@@ -40,8 +40,8 @@ CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CANDIDATE_VERSION=0.8.26
 CANDIDATE_SNAPSHOT_DATE=2026-11-27
-PUBLISHED_VERSION=0.8.16
-PUBLISHED_INSTALLER_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
+PUBLISHED_VERSION=0.8.26
+PUBLISHED_INSTALLER_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -114,6 +114,14 @@ candidate_version_is_consistent() {
         'changelog lifecycle statement can become false after publication' || return 1
     require_literal "$README" "## v$PUBLISHED_VERSION release status and quickstart" \
         'README does not identify the current published release' || return 1
+    require_literal "$README" "[v$PUBLISHED_VERSION release status and quickstart](#v${PUBLISHED_VERSION//./}-release-status-and-quickstart)" \
+        'README current-status link must target the published release heading' || return 1
+    require_literal "$README" 'Multi-worker rewards remain disabled. Headless `--model` installs remain whole-model workers.' \
+        'README must distinguish desktop partial shards from whole-model headless installs and disabled partial rewards' || return 1
+    require_literal "$REPO_ROOT/AGENTS.md" '### Whole-model compatibility path' \
+        'agent guide must scope whole-model routing separately from partial sharding' || return 1
+    require_literal "$REPO_ROOT/AGENTS.md" 'The integrated desktop path described above selects this runtime for eligible' \
+        'agent guide must acknowledge the integrated desktop partial-worker path' || return 1
     require_literal "$README" 'Source-freeze snapshot (2026-08-31; tag-stable)' \
         'README release status is not preserved as a dated source-freeze fact' || return 1
     require_literal "$README" 'pre-tag statement, not a live status probe' \
@@ -139,6 +147,8 @@ candidate_install_commands_are_exact_and_honest() {
             'candidate install guide does not verify the bootstrap on macOS' || return 1
         require_literal "$file" "--proto '=https' --proto-redir '=https' --tlsv1.2" \
             'candidate install guide permits a non-HTTPS bootstrap or redirect' || return 1
+        require_literal "$file" 'The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.' \
+            'install guide must state that this update profile cannot authorize legacy migration' || return 1
         require_literal "$file" 'not published' \
             'candidate install guide could be mistaken for an already-published release' || return 1
         download_line="$(grep -nF -- "$exact_url" "$file" | head -n 1 | cut -d: -f1)"
@@ -432,6 +442,14 @@ readme_counts_and_desktop_secret_copy_match_the_tree() {
     fi
     require_literal "$DESKTOP_README" 'recovery phrase is present' \
         'desktop README falsely implies the native store excludes its signing secret' || return 1
+    require_literal "$GETTING_STARTED" "[v$PUBLISHED_VERSION release](https://github.com/FerrumVir/arc-chain/releases/tag/v$PUBLISHED_VERSION)" \
+        'GUI install link must name the verified published release' || return 1
+    require_literal "$DESKTOP_FIRST_RUN" 'Compute contribution requires at least 16 GB nominal RAM.' \
+        'first-run guide must scope the RAM floor to compute, not the desktop app' || return 1
+    require_literal "$DESKTOP_FIRST_RUN" 'connect to the pinned coordinator, acquire a shard lease, and then load' \
+        'first-run guide must place authenticated assignment before partial model loading' || return 1
+    require_literal "$DESKTOP_FIRST_RUN" 'Partial steps are not completed answers or rewards. Multi-worker rewards remain disabled.' \
+        'first-run guide must distinguish partial work from completed answers and reward settlement' || return 1
     require_literal "$GETTING_STARTED" "v$PUBLISHED_VERSION does not yet use an OS keychain" \
         'user guide omits the desktop recovery-secret storage boundary' || return 1
     require_literal "$DESKTOP_FIRST_RUN" 'only a successful mined receipt' \
@@ -2400,8 +2418,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, and changelog agree on the release candidate; README names published v0.8.16' candidate_version_is_consistent
-run_test 'install commands pin exact published v0.8.16 without claiming the candidate is published' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on the release candidate; README names published v0.8.26' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.26 and preserve historical snapshots and legacy refusal' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract

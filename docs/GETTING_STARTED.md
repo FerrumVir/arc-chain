@@ -74,7 +74,7 @@ Windows version only after a release-blocking runtime test covers it.
 ### Linux (Ubuntu / Debian)
 
 Use the normalized desktop asset name from the
-[v0.8.16 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.16):
+[v0.8.26 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.26):
 
 ```bash
 sudo apt install ./arc-desktop-linux-x86_64.deb
@@ -121,7 +121,7 @@ environment, or logs. The phrase is excluded from frontend `localStorage` and
 is never sent to a server by the identity flow. The app-data directory and
 store are owner-validated through open handles (`0700`/`0600` on Unix; a
 protected current-user/SYSTEM/Administrators DACL on Windows), and writes are
-atomic/no-follow. v0.8.16 does not yet use an OS keychain. Save a separate
+atomic/no-follow. v0.8.26 does not yet use an OS keychain. Save a separate
 offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.

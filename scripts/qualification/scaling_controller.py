@@ -85,6 +85,13 @@ class EvidenceStore:
                 entry[key] = copy.deepcopy(value)
             self._persist_locked()
 
+    def fail_if_started(self, req_id: str, end_ns: int, error: str) -> None:
+        with self._lock:
+            if req_id not in self._attempts:
+                return
+            self._attempts[req_id].update(end_ns=end_ns, status="failed", error=error)
+            self._persist_locked()
+
 def _verify_boot_nonce(raw_value: Any, label: str, expected: str) -> str:
     normalized = qual.normalize_hex64(raw_value, label)
     if normalized != expected:
@@ -214,6 +221,8 @@ def _check_consistency(base: dict[str, Any], cur: dict[str, Any], base_id: str, 
 def _dispatch_one(
     store: EvidenceStore, arm_name: str, index: int, expected_workers: set[str],
     expected_boot: str, get_monotonic_ns: Callable[[], int],
+    timeout_seconds: float = DISPATCH_TIMEOUT_SECONDS,
+    request_once_fn: Callable[..., tuple[int, Any, int]] | None = None,
 ) -> dict[str, Any]:
     req_id, payload = f"{arm_name}-{index}", copy.deepcopy(qual.DISPATCH_PAYLOAD)
     start_ns = get_monotonic_ns()
@@ -223,8 +232,9 @@ def _dispatch_one(
         store.update_attempt(req_id, status="failed", error=str(err))
         return {"index": index, "error": err}
     try:
-        http_status, parsed_response, _ = qual.coordinator_request_once(
-            "POST", qual.DISPATCH_PATH, DISPATCH_TIMEOUT_SECONDS, json_body=payload,
+        request_once = qual.coordinator_request_once if request_once_fn is None else request_once_fn
+        http_status, parsed_response, _ = request_once(
+            "POST", qual.DISPATCH_PATH, timeout_seconds, json_body=payload,
         )
     except EXPECTED_EXCEPTIONS as exc:
         end_ns = get_monotonic_ns()

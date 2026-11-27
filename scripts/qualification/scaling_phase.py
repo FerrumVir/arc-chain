@@ -8,6 +8,7 @@ import time
 
 import community_shard_six_machine as qual
 import scaling_run as run
+import experiment_profile as experiments
 
 KINDS = ('cohort', 'expand', 'stop-added', 'done')
 SCHEMA = 'arc.community-shard-scaling.phase.v1'
@@ -15,32 +16,34 @@ TOTAL_SECONDS = 3600
 CLEANUP_SECONDS = 120
 
 
-def artifact_name(workflow, attempt, kind):
-    run.need(kind in KINDS, 'unknown scaling phase marker')
-    return 'qual-scaling-' + kind + '-r' + qual.validate_positive_id(workflow, 'workflow') + '-a' + qual.validate_positive_id(attempt, 'attempt')
+def artifact_name(workflow, attempt, kind, profile=experiments.SCALING):
+    run.need(kind in profile.marker_kinds, 'unknown experiment phase marker')
+    return 'qual-' + profile.name + '-' + kind + '-r' + qual.validate_positive_id(workflow, 'workflow') + '-a' + qual.validate_positive_id(attempt, 'attempt')
 
 
-def marker_value(workflow, attempt, kind, digest):
-    artifact_name(workflow, attempt, kind)
+def marker_value(workflow, attempt, kind, digest, profile=experiments.SCALING):
+    artifact_name(workflow, attempt, kind, profile)
     if digest is None:
         run.need(kind == 'done', 'only abort completion may omit an unavailable cohort')
     else:
         run.need(qual.normalize_hex64(digest, 'cohort digest') == digest, 'cohort digest must be canonical')
-    return {'schema': SCHEMA, 'workflow_run_id': workflow, 'workflow_run_attempt': attempt,
+    return {'schema': profile.schema('phase'), 'workflow_run_id': workflow, 'workflow_run_attempt': attempt,
             'kind': kind, 'cohort_sha256': digest, 'counts_toward_operator_target': False}
 
 
-def validate_marker(value, workflow, attempt, kind, digest):
+def validate_marker(value, workflow, attempt, kind, digest, profile=experiments.SCALING):
     run.need(isinstance(value, dict), 'phase marker must be an object')
-    run.need(value == marker_value(workflow, attempt, kind, digest), 'phase marker does not bind this run, attempt, phase and cohort')
+    run.need(value == marker_value(workflow, attempt, kind, digest, profile), 'phase marker does not bind this experiment, run, attempt, phase and cohort')
     return value
 
 
 def publish(args):
+    profile = experiments.select(getattr(args, 'mode', 'scaling'))
+    run.need(args.kind in profile.marker_kinds, 'phase marker does not belong to this experiment')
     directory = Path(args.cohort_dir)
     digest = None
     if (directory / 'cohort.json').exists():
-        cohort, _, digest = run.read_cohort(directory)
+        cohort, _, digest = run.read_cohort(directory, profile)
         run.need(cohort['workflow_run_id'] == args.workflow_run_id and cohort['workflow_run_attempt'] == args.workflow_run_attempt, 'cohort belongs to another workflow')
     else:
         run.need(args.kind == 'done', 'initialize a verified cohort before phase publication')
@@ -48,13 +51,13 @@ def publish(args):
         phase = 'before' if args.kind == 'expand' else 'expanded'
         evidence = qual.read_bounded_json_file(directory / (phase + '-attempts.json'))
         run.need(evidence.get('arm_status') == 'succeeded', 'cannot publish next phase after failed measurement')
-        _, identities, _ = run.read_cohort(directory)
-        slots = qual.EXPECTED_SLOTS if phase == 'before' else qual.SCALING_SLOTS
+        _, identities, _ = run.read_cohort(directory, profile)
+        slots = profile.slots(phase)
         workers = {identities[slot]['worker_id'] for slot in slots}
-        reconstructed = run.reconstruct_arm(phase, evidence, workers, cohort['coordinator_boot_nonce'])
+        reconstructed = run.reconstruct_arm(phase, evidence, workers, cohort['coordinator_boot_nonce'], profile)
         run.need(reconstructed == qual.read_bounded_json_file(directory / (phase + '-arm.json')), 'phase measurement differs from verified dispatch evidence')
     output = Path(args.output_dir)
-    run.write_new(output / 'phase.json', marker_value(args.workflow_run_id, args.workflow_run_attempt, args.kind, digest))
+    run.write_new(output / 'phase.json', marker_value(args.workflow_run_id, args.workflow_run_attempt, args.kind, digest, profile))
     if args.kind == 'cohort':
         for name in ('cohort.json', 'cohort-digest.json'):
             descriptor = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -64,19 +67,20 @@ def publish(args):
 
 
 class PhaseReader:
-    def __init__(self, workflow, attempt, directory, token, deadline):
+    def __init__(self, workflow, attempt, directory, token, deadline, profile=experiments.SCALING):
         self.workflow = qual.validate_positive_id(workflow, 'workflow')
         self.attempt = qual.validate_positive_id(attempt, 'attempt')
         self.directory = directory
         self.token = token
         self.deadline = deadline
         self.cache = {}
+        self.profile = profile
 
     def poll(self, kinds):
         metadata = run.list_artifacts(self.workflow, self.token, self.deadline - CLEANUP_SECONDS)
         values = {}
         for kind in kinds:
-            name = artifact_name(self.workflow, self.attempt, kind)
+            name = artifact_name(self.workflow, self.attempt, kind, self.profile)
             matches = [row for row in metadata if row.get('name') == name and row.get('expired') is False]
             run.need(len(matches) <= 1, 'duplicate phase artifact: ' + name)
             if not matches:
@@ -136,13 +140,14 @@ def validate_clean_worker(evidence, identity):
 
 
 def supervise(args):
+    profile = experiments.select(getattr(args, 'mode', 'scaling'))
     deadline = time.monotonic() + TOTAL_SECONDS
     slot = qual.validate_slot(args.slot)
     directory = Path(args.evidence_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    receipt_path = directory / 'scaling-supervisor.json'
+    receipt_path = directory / (profile.name + '-supervisor.json')
     run.need(not receipt_path.exists(), 'worker already supervised; never repeat this measurement')
-    reader = PhaseReader(args.workflow_run_id, args.workflow_run_attempt, Path(args.work_dir) / 'phases', os.environ.get('GH_TOKEN', ''), deadline)
+    reader = PhaseReader(args.workflow_run_id, args.workflow_run_attempt, Path(args.work_dir) / 'phases', os.environ.get('GH_TOKEN', ''), deadline, profile)
     child = None
     digest = None
     stop_kind = None
@@ -165,37 +170,37 @@ def supervise(args):
         while child is None:
             run.need(not stopped.is_set(), 'supervisor interrupted before worker start')
             remaining_runtime(deadline, time.monotonic())
-            phases = reader.poll(('done', 'cohort', 'expand', 'stop-added') if slot > 6 else ('done', 'cohort'))
+            phases = reader.poll(('done', 'cohort', 'expand', 'stop-added') if profile.stop_kind(slot) == 'stop-added' else ('done', 'cohort'))
             if 'done' in phases:
                 value = phases['done']
                 run.need(isinstance(value, dict), 'done phase must be an object')
-                validate_marker(value, args.workflow_run_id, args.workflow_run_attempt, 'done', digest if digest is not None else value.get('cohort_sha256'))
+                validate_marker(value, args.workflow_run_id, args.workflow_run_attempt, 'done', digest if digest is not None else value.get('cohort_sha256'), profile)
                 stop_kind = 'done-before-start'
                 raise qual.QualificationError('controller finished before this worker started')
             if 'stop-added' in phases:
                 run.need(isinstance(phases['stop-added'], dict), 'stop-added phase must be an object')
-                validate_marker(phases['stop-added'], args.workflow_run_id, args.workflow_run_attempt, 'stop-added', digest if digest is not None else phases['stop-added'].get('cohort_sha256'))
+                validate_marker(phases['stop-added'], args.workflow_run_id, args.workflow_run_attempt, 'stop-added', digest if digest is not None else phases['stop-added'].get('cohort_sha256'), profile)
                 stop_kind = 'stop-added-before-start'
                 raise qual.QualificationError('added cohort was stopped before this worker started')
             if 'cohort' in phases:
-                cohort, identities, digest = run.read_cohort(reader.directory / 'cohort')
+                cohort, identities, digest = run.read_cohort(reader.directory / 'cohort', profile)
                 run.need(cohort['workflow_run_id'] == args.workflow_run_id and cohort['workflow_run_attempt'] == args.workflow_run_attempt, 'published cohort belongs to another workflow')
-                validate_marker(phases['cohort'], args.workflow_run_id, args.workflow_run_attempt, 'cohort', digest)
+                validate_marker(phases['cohort'], args.workflow_run_id, args.workflow_run_attempt, 'cohort', digest, profile)
                 run.need(identities[slot] == identity, 'published cohort does not contain this exact worker identity')
-                if slot <= 6 or 'expand' in phases:
-                    if slot > 6:
-                        validate_marker(phases['expand'], args.workflow_run_id, args.workflow_run_attempt, 'expand', digest)
+                if profile.stop_kind(slot) == 'done' or 'expand' in phases:
+                    if profile.stop_kind(slot) == 'stop-added':
+                        validate_marker(phases['expand'], args.workflow_run_id, args.workflow_run_attempt, 'expand', digest, profile)
                     child = subprocess.Popen(child_command(args, deadline), stdin=subprocess.DEVNULL)
                     break
             stopped.wait(min(30, max(0, deadline - time.monotonic() - CLEANUP_SECONDS)))
         while child.poll() is None:
             run.need(not stopped.is_set(), 'supervisor interrupted during measurement')
             run.need(time.monotonic() < deadline - CLEANUP_SECONDS, 'worker reached the global experiment deadline')
-            kinds = ('stop-added', 'done') if slot > 6 else ('done',)
+            kinds = ('stop-added', 'done') if profile.stop_kind(slot) == 'stop-added' else ('done',)
             phases = reader.poll(kinds)
             for kind in kinds:
                 if kind in phases:
-                    validate_marker(phases[kind], args.workflow_run_id, args.workflow_run_attempt, kind, digest)
+                    validate_marker(phases[kind], args.workflow_run_id, args.workflow_run_attempt, kind, digest, profile)
                     stop_kind = kind
                     stop_attempted = True
                     exit_code = stop_child(child, deadline)
@@ -205,7 +210,7 @@ def supervise(args):
             stopped.wait(min(15, max(0, deadline - time.monotonic() - CLEANUP_SECONDS)))
         if exit_code is None:
             exit_code = child.poll()
-        run.need(stop_kind == ('done' if slot <= 6 else 'stop-added'), 'worker exited without its verified phase completion')
+        run.need(stop_kind == profile.stop_kind(slot), 'worker exited without its verified phase completion')
         evidence = qual.read_bounded_json_file(directory / 'worker-evidence.json')
         run.need(isinstance(evidence, dict), 'worker evidence must be an object')
         run.need(evidence.get('stop_reason') == 'signal_15', 'base supervisor stopped for an unexpected reason')
@@ -226,7 +231,7 @@ def supervise(args):
         deleted = qual.delete_private_key(Path(args.private_key_path))
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-        run.write_new(receipt_path, {'schema': 'arc.community-shard-scaling.supervisor.v1', 'slot': slot,
+        run.write_new(receipt_path, {'schema': profile.schema('supervisor'), 'slot': slot,
                                    'cohort_sha256': digest, 'stop_kind': stop_kind, 'key_deleted': deleted,
                                    'child_supervisor_exit_code': exit_code, 'passed': completed and failure is None and deleted,
                                    'error': failure, 'counts_toward_operator_target': False})
@@ -238,6 +243,7 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     marker = commands.add_parser('publish')
     marker.add_argument('kind', choices=KINDS)
+    marker.add_argument('--mode', choices=('scaling', 'overlap'), default='scaling')
     for key in ('workflow-run-id', 'workflow-run-attempt', 'cohort-dir', 'output-dir'):
         marker.add_argument('--' + key, required=True)
     marker.set_defaults(function=publish)
@@ -245,6 +251,7 @@ def main():
     for key in ('workflow-run-id', 'workflow-run-attempt', 'candidate-dir', 'model-path', 'private-key-path', 'identity-dir', 'work-dir', 'evidence-dir'):
         worker.add_argument('--' + key, required=True)
     worker.add_argument('--slot', type=int, required=True)
+    worker.add_argument('--mode', choices=('scaling', 'overlap'), default='scaling')
     worker.set_defaults(function=supervise)
     args = parser.parse_args()
     args.function(args)

@@ -6,10 +6,14 @@ model loading, assignment, block inclusion, or the two-receipt earnings proof co
 in three minutes of wall-clock time. Record the verified waits, then cut them.
 At the 2026-08-31 source-freeze review cutoff, the v0.8.0 recovery candidate
 was not published or deployed; that is a tag-stable historical statement, not
-a live probe. Use this script only when the complete v0.8.16 CLI release is
+a live probe. Use this script only when the complete v0.8.26 CLI release is
 visible on GitHub and signed evidence proves the seed rollout checklist below
 has been completed. Do not record against a mixed v0.7.2/v0.7.9 fleet as
 though these branch fixes are already live.
+
+The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+This walkthrough exercises whole-model headless jobs; it does not prove
+partial-shard reward settlement or 100 active operators.
 
 ## Before recording
 
@@ -76,18 +80,18 @@ closed; the CLI flag alone cannot turn issuance on.
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.16/install.sh
-ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
+ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.16 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is
-`893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e`.
+`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
 
 The protected source-tag installer resolves one exact semantic-versioned
 release and verifies the owner signature on `SHA256SUMS` before trusting any
@@ -97,8 +101,9 @@ for `arc-node`, and its RPC listener stays on `127.0.0.1` by default. A
 model-backed install uses the full deterministic integer-worker role without
 announcing the home machine as a validator shard.
 
-For a recognized v0.7.x node at the exact default `~/.arc`, the same command
-preserves its identity, active model, custom ports, old data, and archived
+With authentic cutover and retirement evidence in a separately qualified
+release, the installer preserves a recognized v0.7.x node at the exact default
+`~/.arc`, including its identity, active model, custom ports, old data, and archived
 configuration while selecting fresh `data-v0.8/` state. It verifies and stops
 the real Linux global units, macOS agents, or detached PID before replacement.
 On the common Linux layout, root keeps ownership only of the global unit files;

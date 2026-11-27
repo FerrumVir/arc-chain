@@ -351,8 +351,9 @@ pins, a private worker key, and an explicit RAM budget. `--check-only` inspects
 admission without keys, network registration or tensor loading. Run mode uses one
 compute thread by default and drains work on shutdown. Its conservative admission
 requires capacity for all shard roles because role-aware placement is not yet
-implemented. Desktop activation still needs integration. Network tests use small
-canonical fixtures; they do not establish deployed capacity or operator availability.
+implemented. The integrated desktop path described above selects this runtime for eligible
+workers. Network tests use small canonical fixtures; they do not establish
+deployed capacity or operator availability.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
 from a GGUF, without preparing optional quantizations. It validates a strict
@@ -432,9 +433,11 @@ recovery and sharding tests on a single build worker and rejects missing cases
 or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow
 when local resource limits prohibit compilation.
 
-- A coordinator receives `POST /inference/run` (`rpc.rs:2763`, `8212`) and
-  runs at most 2 public jobs at once (`rpc.rs:179`).
-- A community job is never split. One stake-0 worker runs every layer
+### Whole-model compatibility path
+
+- Whole-model public jobs retain the two-permit compute limit described at
+  `8949910b` (`rpc.rs:179`). The partial pipeline above has separate admission.
+- A whole-model worker job is not split. One stake-0 worker runs every layer
   (`main.rs:435-446`, `8461-8467`, `9189-9206`); the job carries no layer
   range (`rpc.rs:14626-14664`).
 - Twin execution, off by default, runs the same job on two workers and
@@ -476,7 +479,15 @@ when local resource limits prohibit compilation.
   node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
 
 The manual community-shard qualification workflows use temporary GitHub-hosted
-workers and never count them toward an operator target. The scaling qualification
+workers and never count them toward an operator target. Artifact downloads resolve
+the GitHub CLI from the caller's PATH before launching that exact executable with
+the minimal child environment, so user-local CLI installations work without
+inheriting proxy or debug settings. The scaling qualification
+selects either the pinned Singapore or Amsterdam coordinator; all worker, transport,
+readiness and cleanup checks use that same identity. Both selections require a quiet
+coordinator with zero existing partial workers and sessions. Existing Singapore
+artifacts retain their original identity and default selection.
+The scaling qualification
 binds twelve distinct machine boots and measures six sequential requests on six
 workers, six requests at concurrency two on twelve workers, then six sequential
 requests after the added workers leave. It records client timing, exact participants,
@@ -492,6 +503,15 @@ response session keys. It preserves missing and aborted phases, rejects duplicat
 events and malformed target records, and does not infer server concurrency or
 request success. Its formatter fixtures are synthetic until a deployed capture
 has been checked; the parser's regression tests run in the script-suite CI gate.
+The optional overlap experiment keeps twelve temporary machines for all three
+arms and offers concurrency two, four, then two, with six, twelve, then six
+requests. Its cohort, phase, supervisor and summary schemas are distinct from
+worker-count scaling. Every machine starts with the cohort and stops on the
+verified completion marker. Client HTTP intervals remain separate from server
+phase timings; neither proves server admission concurrency. Phase reports first
+snapshot and validate the bounded controller files, then correlate supplied
+journal records without publishing raw logs or treating them as authenticated
+request-success evidence.
 
 ## Releases and versions
 
@@ -509,11 +529,14 @@ packages. Archive and DMG verification use the same captured version.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published (0.8.16) and candidate (0.8.26)
-  versions (`tests/release/documentation_contract_test.sh:41`, `47`). README
-  install steps name the published one. The test's comment (lines 42-46) says
-  they move to a newer release in the documentation change that follows its
-  publication, together with these values.
+- The doc contract test pins the published and candidate versions at 0.8.26
+  and the exact published installer digest. Active install links change only
+  after immutable publication is verified; historical version observations
+  remain dated. The contract checks the current-status heading link, separates
+  desktop partial shards from whole-model headless installs, and keeps partial
+  rewards disabled. Each active install guide must state that this update profile
+  refuses legacy v0.7 migration; a separately qualified cutover release with
+  authentic cutover and retirement evidence is required.
 - JavaScript audit gates use `scripts/release/npm-audit-gate.py` and the
   dated `npm-audit-exceptions.json` policy; see the dependency audit policy in
   `scripts/release/EXISTING-CHAIN-UPDATE.md`. Every root advisory must match

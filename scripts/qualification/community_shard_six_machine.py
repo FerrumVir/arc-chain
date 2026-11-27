@@ -21,14 +21,16 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from coordinator_target import coordinator_target
+
 EXPECTED_REPO = "FerrumVir/arc-chain"
 EXPECTED_CANDIDATE_WORKFLOW_PATH = ".github/workflows/linux-candidate.yml"
 ALLOWED_CANDIDATE_EVENTS = frozenset({"workflow_dispatch", "push"})
-COORDINATOR_URL = "https://149.28.153.31"
-COORDINATOR_NETLOC = "149.28.153.31"
+COORDINATOR_SITE = os.environ.get("ARC_SHARD_QUAL_SITE", "sgp")
+COORDINATOR_NETLOC, COORDINATOR_ID = coordinator_target(COORDINATOR_SITE)
+COORDINATOR_URL = "https://" + COORDINATOR_NETLOC
 GITHUB_API_ORIGIN = "https://api.github.com"
 GITHUB_API_NETLOC = "api.github.com"
-COORDINATOR_ID = "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"
 TRANSACTION_DOMAIN = "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f"
 EXPECTED_MODEL_ID = "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67"
 CANONICAL_EXECUTION_PROFILE = "INT8 integer (per-row, cross-platform deterministic)"
@@ -209,6 +211,13 @@ def minimal_host_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def github_cli_executable() -> str:
+    executable = shutil.which("gh")
+    if executable is None:
+        raise QualificationError("Install GitHub CLI and expose gh on the caller PATH before downloading artifacts")
+    return str(Path(executable).resolve(strict=True))
 
 
 def redact_secret(text: str, secret: str) -> str:
@@ -754,6 +763,7 @@ def download_validated_artifact_by_id(
             f"artifact {artifact_name} size {size_bytes!r} exceeds bound {max_bytes}"
         )
     expected_zip_sha256 = parse_artifact_sha256_digest(artifact_meta, artifact_name)
+    gh_executable = github_cli_executable()
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     gh_env = minimal_host_env({"GH_TOKEN": token})
     endpoint = f"/repos/{EXPECTED_REPO}/actions/artifacts/{artifact_id}/zip"
@@ -767,7 +777,7 @@ def download_validated_artifact_by_id(
         try:
             proc = subprocess.Popen(
                 [
-                    "gh",
+                    gh_executable,
                     "api",
                     "-H",
                     "Accept: application/vnd.github+json",
@@ -826,6 +836,8 @@ def download_validated_artifact_by_id(
                     pass
             if stderr_thread is not None:
                 stderr_thread.join(timeout=5)
+            if proc is not None and proc.stdout is not None:
+                proc.stdout.close()
         if timed_out.is_set():
             raise QualificationError(f"gh api download timed out for {artifact_name} (id={artifact_id})")
         if rc != 0:

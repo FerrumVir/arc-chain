@@ -1,4 +1,10 @@
-name: Community Shard 6-12-6 Scaling Qualification
+name: Community Shard Scaling and Overlap Qualification
+env:
+  ARC_SHARD_QUAL_SITE: ${{ inputs.coordinator_site || 'sgp' }}
+  QUALIFICATION_MODE: ${{ inputs.mode || 'scaling' }}
+  BEFORE_ARM: ${{ inputs.mode == 'overlap' && 'baseline_before' || 'before' }}
+  MIDDLE_ARM: ${{ inputs.mode == 'overlap' && 'overlap' || 'expanded' }}
+  AFTER_ARM: ${{ inputs.mode == 'overlap' && 'baseline_after' || 'after' }}
 permissions:
   contents: read
   actions: read
@@ -7,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
-    name: Validate candidate and SGP baseline
+    name: Validate candidate and pinned coordinator baseline
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -21,11 +27,14 @@ jobs:
         fetch-depth: 1
         persist-credentials: false
     - name: Check qualification harness before remote inference
+      env:
+        ARC_SHARD_QUAL_SITE: sgp
       run: |
+        python3 -m unittest discover -s scripts/qualification/tests -p 'test_coordinator_target.py' -q
         python3 -m unittest discover -s scripts/qualification/tests -p 'test_community_shard_six_machine.py' -q
         python3 -m unittest discover -s scripts/qualification/tests -p 'test_scaling_cohort.py' -q
         PYTHONPATH=scripts/qualification:scripts/qualification/tests python3 -m unittest discover -s scripts/qualification/scaling_tests -p 'test*.py' -q
-        python3 scripts/ci/no_comments.py scripts/qualification/*.py scripts/qualification/tests/test_community_shard_six_machine.py scripts/qualification/tests/test_scaling_cohort.py scripts/qualification/scaling_tests/*.py .github/workflows/community-shard-scaling.yml
+        python3 scripts/ci/no_comments.py scripts/qualification/*.py scripts/qualification/tests/test_community_shard_six_machine.py scripts/qualification/tests/test_scaling_cohort.py scripts/qualification/tests/test_coordinator_target.py scripts/qualification/scaling_tests/*.py .github/workflows/community-shard-scaling.yml
     - name: Resolve pinned candidate inputs
       id: resolve_inputs
       env:
@@ -77,7 +86,7 @@ jobs:
         path: candidate-source
         fetch-depth: 1
         persist-credentials: false
-    - name: Validate candidate run and SGP readiness baseline
+    - name: Validate candidate run and pinned coordinator readiness baseline
       env:
         GH_TOKEN: ${{ github.token }}
         CANDIDATE_RUN_ID: ${{ steps.resolve_inputs.outputs.candidate_run_id }}
@@ -253,7 +262,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_phase.py worker \
+        python3 scripts/qualification/scaling_phase.py worker --mode "$QUALIFICATION_MODE" \
           --workflow-run-id "$WORKFLOW_RUN_ID" \
           --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
           --slot "$SLOT" \
@@ -307,7 +316,7 @@ jobs:
         set -Eeuo pipefail
         rm -rf "$PRIVATE_DIR"
   controller:
-    name: Measure six, twelve, then six workers
+    name: Measure the selected three-arm experiment
     needs:
     - validate
     runs-on: ubuntu-24.04
@@ -330,7 +339,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_run.py initialize \
+        python3 scripts/qualification/scaling_run.py initialize --mode "$QUALIFICATION_MODE" \
           --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
           --candidate-run-id "$CANDIDATE_RUN_ID" --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
           --candidate-sha "$CANDIDATE_SHA" --output-dir "$EVIDENCE_DIR"
@@ -348,10 +357,10 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_phase.py publish cohort --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
+        python3 scripts/qualification/scaling_phase.py publish cohort --mode "$QUALIFICATION_MODE" --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: qual-scaling-cohort-r${{ github.run_id }}-a${{ github.run_attempt }}
+        name: qual-${{ env.QUALIFICATION_MODE }}-cohort-r${{ github.run_id }}-a${{ github.run_attempt }}
         path: ${{ runner.temp }}/scaling-phase-cohort
         retention-days: 7
         if-no-files-found: error
@@ -367,9 +376,10 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_run.py arm before --output-dir "$EVIDENCE_DIR"
+        python3 scripts/qualification/scaling_run.py arm "$BEFORE_ARM" --mode "$QUALIFICATION_MODE" --output-dir "$EVIDENCE_DIR"
     - name: Publish verified expand phase
       id: publish_expand
+      if: ${{ env.QUALIFICATION_MODE == 'scaling' }}
       env:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -382,14 +392,15 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_phase.py publish expand --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
+        python3 scripts/qualification/scaling_phase.py publish expand --mode "$QUALIFICATION_MODE" --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: ${{ env.QUALIFICATION_MODE == 'scaling' }}
       with:
-        name: qual-scaling-expand-r${{ github.run_id }}-a${{ github.run_attempt }}
+        name: qual-${{ env.QUALIFICATION_MODE }}-expand-r${{ github.run_id }}-a${{ github.run_attempt }}
         path: ${{ runner.temp }}/scaling-phase-expand
         retention-days: 7
         if-no-files-found: error
-    - name: Measure expanded capacity with six verified requests
+    - name: Measure expanded worker capacity or fixed-worker overlap
       env:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -401,9 +412,10 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_run.py arm expanded --output-dir "$EVIDENCE_DIR"
+        python3 scripts/qualification/scaling_run.py arm "$MIDDLE_ARM" --mode "$QUALIFICATION_MODE" --output-dir "$EVIDENCE_DIR"
     - name: Publish verified stop-added phase
       id: publish_stop_added
+      if: ${{ env.QUALIFICATION_MODE == 'scaling' }}
       env:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -416,10 +428,11 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_phase.py publish stop-added --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
+        python3 scripts/qualification/scaling_phase.py publish stop-added --mode "$QUALIFICATION_MODE" --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: ${{ env.QUALIFICATION_MODE == 'scaling' }}
       with:
-        name: qual-scaling-stop-added-r${{ github.run_id }}-a${{ github.run_attempt }}
+        name: qual-${{ env.QUALIFICATION_MODE }}-stop-added-r${{ github.run_id }}-a${{ github.run_attempt }}
         path: ${{ runner.temp }}/scaling-phase-stop-added
         retention-days: 7
         if-no-files-found: error
@@ -435,7 +448,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_run.py arm after --output-dir "$EVIDENCE_DIR"
+        python3 scripts/qualification/scaling_run.py arm "$AFTER_ARM" --mode "$QUALIFICATION_MODE" --output-dir "$EVIDENCE_DIR"
     - name: Publish verified done phase
       id: publish_done
       env:
@@ -450,11 +463,11 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_phase.py publish 'done' --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
+        python3 scripts/qualification/scaling_phase.py publish 'done' --mode "$QUALIFICATION_MODE" --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" --cohort-dir "$EVIDENCE_DIR" --output-dir "$PHASE_DIR"
       if: always()
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: qual-scaling-done-r${{ github.run_id }}-a${{ github.run_attempt }}
+        name: qual-${{ env.QUALIFICATION_MODE }}-done-r${{ github.run_id }}-a${{ github.run_attempt }}
         path: ${{ runner.temp }}/scaling-phase-done
         retention-days: 7
         if-no-files-found: error
@@ -508,7 +521,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 scripts/qualification/scaling_aggregate.py \
+        python3 scripts/qualification/scaling_aggregate.py --mode "$QUALIFICATION_MODE" \
           --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
           --candidate-run-id "$CANDIDATE_RUN_ID" --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
           --candidate-sha "$CANDIDATE_SHA" --output-dir "$OUT_DIR" \
@@ -534,6 +547,18 @@ jobs:
 'on':
   workflow_dispatch:
     inputs:
+      coordinator_site:
+        description: Pinned coordinator; requires zero existing partial workers and sessions
+        required: true
+        default: sgp
+        type: choice
+        options: [sgp, ams]
+      mode:
+        description: Worker-count scaling or fixed twelve-worker verification overlap
+        required: true
+        default: scaling
+        type: choice
+        options: [scaling, overlap]
       candidate_run_id:
         description: Completed FerrumVir/arc-chain linux-candidate workflow run ID
         required: true
