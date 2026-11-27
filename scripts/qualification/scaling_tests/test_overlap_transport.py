@@ -12,7 +12,7 @@ class OverlapTransportTests(unittest.TestCase):
         locations = []
         def invoke(command, **options):
             self.assertEqual(command[:2], ['/usr/bin/curl', '--disable'])
-            self.assertEqual(command[command.index('--max-time') + 1], '310')
+            self.assertEqual(command[command.index('--max-time') + 1], '310.000')
             self.assertEqual(command[command.index('--max-redirs') + 1], '0')
             self.assertEqual(command[command.index('--proto') + 1], '=https')
             self.assertNotIn('--retry', command)
@@ -44,7 +44,7 @@ class OverlapTransportTests(unittest.TestCase):
 
     def test_invalid_scope_and_expired_deadline_refuse_before_network(self):
         with patch.object(transport.subprocess, 'run') as call:
-            for timeout in (True, 0, -1, 311, float('inf'), float('nan')):
+            for timeout in (True, 0, 0.00005, 0.0009, -1, 311, float('inf'), float('nan')):
                 with self.assertRaises(qual.QualificationError):
                     transport.request_once('GET', qual.SHARD_STATUS_PATH, timeout)
             for method, path, body in [('POST', '/faucet/claim', {}), ('POST', qual.DISPATCH_PATH, {}), ('GET', '/account/a', None)]:
@@ -53,6 +53,22 @@ class OverlapTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(qual.QualificationError, 'deadline'):
                 transport.get_json(qual.SHARD_STATUS_PATH, 0)
             call.assert_not_called()
+
+    def test_millisecond_deadlines_and_missing_output_never_become_unbounded(self):
+        def invoke(command, **options):
+            self.assertEqual(command[command.index('--max-time') + 1], '0.001')
+            self.assertEqual(command[command.index('--connect-timeout') + 1], '0.001')
+            return subprocess.CompletedProcess(command, 0, b'200', b'')
+        with patch.object(transport.subprocess, 'run', side_effect=invoke) as call:
+            with self.assertRaisesRegex(qual.QualificationError, 'body is empty'):
+                transport.request_once('GET', qual.SHARD_STATUS_PATH, 0.0019)
+            call.assert_called_once()
+        with patch.object(transport.subprocess, 'run', side_effect=FileNotFoundError('curl missing')):
+            with self.assertRaisesRegex(qual.QualificationError, 'could not start'):
+                transport.request_once('POST', qual.DISPATCH_PATH, 310, qual.DISPATCH_PAYLOAD)
+        with patch.object(transport, 'request_once', side_effect=TimeoutError('deadline')):
+            with self.assertRaisesRegex(qual.QualificationError, 'observation timed out'):
+                transport.get_json(qual.READINESS_PATH, 110, lambda: 100)
 
 
 if __name__ == '__main__':

@@ -11,7 +11,6 @@ OVERLAP_DISPATCH_TIMEOUT_SECONDS = 310.0
 READINESS_TIMEOUT_SECONDS = sc.READINESS_TIMEOUT_SECONDS
 READINESS_POLL_INTERVAL_SECONDS = sc.READINESS_POLL_INTERVAL_SECONDS
 SCHEDULER_POLL_INTERVAL_SECONDS = 0.25
-STATUS_REQUEST_TIMEOUT_SECONDS = 15.0
 SCHEDULER_TIMEOUT_SECONDS = 1800.0
 DRAIN_TIMEOUT_SECONDS = 330.0
 OVERLAP_ARM_SPECS: dict[str, tuple[int, int, int, int]] = {
@@ -54,8 +53,7 @@ def _default_read_status(deadline_s: float, get_monotonic: Callable[[], float]) 
     remaining = deadline_s - get_monotonic()
     if remaining <= 0:
         raise qual.QualificationError("scheduler deadline expired before status poll")
-    _, parsed, _ = overlap_transport.request_once("GET", qual.SHARD_STATUS_PATH, min(STATUS_REQUEST_TIMEOUT_SECONDS, remaining))
-    return parsed
+    return overlap_transport.get_json(qual.SHARD_STATUS_PATH, deadline_s, get_monotonic)
 
 def wait_for_overlap_arm_readiness(
     name: str, expected_boot_nonce: str, timeout_seconds: float = READINESS_TIMEOUT_SECONDS,
@@ -69,7 +67,7 @@ def wait_for_overlap_arm_readiness(
     expected_workers, tile_ready, _, _ = OVERLAP_ARM_SPECS[name]
     get_monotonic = time.monotonic if monotonic_fn is None else monotonic_fn
     do_sleep = time.sleep if sleep_fn is None else sleep_fn
-    get_readiness = (lambda dl: overlap_transport.get_json(qual.READINESS_PATH, dl)) if readiness_fn is None else readiness_fn
+    get_readiness = (lambda dl: overlap_transport.get_json(qual.READINESS_PATH, dl, get_monotonic)) if readiness_fn is None else readiness_fn
     get_status = (lambda dl: _default_read_status(dl, get_monotonic)) if status_fn is None else status_fn
     deadline, last_counts = get_monotonic() + timeout_seconds, None
     while True:
@@ -151,6 +149,7 @@ def _execute_continuous_overlap(
         if failure is not None:
             err = qual.QualificationError(f"{name}-{meta['index']}: dispatch callback failed: {type(failure).__name__}: {failure}")
             err.__cause__ = failure
+            store.fail_if_started(f"{name}-{meta['index']}", get_ns(), str(err))
             item = {"index": meta["index"], "error": err}
         else:
             item = fut.result()
@@ -173,14 +172,14 @@ def _execute_continuous_overlap(
                 baseline_resp, baseline_id = item["validated"], req_id
             else:
                 val_err = sc._check_consistency(baseline_resp, item["validated"], baseline_id, req_id)
+        req = item["request"]
+        if val_err is None and not arm_queued_ns <= meta["hol_ns"] <= meta["submitted_ns"] <= req["start_ns"] < req["end_ns"]:
+            val_err = qual.QualificationError(f"{req_id}: invalid queue and HTTP timing order")
         if val_err is not None:
             store.update_attempt(req_id, status="failed", error=str(val_err))
             item["error"] = val_err
             first_error = val_err if first_error is None else first_error
         else:
-            req = item["request"]
-            if not arm_queued_ns <= meta["hol_ns"] <= meta["submitted_ns"] <= req["start_ns"] < req["end_ns"]:
-                raise qual.QualificationError(f"{req_id}: invalid queue and HTTP timing order")
             store.update_attempt(req_id, status="succeeded")
             pacing_by_index[meta["index"]] = {
                 "id": req_id, "queued_at_ns": arm_queued_ns, "head_of_line_at_ns": meta["hol_ns"],
@@ -199,6 +198,9 @@ def _execute_continuous_overlap(
             process_future(fut)
 
     executor = ThreadPoolExecutor(max_workers=offered_cap)
+    completed = False
+    pending_submission = None
+    store.set_fields(undrained_in_flight_count=0, untracked_submission_possible=False)
     try:
         while len(outcomes) < request_count:
             harvest_done()
@@ -215,6 +217,8 @@ def _execute_continuous_overlap(
             if first_error is not None:
                 raise first_error
             _, active_sessions = validate_live_overlap_status(raw_status, expected_boot)
+            if len(outcomes) == request_count:
+                break
             if get_monotonic() >= deadline:
                 raise qual.QualificationError(f"arm {name!r} status poll exhausted scheduling deadline")
             if pending_launch is not None and active_sessions > pending_launch[2]:
@@ -227,27 +231,29 @@ def _execute_continuous_overlap(
                 idx = next_index
                 next_index += 1
                 hol_ns, submitted_ns = next_hol_ns, get_ns()
-                fut = executor.submit(
-                    dispatch_fn, store, name, idx,
-                    expected_workers, expected_boot, get_ns, dispatch_timeout_seconds,
-                )
                 is_final = idx == request_count
-                future_meta[fut] = {
+                meta = {
                     "index": idx, "hol_ns": hol_ns, "submitted_ns": submitted_ns,
                     "prelaunch_active": active_sessions,
                     "unblocked_by": "final_request" if is_final else "pending",
                 }
+                pending_submission = idx
+                fut = executor.submit(
+                    dispatch_fn, store, name, idx,
+                    expected_workers, expected_boot, get_ns, dispatch_timeout_seconds,
+                )
+                future_meta[fut] = meta
                 in_flight.add(fut)
+                pending_submission = None
                 if not is_final:
                     pending_launch = (fut, idx, active_sessions)
-                else:
-                    continue
             slice_s = min(poll_interval_seconds, max(0.0, deadline - get_monotonic()))
             _wait_for_poll_or_completion(in_flight, slice_s, sleep_fn)
+        completed = True
     finally:
-        pending_error = sys.exception()
+        pending_error = sys.exception() if not completed else None
         try:
-            if pending_error is not None:
+            if not completed:
                 done_drain, still_running = wait(in_flight, timeout=drain_timeout_seconds) if in_flight else (set(), set())
                 store.set_fields(undrained_in_flight_count=len(still_running))
                 for fut in sorted(done_drain, key=lambda f: future_meta[f]["index"]):
@@ -258,7 +264,14 @@ def _execute_continuous_overlap(
                         f"{pending_error}; {len(still_running)} in-flight callback(s) exceeded drain bound {drain_timeout_seconds}s"
                     ) from pending_error
         finally:
-            executor.shutdown(wait=(len(in_flight) == 0), cancel_futures=True)
+            running = sum(not future.done() for future in in_flight)
+            untracked = pending_submission is not None and not any(future in in_flight and meta["index"] == pending_submission for future, meta in future_meta.items())
+            try:
+                if not completed:
+                    store.set_fields(undrained_in_flight_count=None if untracked else running,
+                                     untracked_submission_possible=untracked)
+            finally:
+                executor.shutdown(wait=(running == 0 and not untracked), cancel_futures=True)
     ordered = sorted(outcomes, key=lambda item: item["index"])
     intervals = [(item["request"]["start_ns"], item["request"]["end_ns"]) for item in ordered]
     observed_peak = _max_http_in_flight(intervals)
@@ -307,6 +320,7 @@ def run_overlap_arm(
         experiment_mode="overlap",
         client_timeout_is_not_server_deadline=True, http_intervals_are_not_server_admission=True,
     )
+    completed = False
     try:
         readiness, status = wait_for_overlap_arm_readiness(
             name, normalized_boot, monotonic_fn=get_monotonic, sleep_fn=sleep_fn,
@@ -324,9 +338,10 @@ def run_overlap_arm(
         participated = {wid for item in ordered for wid in item["request"]["worker_ids"]}
         if participated != normalized_workers:
             raise qual.QualificationError(f"missing arm workers: {sorted(normalized_workers - participated)}")
+        completed = True
     finally:
-        failure = sys.exception()
-        if failure is not None:
+        if not completed:
+            failure = sys.exception()
             store.set_fields(arm_status="failed", error=f"{type(failure).__name__}: {failure}", completed_at_utc=qual.utc_now_iso())
     store.set_fields(arm_status="succeeded", completed_at_utc=qual.utc_now_iso(), pacing=pacing)
     return {"workers": sorted(normalized_workers), "requests": [item["request"] for item in ordered]}

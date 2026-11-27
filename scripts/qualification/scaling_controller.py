@@ -85,6 +85,13 @@ class EvidenceStore:
                 entry[key] = copy.deepcopy(value)
             self._persist_locked()
 
+    def fail_if_started(self, req_id: str, end_ns: int, error: str) -> None:
+        with self._lock:
+            if req_id not in self._attempts:
+                return
+            self._attempts[req_id].update(end_ns=end_ns, status="failed", error=error)
+            self._persist_locked()
+
 def _verify_boot_nonce(raw_value: Any, label: str, expected: str) -> str:
     normalized = qual.normalize_hex64(raw_value, label)
     if normalized != expected:

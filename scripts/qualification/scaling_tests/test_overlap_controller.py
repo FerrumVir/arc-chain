@@ -1,4 +1,5 @@
 import ast, json, sys, tempfile, threading, unittest
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -51,6 +52,93 @@ def _slice_workers(idx: int) -> list[str]:
     return WORKERS_12[:6] if idx % 2 == 1 else WORKERS_12[6:]
 
 class OverlapControllerTests(unittest.TestCase):
+    def test_success_inside_a_callers_exception_handler_has_no_false_error(self) -> None:
+        sequence = [0]
+        def post(*args, **kwargs):
+            sequence[0] += 1
+            return 200, _response_payload(sequence[0], _slice_workers(sequence[0])), 10
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'nested.json'
+            try:
+                raise ValueError('handled by caller')
+            except ValueError:
+                self._run(path, 'baseline_before', lambda _dl: _status_payload(), post)
+            evidence = json.loads(path.read_text())
+            self.assertEqual(evidence['arm_status'], 'succeeded')
+            self.assertIsNone(evidence['error'])
+
+    def test_default_observations_use_the_injected_clock(self) -> None:
+        def request(method, path, timeout):
+            self.assertEqual(method, 'GET')
+            self.assertEqual(timeout, 15)
+            return 200, _readiness_payload() if path == qual.READINESS_PATH else _status_payload(), 1
+        with patch.object(overlap_transport, 'request_once', side_effect=request) as calls:
+            oc.wait_for_overlap_arm_readiness('overlap', SYNTHETIC_BOOT, monotonic_fn=lambda: 100)
+        self.assertEqual(calls.call_count, 2)
+
+    def test_interrupted_submit_preserves_uncertain_drain_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'interrupted.json'
+            with patch.object(oc, 'ThreadPoolExecutor') as executor:
+                executor.return_value.submit.side_effect = KeyboardInterrupt('during submit')
+                with self.assertRaises(KeyboardInterrupt):
+                    self._run(path, 'overlap', lambda _dl: _status_payload(), None)
+            evidence = json.loads(path.read_text())
+            self.assertTrue(evidence['untracked_submission_possible'])
+            self.assertIsNone(evidence['undrained_in_flight_count'])
+            self.assertEqual(evidence['arm_status'], 'failed')
+
+    def test_invalid_queue_timing_marks_the_finished_attempt_failed(self) -> None:
+        def dispatch(*args):
+            result = oc._bounded_dispatch(*args)
+            result['request']['start_ns'] = 1
+            return result
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'timing.json'
+            with self.assertRaisesRegex(qual.QualificationError, 'timing order'):
+                self._run(path, 'overlap', lambda _dl: _status_payload(),
+                          lambda *args, **kwargs: (200, _response_payload(1, WORKERS_12[:6]), 10), dispatch_fn=dispatch)
+            evidence = json.loads(path.read_text())
+            self.assertEqual(evidence['attempts'][0]['status'], 'failed')
+            self.assertIsNotNone(evidence['attempts'][0]['end_ns'])
+            self.assertEqual(evidence['undrained_in_flight_count'], 0)
+
+    def test_last_completion_during_status_does_not_fail_or_sleep_at_deadline(self) -> None:
+        clock = FakeClock()
+        held, results, sequence, sleeps = [], [], [0], []
+        class Executor:
+            def __init__(self, **kwargs):
+                pass
+            def submit(self, function, *args):
+                future = Future()
+                result = function(*args)
+                if result['index'] == 2:
+                    held.append(future)
+                    results.append(result)
+                else:
+                    future.set_result(result)
+                return future
+            def shutdown(self, **kwargs):
+                pass
+        def status(_deadline):
+            if held and not held[0].done():
+                self.assertTrue(sleeps)
+                held[0].set_result(results[0])
+                clock.s = _deadline
+            return _status_payload()
+        def post(*args, **kwargs):
+            sequence[0] += 1
+            return 200, _response_payload(sequence[0], _slice_workers(sequence[0])), 1
+        with tempfile.TemporaryDirectory() as td, patch.object(oc, 'ThreadPoolExecutor', Executor), patch.dict(oc.OVERLAP_ARM_SPECS, baseline_before=(12, 2, 2, 2)):
+            original_sleep = clock.sleep
+            def checked_sleep(seconds):
+                self.assertFalse(held and held[0].done())
+                sleeps.append(seconds)
+                original_sleep(seconds)
+            clock.sleep = checked_sleep
+            result = self._run(Path(td) / 'last.json', 'baseline_before', status, post, clock=clock)
+            self.assertEqual(len(result['requests']), 2)
+
     def test_scheduler_evidence_reconstructs_with_real_response_validator(self) -> None:
         import experiment_profile as profiles
         import scaling_run
@@ -218,6 +306,9 @@ class OverlapControllerTests(unittest.TestCase):
                     self._run(ev_path, "overlap", st_case, post_case, expected_baseline_response=base_resp, prior_session_keys={(SYNTHETIC_BOOT, 99)})
                 saved = json.loads(ev_path.read_text(encoding="utf-8"))
                 self.assertEqual((started, saved["undrained_in_flight_count"], saved["attempts"][0]["status"]), ([1, 2], 0, "succeeded"))
+                self.assertEqual(saved['attempts'][1]['status'], 'failed')
+                self.assertIsNotNone(saved['attempts'][1]['end_ns'])
+                self.assertTrue(saved['attempts'][1]['error'])
             for mode, exc_cls in (("boot", qual.QualificationError), ("deadline", qual.QualificationError), ("interrupt", KeyboardInterrupt)):
                 e1, r1, started, polls = threading.Event(), threading.Event(), [], [0]
                 clk = FakeClock(on_sleep=lambda now, _r1=r1: _r1.set() if now >= 100.4 else None)
