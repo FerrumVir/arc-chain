@@ -1229,7 +1229,8 @@ mod gguf_preparation {
             );
         }
 
-        let partial_cases: &[(&[(usize, usize)], [bool; 4], bool, bool)] = &[
+        type PartialRangeCase<'a> = (&'a [(usize, usize)], [bool; 4], bool, bool);
+        let partial_cases: &[PartialRangeCase<'_>] = &[
             (&[(1, 3)], [false, true, true, false], false, false),
             (&[(0, 1), (3, 4)], [true, false, false, true], true, true),
             (&[(1, 2), (3, 10)], [false, true, false, true], false, true),

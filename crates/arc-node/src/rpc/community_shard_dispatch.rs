@@ -233,12 +233,11 @@ fn format_dispatched_input(
     has_vocab: bool,
     model_artifact_id: Option<Hash256>,
 ) -> String {
-    if has_vocab {
-        if let Some(wrapped) =
+    if has_vocab
+        && let Some(wrapped) =
             super::coordinator_chat_input(input, chat_template, model_artifact_id)
-        {
-            return wrapped;
-        }
+    {
+        return wrapped;
     }
     input.to_string()
 }

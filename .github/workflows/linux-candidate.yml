@@ -323,6 +323,7 @@ jobs:
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib partial_worker_status_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib below_floor_config_roundtrip_preserves_choices_and_launches_only_observer -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_shard_route_tests:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib inference_retry_tests:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib shard_dispatch_readiness_parser_enforces_exact_contract_and_invariants -- --test-threads=1
@@ -401,6 +402,7 @@ jobs:
         run: |
           cargo build --locked --release -p arc-node --features candle --bin arc-node \
             --example qualify_recovered_native_boundary --example production_partial_row_conformance
+          cargo build --locked --release -p arc-cli --bin arc
           cargo build --locked --release -p arc-inference \
             --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
             --example tensor_row_shared_worker --example low_residency_conformance --features candle
@@ -435,6 +437,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/linux-candidate"
           cp target/release/arc-node "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/arc "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/qualify_recovered_native_boundary \
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/tensor_row_stdio_worker \
@@ -455,6 +458,7 @@ jobs:
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
             printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary --example production_partial_row_conformance\n'
+            printf 'build= cargo build --locked --release -p arc-cli --bin arc\n'
             printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --example low_residency_conformance --features candle\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'

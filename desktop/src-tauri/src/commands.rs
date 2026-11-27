@@ -344,17 +344,11 @@ pub async fn update_location_block() -> CmdResult<Option<String>> {
 
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
-    let (ram_gb, _) = crate::hardware::compute_capacity();
-    let store = state.store.lock().await;
-    let mut config = store.config.clone();
-    if tier_for_ram_gb(ram_gb) == "none" {
-        if let Some(config) = &mut config {
-            config.compute_consent = Some(false);
-            config.role = "observer".into();
-            config.model_path = None;
-        }
-    }
-    Ok(config)
+    Ok(load_config_inner(&state).await)
+}
+
+async fn load_config_inner(state: &AppState) -> Option<NodeConfig> {
+    state.store.lock().await.config.clone()
 }
 
 #[tauri::command]
@@ -7208,6 +7202,55 @@ mod start_fence_tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn below_floor_config_roundtrip_preserves_choices_and_launches_only_observer() {
+        for consent in [None, Some(false), Some(true)] {
+            for save in [
+                super::ConfigSave::Preferences,
+                super::ConfigSave::Onboarding,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let state = state_with(None);
+                *state.data_dir.lock().await = directory.path().to_path_buf();
+                let original = NodeConfig {
+                    role: "worker".into(),
+                    model_path: Some("/models/standard.gguf".into()),
+                    compute_consent: consent,
+                    worker_threads: Some(3),
+                    ..NodeConfig::default()
+                };
+                state.store.lock().await.config = Some(original.clone());
+                let mut displayed = super::load_config_inner(&state).await.unwrap();
+                assert_eq!(displayed.compute_consent, consent);
+                assert_eq!(displayed.model_path, original.model_path);
+                assert_eq!(displayed.role, original.role);
+                let launched = crate::node_manager::effective_launch_config_for_ram(&displayed, 12);
+                assert_eq!(launched.role, "observer");
+                assert_eq!(launched.model_path, None);
+                assert!(!super::needs_promotion(&displayed, 12));
+                displayed.rpc_port = 29_195;
+                {
+                    let mut store = state.store.lock().await;
+                    super::apply_webview_config_save(&mut store, displayed, save);
+                    store.save_to(directory.path()).unwrap();
+                }
+                let reopened = crate::store::Store::load_from(directory.path());
+                let persisted = reopened.config.as_ref().unwrap();
+                assert_eq!(persisted.rpc_port, 29_195);
+                assert_eq!(persisted.compute_consent, consent);
+                assert_eq!(persisted.model_path, original.model_path);
+                assert_eq!(persisted.worker_threads, Some(3));
+                let launched = crate::node_manager::effective_launch_config_for_ram(persisted, 12);
+                assert_eq!(launched.role, "observer");
+                assert_eq!(launched.model_path, None);
+                *state.store.lock().await = reopened;
+                let displayed = super::load_config_inner(&state).await.unwrap();
+                assert_eq!(displayed.compute_consent, consent);
+                assert_eq!(displayed.model_path, original.model_path);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn other_desktop_cannot_save_contribution_or_preferences() {

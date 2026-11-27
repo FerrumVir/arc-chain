@@ -8093,7 +8093,7 @@ mod tests {
         let model_path = model.to_string_lossy().into_owned();
         std::fs::write(
             &binary,
-            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce --community-rpc-url --full-integer-worker'\n  exit 0\nfi\nall=\"$*\"\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/fixture-starts\" ]; then starts=$(cat \"$data_dir/fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/fixture-starts\"\nprintf '%s\\n' \"$all\" > \"$data_dir/fixture-argv-$starts\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce --community-rpc-url --full-integer-worker --threads --community-shard-worker --community-shard-coordinator-url --community-shard-coordinator-id --community-shard-transaction-domain --community-shard-expected-model-id --community-shard-max-working-set-bytes'\n  exit 0\nfi\nall=\"$*\"\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/fixture-starts\" ]; then starts=$(cat \"$data_dir/fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/fixture-starts\"\nprintf '%s\\n' \"$all\" > \"$data_dir/fixture-argv-$starts\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -8141,6 +8141,7 @@ mod tests {
         let first = fixture_argv(&data, 1).await;
         assert!(!first.contains("--model"), "{first}");
         assert!(!first.contains("--community-mode"), "{first}");
+        assert!(!first.contains("--community-shard-worker"), "{first}");
         assert_eq!(
             manager
                 .active_launch_plan
@@ -8200,10 +8201,33 @@ mod tests {
         );
         assert_eq!(relaunched.dropped_model, None);
         let third = fixture_argv(&data, 3).await;
+        let recovery = fixture_argv(&data, 2).await;
+        for forbidden in ["--model", "--community-mode", "--community-shard-worker"] {
+            assert!(!recovery.contains(forbidden), "{recovery}");
+        }
         assert!(third.contains(&format!("--model {model_path}")), "{third}");
-        assert!(
-            third.contains("--community-mode --full-integer-worker"),
-            "{third}"
+        assert!(!third.contains("--community-mode"), "{third}");
+        assert!(!third.contains("--full-integer-worker"), "{third}");
+        assert!(third.contains("--community-shard-worker"), "{third}");
+        assert!(third.contains("--threads 1"), "{third}");
+        let pin = PRODUCTION_SHARD_COORDINATOR.unwrap();
+        for (flag, value) in [
+            ("--community-shard-coordinator-url", pin.coordinator_url),
+            ("--community-shard-coordinator-id", pin.coordinator_id),
+            (
+                "--community-shard-transaction-domain",
+                pin.transaction_domain,
+            ),
+            ("--community-shard-expected-model-id", pin.expected_model_id),
+        ] {
+            assert!(third.contains(&format!("{flag} {value}")), "{third}");
+        }
+        assert_eq!(
+            relaunched.compute_mode,
+            ManagedComputeLaunchMode::CommunityShardWorker {
+                pin,
+                max_working_set_bytes: 8 * crate::hardware::GIB,
+            }
         );
 
         let mut child = manager.child.take().unwrap();
@@ -9008,6 +9032,16 @@ mod managed_shard_launch_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("update arc-node"));
+        for &missing in REQUIRED_COMMUNITY_SHARD_WORKER_FLAGS {
+            let error = ensure_binary_supports_compute_mode_with(
+                Path::new("/tmp/incomplete-shard-node"),
+                &shard_mode,
+                |flag| flag != missing,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(missing));
+            assert!(error.to_string().contains("update arc-node"));
+        }
     }
 
     #[test]

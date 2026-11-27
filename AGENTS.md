@@ -303,6 +303,8 @@ Singapore's verified coordinator identity, recovered domain and canonical model.
 Eligible desktop workers use partial shards; explicit compute opt-outs and
 unresolved shutdown recovery retain observer mode. An absent pin preserves the
 whole-worker path for rollback tests.
+Settings reads preserve saved compute choices and model selection. Memory limits
+apply to the launch configuration without inventing a saved compute opt-out.
 The rollout manifest's optional `gateway.community_sharding` boolean adds the
 exact shard routes and coordinator flag only when enabled. Disabled rendering
 preserves the sealed gateway bytes. Metadata and public requests are capped at
