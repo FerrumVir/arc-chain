@@ -176,7 +176,26 @@ def run_recorded(command, log, timeout):
     return log.read_text()
 
 
+def expected_test_targets():
+    targets = {
+        "arc_state": (("wal::tests::verified_recovery_identity_probe_", "wal::tests::attach_verified_recovery_wal_", "recovery::tests::staged_attach_", "recovery::tests::prepared_recovery_restart_restores_rooted_native_migration_and_context", "recovery::tests::restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base", "recovery::tests::restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base", "recovery::tests::streaming_recovery_reread_rejects_same_size_mutation_and_added_empty_plan_entry"), EXPECTED_STATE_TESTS),
+        "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
+        "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
+        "arc_node": (("rpc::community_sharded_routing_tests::", "rpc::community_shard_dispatch::inference_run_adapter_tests::", "community_worker::tests::partial_snapshot_", "rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
+    }
+    validate_selector_prefixes(targets)
+    return targets
+
+
+def validate_selector_prefixes(targets):
+    for target, (prefixes, expected) in targets.items():
+        missing = sorted(test for test in expected if not test.startswith(prefixes))
+        if missing:
+            raise ValueError(f"{target} mandatory tests fall outside selector prefixes: {missing}; add their prefixes before compiling qualification tests")
+
+
 def main():
+    expected_targets = expected_test_targets()
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence-dir", required=True, type=Path)
     args = parser.parse_args()
@@ -197,12 +216,6 @@ def main():
             target = row.get("target", {})
             if target.get("name") in {"arc-node", "arc_node", "arc_inference", "arc_state"}:
                 executables.setdefault(target["name"], set()).add(row["executable"])
-    expected_targets = {
-        "arc_state": (("wal::tests::attach_verified_recovery_wal_", "recovery::tests::staged_attach_", "recovery::tests::prepared_recovery_restart_restores_rooted_native_migration_and_context", "recovery::tests::restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base", "recovery::tests::restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base", "recovery::tests::streaming_recovery_reread_rejects_same_size_mutation_and_added_empty_plan_entry"), EXPECTED_STATE_TESTS),
-        "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
-        "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
-        "arc_node": (("rpc::community_sharded_routing_tests::", "rpc::community_shard_dispatch::inference_run_adapter_tests::", "community_worker::tests::partial_snapshot_", "rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
-    }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
         raise SystemExit(f"Expected one executable for each node binary, node library, inference library, and state library target, found {executables}")
     passed, failed = [], []

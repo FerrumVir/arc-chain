@@ -42,5 +42,6 @@ run_unittest "release: immutable update handoff ZIP"         scripts/release/tes
 run_unittest "benchmarks: native request latency (M8)"      scripts/benchmarks/tests/test_native_request_latency.py
 run_unittest "benchmarks: inference cost projection (M9)"   scripts/benchmarks/tests/test_project_inference_cost.py
 run_unittest "ci: no-comments checker"                     scripts/ci/test_no_comments.py
+run_unittest "qualification: mandatory recovery selectors" scripts/qualification/tests/test_recovery_peer_selectors.py
 
 exit "$failed"
