@@ -305,6 +305,14 @@ unresolved shutdown recovery retain observer mode. An absent pin preserves the
 whole-worker path for rollback tests.
 Settings reads preserve saved compute choices and model selection. Memory limits
 apply to the launch configuration without inventing a saved compute opt-out.
+Launches serialize the node guard before reading current saved settings, and a
+newer lifecycle action cancels a pending launch. Settings writers release the
+store guard before waiting for the node. Interrupted shutdown retains the child,
+shutdown control and lifecycle ownership until a later stop completes. A ready,
+consenting installation remains on the bounded reconciliation schedule so a
+running observer can resume compute after recovery or model restoration. These
+checks preserve a manually stopped node and use an already verified cached model
+without requiring download conditions.
 The rollout manifest's optional `gateway.community_sharding` boolean adds the
 exact shard routes and coordinator flag only when enabled. Disabled rendering
 preserves the sealed gateway bytes. Metadata and public requests are capped at

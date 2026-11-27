@@ -390,7 +390,6 @@ fn parse_networkmanager_metered(output: &str) -> Option<bool> {
 pub(crate) enum StopReason {
     NoConsent,
     Ineligible,
-    Ready,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,6 +397,8 @@ pub(crate) struct PromotionFacts {
     pub need: PromotionNeed,
     pub model_unavailable: bool,
     pub model_fits: bool,
+    pub running_as_observer: bool,
+    pub cached_model_ready: bool,
     pub disk_space_needed: Option<u64>,
 }
 
@@ -405,18 +406,27 @@ pub(crate) struct PromotionFacts {
 pub(crate) enum TickPlan {
     Stop(StopReason),
     Skip(SkipReason),
+    Monitor,
     Promote,
 }
 
 pub(crate) fn plan_tick(facts: PromotionFacts, conditions: &impl DownloadConditions) -> TickPlan {
-    match facts.need {
+    let needs_download = match facts.need {
         PromotionNeed::NoConsent => return TickPlan::Stop(StopReason::NoConsent),
         PromotionNeed::Ineligible => return TickPlan::Stop(StopReason::Ineligible),
-        PromotionNeed::Ready if !facts.model_unavailable => {
-            return TickPlan::Stop(StopReason::Ready)
+        PromotionNeed::Ready | PromotionNeed::Promote if !facts.model_fits => {
+            return TickPlan::Stop(StopReason::Ineligible);
         }
-        PromotionNeed::Ready if !facts.model_fits => return TickPlan::Stop(StopReason::Ineligible),
-        PromotionNeed::Ready | PromotionNeed::Promote => {}
+        PromotionNeed::Ready if !facts.model_unavailable => {
+            if !facts.running_as_observer {
+                return TickPlan::Monitor;
+            }
+            false
+        }
+        PromotionNeed::Ready | PromotionNeed::Promote => !facts.cached_model_ready,
+    };
+    if !needs_download {
+        return TickPlan::Promote;
     }
     if let Some(needed_bytes) = facts.disk_space_needed {
         return TickPlan::Skip(SkipReason::DiskFull { needed_bytes });
@@ -472,6 +482,7 @@ pub(crate) trait TickEnv {
 pub(crate) enum TickOutcome {
     Stopped(StopReason),
     Skipped(SkipReason),
+    Monitoring,
     Promoted,
     Failed(String),
 }
@@ -489,6 +500,7 @@ pub(crate) async fn background_tick<E: TickEnv>(
     match plan_tick(env.facts().await, conditions) {
         TickPlan::Stop(reason) => TickOutcome::Stopped(reason),
         TickPlan::Skip(reason) => TickOutcome::Skipped(reason),
+        TickPlan::Monitor => TickOutcome::Monitoring,
         TickPlan::Promote => match env.promote_unless_busy().await {
             None => TickOutcome::Skipped(SkipReason::InFlight),
             Some(Ok(())) => TickOutcome::Promoted,
@@ -580,6 +592,11 @@ pub(crate) async fn run_retry_loop(app: tauri::AppHandle) {
                     "background model download retry skipped; trying again later"
                 );
             }
+            TickOutcome::Monitoring => {
+                tracing::debug!(
+                    "consented worker is ready; continuing bounded reconciliation monitoring"
+                );
+            }
             TickOutcome::Promoted => {
                 tracing::info!("compute contribution enabled in the background: worker mode with a verified model");
             }
@@ -625,6 +642,8 @@ mod tests {
             need,
             model_unavailable: false,
             model_fits: true,
+            running_as_observer: false,
+            cached_model_ready: false,
             disk_space_needed: None,
         }
     }
@@ -883,10 +902,10 @@ mod tests {
     }
 
     #[test]
-    fn the_loop_stops_on_ready_no_consent_and_ineligible_but_waits_for_disk() {
+    fn the_loop_monitors_ready_stops_without_consent_or_capacity_and_waits_for_disk() {
         assert_eq!(
             plan_tick(facts(PromotionNeed::Ready), &MAINS_UNMETERED),
-            TickPlan::Stop(StopReason::Ready)
+            TickPlan::Monitor
         );
         assert_eq!(
             plan_tick(facts(PromotionNeed::NoConsent), &MAINS_UNMETERED),
@@ -935,6 +954,95 @@ mod tests {
             ),
             TickPlan::Skip(SkipReason::DiskFull { needed_bytes: 1024 })
         );
+    }
+
+    #[tokio::test]
+    async fn ready_monitoring_keeps_loop_alive_reconciles_later_observer_and_never_starts_stopped_node(
+    ) {
+        struct MonitorState {
+            facts: PromotionFacts,
+            restarts: usize,
+        }
+        struct MonitorEnv {
+            state: StdMutex<MonitorState>,
+        }
+        impl TickEnv for MonitorEnv {
+            async fn facts(&self) -> PromotionFacts {
+                self.state.lock().unwrap().facts
+            }
+
+            async fn promote_unless_busy(&self) -> Option<Result<(), String>> {
+                let mut state = self.state.lock().unwrap();
+                state.restarts += 1;
+                state.facts.running_as_observer = false;
+                Some(Ok(()))
+            }
+        }
+
+        let restricted = Conditions {
+            power: PowerSource::Battery,
+            metered: Some(true),
+        };
+        let env = MonitorEnv {
+            state: StdMutex::new(MonitorState {
+                facts: facts(PromotionNeed::Ready),
+                restarts: 0,
+            }),
+        };
+
+        let steady_or_stopped = background_tick(&env, &restricted).await;
+        assert_eq!(steady_or_stopped, TickOutcome::Monitoring);
+        assert!(!steady_or_stopped.ends_loop());
+        assert_eq!(wait_for_outcome(&steady_or_stopped), None);
+        assert_eq!(env.state.lock().unwrap().restarts, 0);
+
+        env.state.lock().unwrap().facts.running_as_observer = true;
+        let reconciled = background_tick(&env, &restricted).await;
+        assert_eq!(reconciled, TickOutcome::Promoted);
+        assert!(!reconciled.ends_loop());
+        assert_eq!(env.state.lock().unwrap().restarts, 1);
+
+        let after_reconcile = background_tick(&env, &restricted).await;
+        assert_eq!(after_reconcile, TickOutcome::Monitoring);
+        assert!(!after_reconcile.ends_loop());
+        assert_eq!(env.state.lock().unwrap().restarts, 1);
+
+        env.state.lock().unwrap().facts.need = PromotionNeed::NoConsent;
+        env.state.lock().unwrap().facts.running_as_observer = true;
+        let opted_out = background_tick(&env, &restricted).await;
+        assert_eq!(opted_out, TickOutcome::Stopped(StopReason::NoConsent));
+        assert!(opted_out.ends_loop());
+        assert_eq!(env.state.lock().unwrap().restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn no_consent_and_ineligible_explicitly_end_monitoring_loop() {
+        let no_consent = env(
+            PromotionFacts {
+                running_as_observer: true,
+                cached_model_ready: true,
+                ..facts(PromotionNeed::NoConsent)
+            },
+            Some(Ok(())),
+        );
+        let outcome = background_tick(&no_consent, &MAINS_UNMETERED).await;
+        assert_eq!(outcome, TickOutcome::Stopped(StopReason::NoConsent));
+        assert!(outcome.ends_loop());
+        assert_eq!(no_consent.promotions.load(Ordering::SeqCst), 0);
+
+        for ineligible_facts in [
+            facts(PromotionNeed::Ineligible),
+            PromotionFacts {
+                model_fits: false,
+                ..facts(PromotionNeed::Ready)
+            },
+        ] {
+            let ineligible = env(ineligible_facts, Some(Ok(())));
+            let outcome = background_tick(&ineligible, &MAINS_UNMETERED).await;
+            assert_eq!(outcome, TickOutcome::Stopped(StopReason::Ineligible));
+            assert!(outcome.ends_loop());
+            assert_eq!(ineligible.promotions.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
@@ -1084,11 +1192,13 @@ mod tests {
             "the missing model is fetched again"
         );
 
-        for need in [
-            PromotionNeed::Ready,
-            PromotionNeed::NoConsent,
-            PromotionNeed::Ineligible,
-        ] {
+        let ready = env(facts(PromotionNeed::Ready), Some(Ok(())));
+        let outcome = background_tick(&ready, &MAINS_UNMETERED).await;
+        assert_eq!(outcome, TickOutcome::Monitoring);
+        assert!(!outcome.ends_loop());
+        assert_eq!(ready.promotions.load(Ordering::SeqCst), 0);
+
+        for need in [PromotionNeed::NoConsent, PromotionNeed::Ineligible] {
             let done = env(facts(need), Some(Ok(())));
             let outcome = background_tick(&done, &MAINS_UNMETERED).await;
             assert!(outcome.ends_loop(), "{need:?} ends the loop");

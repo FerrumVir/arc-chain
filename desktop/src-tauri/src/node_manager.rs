@@ -1265,6 +1265,7 @@ fn configure_node_process(cmd: &mut Command) {
 
 pub struct NodeManager {
     child: Option<Child>,
+    active_recovery_launch: bool,
     started_at: Option<Instant>,
     pub rpc_port: u16,
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
@@ -1290,6 +1291,21 @@ pub struct NodeManager {
     update_suspended_crash_retry: Option<SuspendedCrashRetry>,
     #[cfg(test)]
     test_ram_gb: Option<u64>,
+}
+
+struct ManagedStopFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl ManagedStopFlag {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for ManagedStopFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct SuspendedCrashRetry {
@@ -1567,6 +1583,7 @@ impl NodeManager {
     pub fn new() -> Self {
         Self {
             child: None,
+            active_recovery_launch: false,
             started_at: None,
             rpc_port: 9090,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_SIZE))),
@@ -1953,6 +1970,19 @@ impl NodeManager {
         self.child.is_some()
     }
 
+    pub(crate) fn requires_completed_stop_before_start(&self) -> bool {
+        (self.child.is_some() && self.active_recovery_launch)
+            || (!self.desired_running && (self.child.is_some() || self.lifecycle_lock.is_some()))
+    }
+
+    pub(crate) fn running_as_observer(&self) -> bool {
+        self.child.is_some()
+            && (self.active_recovery_launch
+                || self.active_launch_plan.as_ref().is_some_and(|plan| {
+                    matches!(plan.compute_mode, ManagedComputeLaunchMode::Observer)
+                }))
+    }
+
     pub async fn start(
         &mut self,
         config: &NodeConfig,
@@ -2324,6 +2354,7 @@ impl NodeManager {
         }
 
         self.child = Some(child);
+        self.active_recovery_launch = recovery_launch;
         crate::sharing_awake::set_worker(
             if config.role == "worker"
                 && config.model_path.is_some()
@@ -2351,6 +2382,7 @@ impl NodeManager {
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
                 crate::sharing_awake::set_worker(None);
                 self.child = None;
+                self.active_recovery_launch = false;
                 self.started_at = None;
                 self.shutdown_control = None;
                 self.active_worker_threads = None;
@@ -2426,15 +2458,12 @@ impl NodeManager {
 
     async fn stop_owned_child(&mut self) -> anyhow::Result<usize> {
         let mut stopped = 0usize;
-        if let Some(mut child) = self.child.take() {
-            let mut shutdown_control = self.shutdown_control.take();
-            self.stopping
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(child) = self.child.as_mut() {
+            let stopping = ManagedStopFlag::new(self.stopping.clone());
             let outcome =
-                terminate_owned_child(&mut child, shutdown_control.as_mut(), GRACEFUL_STOP_TIMEOUT)
+                terminate_owned_child(child, self.shutdown_control.as_mut(), GRACEFUL_STOP_TIMEOUT)
                     .await;
-            self.stopping
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            drop(stopping);
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -2442,6 +2471,8 @@ impl NodeManager {
                     let exited_before_stop = error
                         .downcast_ref::<OwnedNodeExitedBeforeStop>()
                         .map(ToString::to_string);
+                    let child = self.child.take().expect("owned child remains during stop");
+                    let shutdown_control = self.shutdown_control.take();
                     self.restore_child_after_failed_stop(child, shutdown_control);
                     if let Some(note) = exited_before_stop {
                         push_log(&self.logs, "warn", note).await;
@@ -2454,6 +2485,9 @@ impl NodeManager {
                     return Err(error);
                 }
             };
+            self.child = None;
+            self.active_recovery_launch = false;
+            self.shutdown_control = None;
             if let Some(reason) = outcome.forced_reason {
                 push_log(
                     &self.logs,
@@ -2467,7 +2501,6 @@ impl NodeManager {
             }
             stopped += 1;
             self.refresh_durability_failure()?;
-            self.lifecycle_lock = None;
             self.started_at = None;
             self.active_worker_threads = None;
             self.active_model_unavailable = None;
@@ -2484,6 +2517,7 @@ impl NodeManager {
     ) {
         match child.try_wait() {
             Ok(Some(_status)) => {
+                self.active_recovery_launch = false;
                 self.started_at = None;
                 self.active_worker_threads = None;
                 self.active_model_unavailable = None;
@@ -2509,28 +2543,22 @@ impl NodeManager {
                 "legacy desktop node reconciliation is unresolved; refusing Stop/update boundary: {error}"
             );
         }
-        let mut lifecycle_lock = match self.lifecycle_lock.take() {
-            Some(lock) => Some(lock),
-            None => self
+        if self.lifecycle_lock.is_none() {
+            self.lifecycle_lock = self
                 .managed_data_dir
                 .as_deref()
                 .map(|data_dir| {
                     acquire_managed_lifecycle_lock_for_reconciliation(&data_dir.to_string_lossy())
                 })
-                .transpose()?,
-        };
-        let mut stopped = match self.stop_owned_child().await {
-            Ok(stopped) => stopped,
-            Err(error) => {
-                if self.child.is_some() {
-                    self.lifecycle_lock = lifecycle_lock.take();
-                }
-                return Err(error);
-            }
-        };
+                .transpose()?;
+        }
+        let mut stopped = self.stop_owned_child().await?;
+        let reconciliation = stop_detached_arc_node(
+            self.legacy_windows_stop_context.as_ref(),
+            self.managed_data_dir.as_deref(),
+        )
+        .await;
         let legacy_context = self.legacy_windows_stop_context.take();
-        let reconciliation =
-            stop_detached_arc_node(legacy_context.as_ref(), self.managed_data_dir.as_deref()).await;
         let detached = finish_legacy_reconciliation(
             &mut self.legacy_windows_stop_context,
             legacy_context,
@@ -2571,6 +2599,7 @@ impl NodeManager {
             )
             .await;
         }
+        let lifecycle_lock = self.lifecycle_lock.take();
         self.refresh_durability_failure()?;
         if let Some(error) = self.durability_failure.as_deref() {
             return Err(ManagedDurabilityRecoveryRequired {
@@ -2578,7 +2607,7 @@ impl NodeManager {
             }
             .into());
         }
-        lifecycle_lock = lifecycle_lock
+        let lifecycle_lock = lifecycle_lock
             .map(refresh_managed_lifecycle_namespace)
             .transpose()?;
         Ok(StopLifecycleOutcome {
@@ -7680,6 +7709,113 @@ mod tests {
         child.wait().await.unwrap();
         manager.child = None;
         manager.shutdown_control = None;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_stop_with_unproven_receipt_releases_owner_for_recovery() {
+        let dir = resource_test_dir("stopped-recovery-owner");
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let (_control, _genesis) = receipt_control_for_executable(&dir, &shell);
+        let lifecycle =
+            acquire_managed_lifecycle_lock_for_reconciliation(&dir.to_string_lossy()).unwrap();
+        let mut manager = NodeManager::new();
+        manager.lifecycle_lock = Some(lifecycle);
+        manager.managed_data_dir = Some(dir.clone());
+        assert!(manager.requires_completed_stop_before_start());
+        assert!(probe_existing_managed_lifecycle_owner(&dir.to_string_lossy()).is_err());
+
+        let error = manager.stop().await.unwrap_err();
+        assert!(error
+            .downcast_ref::<ManagedDurabilityRecoveryRequired>()
+            .is_some());
+        assert!(manager.lifecycle_lock.is_none());
+        assert!(!manager.requires_completed_stop_before_start());
+        assert!(managed_shutdown_recovery_required(&dir.to_string_lossy()).unwrap());
+        let recovery_owner = acquire_managed_lifecycle_lock(&dir.to_string_lossy()).unwrap();
+        drop(recovery_owner);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_recovery_stop_retains_owned_child_control_and_lifecycle_until_ack() {
+        let dir = resource_test_dir("cancelled-recovery-stop");
+        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+        let lifecycle = acquire_managed_lifecycle_lock(&dir.to_string_lossy()).unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let (control, genesis) = receipt_control_for_executable(&dir, &shell);
+        let request = control.request_file.clone();
+        let ack_ready = dir.join("ack-ready");
+        let child = Command::new(&shell)
+            .args([
+                "-c",
+                "while [ ! -f \"$ARC_STOP_REQUEST\" ]; do sleep 0.01; done; while [ ! -f \"$ARC_ACK_READY\" ]; do sleep 0.01; done; exit 0",
+            ])
+            .env("ARC_STOP_REQUEST", &request)
+            .env("ARC_ACK_READY", &ack_ready)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut manager = NodeManager::new();
+        manager.child = Some(child);
+        manager.shutdown_control = Some(control);
+        manager.lifecycle_lock = Some(lifecycle);
+        manager.managed_data_dir = Some(dir.clone());
+        manager.started_at = Some(Instant::now());
+        manager.desired_running = true;
+        assert!(!manager.requires_completed_stop_before_start());
+        manager.active_recovery_launch = true;
+        assert!(manager.requires_completed_stop_before_start());
+        assert!(manager.running_as_observer());
+
+        let mut attempt = Box::pin(manager.stop());
+        tokio::select! {
+            result = &mut attempt => panic!("stop completed before the held ACK: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                while !request.is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("stop request must be published before cancellation"),
+        }
+        drop(attempt);
+
+        assert_eq!(manager.pid(), Some(pid));
+        assert!(manager
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+        assert!(manager.shutdown_control.is_some());
+        assert!(manager.lifecycle_lock.is_some());
+        assert!(!manager.stopping.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.requires_completed_stop_before_start());
+        assert!(probe_existing_managed_lifecycle_owner(&dir.to_string_lossy()).is_err());
+
+        let control = manager.shutdown_control.as_ref().unwrap();
+        arc_crypto::secret_file::acknowledge_desktop_shutdown_receipt(
+            &control.data_dir,
+            &control.token_bytes().unwrap(),
+            &control.receipt_nonce.unwrap(),
+            control.receipt_executable.as_ref().unwrap(),
+            &genesis,
+        )
+        .unwrap();
+        std::fs::write(&ack_ready, b"ready").unwrap();
+        manager.stop().await.unwrap();
+        assert!(!manager.is_running());
+        assert!(!manager.requires_completed_stop_before_start());
+        assert!(manager.shutdown_control.is_none());
+        assert!(manager.lifecycle_lock.is_none());
+        assert!(!manager.active_recovery_launch);
+        assert!(!manager.running_as_observer());
+        assert!(!managed_shutdown_recovery_required(&dir.to_string_lossy()).unwrap());
+        probe_existing_managed_lifecycle_owner(&dir.to_string_lossy()).unwrap();
+        drop(manager);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
