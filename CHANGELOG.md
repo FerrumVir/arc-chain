@@ -18,6 +18,23 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.28 - Release-preparation snapshot (2026-11-28)
+
+> **Candidate note:** This entry records the v0.8.28 release-preparation
+> snapshot. It does not claim publication, deployment, or 100 active operators.
+
+- Partial workers recover from a lost lease release by cleaning up the exact
+  remembered assignment before requesting new work. Regressed lease sequences
+  and old coordinator boots remain fenced.
+- Integrated workers reconnect after exhausted lease and registration recovery
+  budgets, retaining cancellable backoff and the existing protocol checks.
+- Partial work holds the shared update-drain permit through claim, execution
+  and result submission. Closed admission pauses claims while heartbeats and
+  cancellation continue.
+- Cleanly stopped desktops with launch-on-start disabled can install updates
+  under a lifecycle fence. Contention retries without stopping detached nodes;
+  pending recovery, failure state and manual-stop behavior stay preserved.
+
 ## v0.8.27 - Release-preparation snapshot (2026-11-27)
 
 > **Candidate note:** This entry records the v0.8.27 release-preparation

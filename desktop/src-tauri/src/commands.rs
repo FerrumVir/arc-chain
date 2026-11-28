@@ -769,8 +769,17 @@ pub(crate) async fn try_prepare_auto_update_relaunch_inner(
     state: &AppState,
     boundary: AppUpdateBoundary,
 ) -> CmdResult<crate::auto_update::PrepareResult> {
+    let can_install = update_install_policy().await?.can_install;
+    try_prepare_auto_update_relaunch_with_policy(state, boundary, can_install).await
+}
+
+async fn try_prepare_auto_update_relaunch_with_policy(
+    state: &AppState,
+    boundary: AppUpdateBoundary,
+    can_install: bool,
+) -> CmdResult<crate::auto_update::PrepareResult> {
     use crate::auto_update::{PrepareResult, RequestFence};
-    if !update_install_policy().await?.can_install {
+    if !can_install {
         return Ok(PrepareResult::busy(
             "This installation is updated by its package manager",
             0,
@@ -818,18 +827,41 @@ pub(crate) async fn try_prepare_auto_update_relaunch_inner(
             format!("automatic update preparation requires a safe abort: {error}")
         });
     }
-    if node.pid().is_some() {
-        state.cancel_startup_retry();
+    if node.pid().is_none() {
+        let store = state.store.lock().await;
+        let Some(config) = store.config.as_ref() else {
+            *held = None;
+            return Ok(PrepareResult::busy("Automatic installation is disabled", 0));
+        };
+        if !config.auto_update || !config.auto_install_updates {
+            *held = None;
+            return Ok(PrepareResult::busy("Automatic installation is disabled", 0));
+        }
+        if config.auto_start {
+            *held = None;
+            return Ok(PrepareResult::busy(
+                "The node is stopped while launch-on-start is enabled; keeping your manual stop or recovery state instead of relaunching automatically",
+                0,
+            ));
+        }
     }
     let result = node.prepare_auto_update_relaunch().await;
-    if matches!(result, Ok(PrepareResult::Busy { .. })) {
-        *held = None;
+    match &result {
+        Ok(PrepareResult::Prepared) => state.cancel_startup_retry(),
+        Ok(PrepareResult::Busy { .. }) => {
+            *held = None;
+        }
+        Err(_) => {}
     }
     result.map_err(|error| format!("automatic update preparation requires a safe abort: {error}"))
 }
 
 #[tauri::command]
 pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
+    begin_update_handoff_inner(&state).await
+}
+
+pub(crate) async fn begin_update_handoff_inner(state: &AppState) -> CmdResult<()> {
     let _requests = state.auto_update_requests.lock().await;
     let mut node = state.node.lock().await;
     node.begin_update_handoff()
@@ -838,6 +870,10 @@ pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    abort_update_relaunch_inner(&state).await
+}
+
+pub(crate) async fn abort_update_relaunch_inner(state: &AppState) -> CmdResult<()> {
     let mut requests = state.auto_update_requests.lock().await;
     let mut node = state.node.lock().await;
     node.abort_update_relaunch().await.map_err(|error| {
@@ -8281,5 +8317,268 @@ mod slow_crash_wait_update_tests {
         assert_update_holds_and_nothing_relaunches(&state).await;
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn idle_update_state(auto_start: bool) -> (tempfile::TempDir, PathBuf, PathBuf, AppState) {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().canonicalize().unwrap();
+        let app_data = canonical_root.join("app-data");
+        let data = canonical_root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&app_data).unwrap();
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let state = super::inference_retry_tests::test_state();
+        *state.data_dir.try_lock().unwrap() = app_data.clone();
+        {
+            let mut store = state.store.try_lock().unwrap();
+            store.config = Some(NodeConfig {
+                data_dir: configured.clone(),
+                auto_start,
+                auto_update: true,
+                auto_install_updates: true,
+                ..NodeConfig::default()
+            });
+            store.save_to(&app_data).unwrap();
+        }
+        state
+            .node
+            .try_lock()
+            .unwrap()
+            .configure_managed_data_dir(&configured)
+            .unwrap();
+        (temp, app_data, data, state)
+    }
+
+    async fn prepare_idle_auto_update_for_test(
+        state: &AppState,
+        boundary: AppUpdateBoundary,
+        can_install: bool,
+    ) -> CmdResult<crate::auto_update::PrepareResult> {
+        try_prepare_auto_update_relaunch_with_policy(state, boundary, can_install).await
+    }
+
+    #[tokio::test]
+    async fn idle_auto_update_with_auto_start_enabled_defers_and_preserves_settings() {
+        use crate::auto_update::PrepareResult;
+
+        let (temp, app_data, data, state) = idle_update_state(true);
+        let configured = data.to_string_lossy().into_owned();
+        let before_store = std::fs::read(app_data.join("store.json")).unwrap();
+        let startup_cancel = state.startup_retry_cancel.subscribe();
+
+        let package_busy =
+            prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, false)
+                .await
+                .unwrap();
+        assert!(matches!(
+            package_busy,
+            PrepareResult::Busy { active_jobs: 0, .. }
+        ));
+        assert!(!startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_none());
+
+        let result = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap();
+        match result {
+            PrepareResult::Busy {
+                reason,
+                active_jobs,
+            } => {
+                assert_eq!(active_jobs, 0);
+                assert!(
+                    reason.contains("manual stop or recovery")
+                        && reason.contains("launch-on-start"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Busy for auto_start=true idle node, got {other:?}"),
+        }
+        assert!(!startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_none());
+        assert!(state.community_inference_write.try_lock().is_ok());
+        assert!(state.wallet_write.try_lock().is_ok());
+        assert!(state.node.lock().await.refuse_start_during_update().is_ok());
+        assert!(state.node.lock().await.pid().is_none());
+        assert!(state.store.lock().await.config.as_ref().unwrap().auto_start);
+        assert_eq!(
+            std::fs::read(app_data.join("store.json")).unwrap(),
+            before_store
+        );
+        drop(crate::node_manager::acquire_managed_lifecycle_lock(&configured).unwrap());
+
+        state.store.lock().await.config.as_mut().unwrap().auto_start = false;
+        let retry = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap();
+        assert_eq!(retry, PrepareResult::Prepared);
+        assert!(startup_cancel.has_changed().unwrap());
+        abort_update_relaunch_inner(&state).await.unwrap();
+        drop(state);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn idle_auto_update_with_auto_start_disabled_prepares_and_aborts_cleanly() {
+        use crate::auto_update::PrepareResult;
+
+        let (temp, _app_data, data, state) = idle_update_state(false);
+        let configured = data.to_string_lossy().into_owned();
+        let startup_cancel = state.startup_retry_cancel.subscribe();
+
+        let prepared = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap();
+        assert_eq!(prepared, PrepareResult::Prepared);
+        assert!(startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_some());
+        assert!(state.community_inference_write.try_lock().is_err());
+        assert!(state.wallet_write.try_lock().is_err());
+        assert!(state
+            .node
+            .lock()
+            .await
+            .refuse_start_during_update()
+            .is_err());
+        assert!(crate::node_manager::acquire_managed_lifecycle_lock(&configured).is_err());
+
+        let second = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap();
+        assert!(matches!(second, PrepareResult::Busy { active_jobs: 0, .. }));
+
+        abort_update_relaunch_inner(&state).await.unwrap();
+        assert!(state.auto_update_requests.lock().await.is_none());
+        assert!(state.community_inference_write.try_lock().is_ok());
+        assert!(state.wallet_write.try_lock().is_ok());
+        assert!(state.node.lock().await.refuse_start_during_update().is_ok());
+        assert!(state.node.lock().await.pid().is_none());
+        drop(crate::node_manager::acquire_managed_lifecycle_lock(&configured).unwrap());
+
+        let prepared_again =
+            prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+                .await
+                .unwrap();
+        assert_eq!(prepared_again, PrepareResult::Prepared);
+        begin_update_handoff_inner(&state).await.unwrap();
+        assert!(abort_update_relaunch_inner(&state).await.is_err());
+        assert!(state
+            .node
+            .lock()
+            .await
+            .refuse_start_during_update()
+            .is_err());
+        drop(state);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn idle_auto_update_contention_releases_request_fence_and_keeps_retry() {
+        use crate::auto_update::PrepareResult;
+        use fs2::FileExt as _;
+
+        let (temp, _app_data, data, state) = idle_update_state(false);
+        let configured = data.to_string_lossy().into_owned();
+        let node_lock_path = data.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+
+        let startup_cancel = state.startup_retry_cancel.subscribe();
+        let data_busy =
+            prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+                .await
+                .unwrap();
+        assert!(matches!(
+            data_busy,
+            PrepareResult::Busy { active_jobs: 0, .. }
+        ));
+        assert!(!startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_none());
+        assert!(state.community_inference_write.try_lock().is_ok());
+        assert!(state.wallet_write.try_lock().is_ok());
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+
+        let owner_lock = crate::node_manager::acquire_managed_lifecycle_lock(&configured).unwrap();
+        let owner_busy =
+            prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+                .await
+                .unwrap();
+        assert!(matches!(
+            owner_busy,
+            PrepareResult::Busy { active_jobs: 0, .. }
+        ));
+        assert!(!startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_none());
+        assert!(state.community_inference_write.try_lock().is_ok());
+        assert!(state.wallet_write.try_lock().is_ok());
+        drop(owner_lock);
+
+        let retry = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap();
+        assert_eq!(retry, PrepareResult::Prepared);
+        assert!(startup_cancel.has_changed().unwrap());
+        abort_update_relaunch_inner(&state).await.unwrap();
+        drop(state);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn idle_auto_update_error_keeps_request_fence_until_abort_without_cancelling_retry() {
+        let (temp, _app_data, _data, state) = idle_update_state(false);
+        state
+            .node
+            .lock()
+            .await
+            .block_legacy_windows_reconciliation("simulated legacy refusal");
+        let startup_cancel = state.startup_retry_cancel.subscribe();
+
+        let error = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Ordinary, true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("legacy desktop node reconciliation is unresolved"),
+            "{error}"
+        );
+        assert!(!startup_cancel.has_changed().unwrap());
+        assert!(state.auto_update_requests.lock().await.is_some());
+        assert!(state.community_inference_write.try_lock().is_err());
+
+        abort_update_relaunch_inner(&state).await.unwrap();
+        assert!(state.auto_update_requests.lock().await.is_none());
+        assert!(state.community_inference_write.try_lock().is_ok());
+        drop(state);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn fenced_repair_path_retains_behavior_even_when_auto_start_is_enabled() {
+        use crate::auto_update::PrepareResult;
+
+        let (temp, _app_data, data, state) = idle_update_state(true);
+        let configured = data.to_string_lossy().into_owned();
+        let startup_cancel = state.startup_retry_cancel.subscribe();
+
+        let prepared = prepare_idle_auto_update_for_test(&state, AppUpdateBoundary::Fenced, true)
+            .await
+            .unwrap();
+        assert_eq!(prepared, PrepareResult::Prepared);
+        assert!(startup_cancel.has_changed().unwrap());
+        assert!(state
+            .node
+            .lock()
+            .await
+            .refuse_start_during_update()
+            .is_err());
+        abort_update_relaunch_inner(&state).await.unwrap();
+        drop(crate::node_manager::acquire_managed_lifecycle_lock(&configured).unwrap());
+        drop(state);
+        drop(temp);
     }
 }

@@ -13,6 +13,7 @@ use crate::community_sharding::{
     ShardStepSubmitRequest, ShardStepSubmitResponse, ShardStepWork, TrustedModelSpec,
 };
 use crate::community_worker::CommunityWorkerStatus;
+use crate::native_inference::{WorkerExecutionGate, WorkerExecutionPermit};
 use crate::rpc::community_shard_http::{
     COMMUNITY_SHARD_CAPABILITY, COMMUNITY_SHARD_CLAIM_STEP_PATH, COMMUNITY_SHARD_HEARTBEAT_PATH,
     COMMUNITY_SHARD_LEASE_PATH, COMMUNITY_SHARD_RELEASE_PATH,
@@ -98,6 +99,42 @@ impl PartialEq for ShardWorkerTelemetrySink {
 
 impl Eq for ShardWorkerTelemetrySink {}
 
+#[derive(Clone)]
+pub struct ShardWorkerExecutionGate(Arc<WorkerExecutionGate>);
+
+impl ShardWorkerExecutionGate {
+    pub fn new(gate: Arc<WorkerExecutionGate>) -> Self {
+        Self(gate)
+    }
+
+    pub fn gate(&self) -> &Arc<WorkerExecutionGate> {
+        &self.0
+    }
+}
+
+impl From<Arc<WorkerExecutionGate>> for ShardWorkerExecutionGate {
+    fn from(gate: Arc<WorkerExecutionGate>) -> Self {
+        Self(gate)
+    }
+}
+
+impl std::fmt::Debug for ShardWorkerExecutionGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardWorkerExecutionGate")
+            .field("closed", &self.0.is_closed())
+            .field("active_jobs", &self.0.active_jobs())
+            .finish()
+    }
+}
+
+impl PartialEq for ShardWorkerExecutionGate {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ShardWorkerExecutionGate {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommunityShardWorkerConfig {
     pub coordinator_base_url: String,
@@ -124,6 +161,7 @@ pub struct CommunityShardWorkerConfig {
     pub reconnect_base_backoff_ms: u64,
     pub reconnect_max_backoff_ms: u64,
     pub telemetry: Option<ShardWorkerTelemetrySink>,
+    pub worker_execution_gate: Option<ShardWorkerExecutionGate>,
 }
 
 impl CommunityShardWorkerConfig {
@@ -161,6 +199,7 @@ impl CommunityShardWorkerConfig {
             reconnect_base_backoff_ms: DEFAULT_RECONNECT_BASE_BACKOFF_MS,
             reconnect_max_backoff_ms: DEFAULT_RECONNECT_MAX_BACKOFF_MS,
             telemetry: None,
+            worker_execution_gate: None,
         }
     }
 
@@ -358,6 +397,12 @@ struct LeaseFenceTracker {
 }
 
 impl LeaseFenceTracker {
+    fn is_current_high_water(&self, assignment: &ShardLeaseAssignment) -> bool {
+        let boot = assignment.lease_id.boot_nonce;
+        !self.fenced_boot_nonces.contains(&boot.0)
+            && self.high_water == Some((boot, assignment.lease_id.seq, assignment.lease_epoch))
+    }
+
     fn validate_next(
         &self,
         assignment: &ShardLeaseAssignment,
@@ -460,8 +505,14 @@ enum WaitOutcome {
 
 enum LeaseAcquireOutcome {
     Acquired(ShardLeaseResponse),
+    PriorLeaseReleaseRetry { needs_reregister: bool },
     ReregisterRequired,
     Shutdown,
+}
+
+enum GateAdmission {
+    Admitted(Option<WorkerExecutionPermit>),
+    Paused,
 }
 
 enum RegisterOutcome {
@@ -489,6 +540,7 @@ struct WorkerRuntime {
     shutdown: watch::Receiver<bool>,
     executor: Option<CommunityShardExecutor>,
     active_lease: Option<ShardLeaseAssignment>,
+    unreleased_prior_lease: Option<ShardLeaseAssignment>,
     ready_ttl_ms: Option<u64>,
     fence: LeaseFenceTracker,
     consecutive_reacquires: usize,
@@ -580,6 +632,7 @@ impl WorkerRuntime {
             shutdown,
             executor: None,
             active_lease: None,
+            unreleased_prior_lease: None,
             ready_ttl_ms: None,
             fence: LeaseFenceTracker::default(),
             consecutive_reacquires: 0,
@@ -644,6 +697,18 @@ impl WorkerRuntime {
                         self.summary.leases_acquired += 1;
                         (resp.assignment, false)
                     }
+                    LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                        needs_reregister: rereg,
+                    } => {
+                        self.telemetry(|status| {
+                            status.record_shard_reconnecting("prior lease release pending")
+                        });
+                        needs_reregister = rereg;
+                        if !self.wait_reacquire_backoff().await? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
                     LeaseAcquireOutcome::ReregisterRequired => {
                         needs_reregister = true;
                         continue;
@@ -652,6 +717,7 @@ impl WorkerRuntime {
                 }
             };
             self.fence.record(&assignment);
+            self.unreleased_prior_lease = None;
             self.active_lease = Some(assignment.clone());
             self.summary.clean_release_sent = false;
             self.consecutive_heartbeat_transients = 0;
@@ -750,6 +816,7 @@ impl WorkerRuntime {
         self.release_local_and_remote().await;
         self.executor = None;
         self.active_lease = None;
+        self.unreleased_prior_lease = None;
         self.ready_ttl_ms = None;
     }
 
@@ -813,9 +880,12 @@ impl WorkerRuntime {
         {
             release_req = Some(req);
         }
-        let lease_fallback = self.active_lease.take();
+        let prior_assignment = self
+            .active_lease
+            .take()
+            .or_else(|| self.unreleased_prior_lease.clone());
         if release_req.is_none()
-            && let Some(lease) = lease_fallback
+            && let Some(lease) = prior_assignment.as_ref()
         {
             release_req = Some(ShardReleaseRequest {
                 worker_id: self.worker_id,
@@ -824,6 +894,7 @@ impl WorkerRuntime {
             });
         }
         if let Some(req) = release_req {
+            let mut released = false;
             let release_deadline =
                 Instant::now() + Duration::from_millis(self.config.release_timeout_ms);
             for attempt in 0..MAX_RELEASE_TRANSIENT_ATTEMPTS {
@@ -845,6 +916,7 @@ impl WorkerRuntime {
                     Ok(HttpCallResult::Ok(resp)) => {
                         if resp.released {
                             self.summary.clean_release_sent = true;
+                            released = true;
                         }
                         break;
                     }
@@ -864,6 +936,83 @@ impl WorkerRuntime {
                     }
                     _ => break,
                 }
+            }
+            if released {
+                self.unreleased_prior_lease = None;
+            } else if let Some(lease) = prior_assignment {
+                self.unreleased_prior_lease = Some(lease);
+            }
+        }
+    }
+
+    fn is_unreleased_prior_assignment(&self, assignment: &ShardLeaseAssignment) -> bool {
+        self.unreleased_prior_lease.as_ref() == Some(assignment)
+            && self.fence.is_current_high_water(assignment)
+    }
+
+    async fn release_duplicate_prior_lease(
+        &mut self,
+        assignment: &ShardLeaseAssignment,
+    ) -> Result<LeaseAcquireOutcome, CommunityShardWorkerError> {
+        let req = ShardReleaseRequest {
+            worker_id: self.worker_id,
+            lease_id: assignment.lease_id,
+            lease_epoch: assignment.lease_epoch,
+        };
+        let timeout = Duration::from_millis(self.config.release_timeout_ms);
+        let call = match self
+            .post_signed_shard_cancellable::<ShardReleaseRequest, ShardReleaseResponse>(
+                COMMUNITY_SHARD_RELEASE_PATH,
+                &req,
+                timeout,
+            )
+            .await
+        {
+            Ok(call) => call,
+            Err(err) => {
+                self.unreleased_prior_lease = None;
+                return Err(err);
+            }
+        };
+        match call {
+            CancellableCall::Shutdown => Ok(LeaseAcquireOutcome::Shutdown),
+            CancellableCall::Completed(HttpCallResult::Ok(resp)) => {
+                if resp.released {
+                    self.summary.clean_release_sent = true;
+                    self.unreleased_prior_lease = None;
+                }
+                Ok(LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                    needs_reregister: false,
+                })
+            }
+            CancellableCall::Completed(HttpCallResult::HttpError { status, body }) => {
+                if is_registration_missing_error(status, &body) {
+                    return Ok(LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                        needs_reregister: true,
+                    });
+                }
+                if is_lease_not_found_error(status, &body) {
+                    self.unreleased_prior_lease = None;
+                    return Ok(LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                        needs_reregister: false,
+                    });
+                }
+                if status == StatusCode::CONFLICT && !is_fatal_model_or_profile_conflict(&body) {
+                    return Ok(LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                        needs_reregister: false,
+                    });
+                }
+                self.unreleased_prior_lease = None;
+                Err(CommunityShardWorkerError::ProtocolRejected {
+                    path: COMMUNITY_SHARD_RELEASE_PATH,
+                    status: status.as_u16(),
+                    detail: body,
+                })
+            }
+            CancellableCall::Completed(HttpCallResult::Transient(_)) => {
+                Ok(LeaseAcquireOutcome::PriorLeaseReleaseRetry {
+                    needs_reregister: false,
+                })
             }
         }
     }
@@ -969,13 +1118,17 @@ impl WorkerRuntime {
                 CancellableCall::Shutdown => return Ok(LeaseAcquireOutcome::Shutdown),
                 CancellableCall::Completed(HttpCallResult::Ok(resp)) => {
                     let now_ms = checked_now_unix_ms()?;
-                    validate_lease_response(
+                    validate_lease_response_envelope(&self.config, &resp)?;
+                    validate_lease_assignment_shape(
                         &self.config,
                         &self.model_spec,
-                        &resp,
-                        now_ms,
-                        &self.fence,
+                        &resp.assignment,
                     )?;
+                    if self.is_unreleased_prior_assignment(&resp.assignment) {
+                        return self.release_duplicate_prior_lease(&resp.assignment).await;
+                    }
+                    validate_lease_assignment_progression(&resp.assignment, now_ms, &self.fence)?;
+                    self.unreleased_prior_lease = None;
                     return Ok(LeaseAcquireOutcome::Acquired(resp));
                 }
                 CancellableCall::Completed(HttpCallResult::HttpError { status, body }) => {
@@ -1179,6 +1332,16 @@ impl WorkerRuntime {
         }
     }
 
+    fn try_enter_worker_execution_gate(&self) -> GateAdmission {
+        match self.config.worker_execution_gate.as_ref() {
+            Some(gate) => match gate.gate().try_enter() {
+                Some(permit) => GateAdmission::Admitted(Some(permit)),
+                None => GateAdmission::Paused,
+            },
+            None => GateAdmission::Admitted(None),
+        }
+    }
+
     async fn run_active_loop(&mut self) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
         let mut next_heartbeat_at = self.next_heartbeat_deadline();
         let mut transient_claim_errors = 0usize;
@@ -1202,6 +1365,25 @@ impl WorkerRuntime {
                     other => return Ok(other),
                 }
             }
+            let execution_permit = match self.try_enter_worker_execution_gate() {
+                GateAdmission::Admitted(permit) => permit,
+                GateAdmission::Paused => {
+                    let wait = Duration::from_millis(self.config.idle_poll_interval_ms);
+                    match self
+                        .wait_with_heartbeats(wait, &mut next_heartbeat_at, None)
+                        .await?
+                    {
+                        WaitOutcome::Elapsed | WaitOutcome::WatchedSessionCancelled => continue,
+                        WaitOutcome::Rebalance(next) => {
+                            return Ok(StepCycleOutcome::Rebalance(next));
+                        }
+                        WaitOutcome::Reacquire { needs_reregister } => {
+                            return Ok(StepCycleOutcome::Reacquire { needs_reregister });
+                        }
+                        WaitOutcome::Shutdown => return Ok(StepCycleOutcome::Shutdown),
+                    }
+                }
+            };
             let claim_req = ShardClaimStepRequest {
                 worker_id: self.worker_id,
                 lease_id: assignment.lease_id,
@@ -1218,11 +1400,15 @@ impl WorkerRuntime {
                 )
                 .await?
             {
-                CancellableCall::Shutdown => return Ok(StepCycleOutcome::Shutdown),
+                CancellableCall::Shutdown => {
+                    drop(execution_permit);
+                    return Ok(StepCycleOutcome::Shutdown);
+                }
                 CancellableCall::Completed(HttpCallResult::Ok(resp)) => {
                     transient_claim_errors = 0;
                     match resp {
                         ShardClaimStepResponse::Idle => {
+                            drop(execution_permit);
                             let wait = Duration::from_millis(self.config.idle_poll_interval_ms);
                             match self
                                 .wait_with_heartbeats(wait, &mut next_heartbeat_at, None)
@@ -1239,6 +1425,7 @@ impl WorkerRuntime {
                             }
                         }
                         ShardClaimStepResponse::CancelSessions { cancellations } => {
+                            drop(execution_permit);
                             if cancellations.len() > MAX_CANCELLATIONS_PER_WORKER_HARD_CAP {
                                 return Err(CommunityShardWorkerError::MalformedResponse {
                                     path: COMMUNITY_SHARD_CLAIM_STEP_PATH,
@@ -1248,6 +1435,7 @@ impl WorkerRuntime {
                             self.apply_cancellations(&cancellations)?;
                         }
                         ShardClaimStepResponse::RebalanceRequired { assignment: next } => {
+                            drop(execution_permit);
                             let now_ms = checked_now_unix_ms()?;
                             validate_lease_assignment(
                                 &self.config,
@@ -1260,7 +1448,11 @@ impl WorkerRuntime {
                         }
                         ShardClaimStepResponse::Step { work } => {
                             match self
-                                .execute_and_submit_step(*work, &mut next_heartbeat_at)
+                                .execute_and_submit_step(
+                                    *work,
+                                    &mut next_heartbeat_at,
+                                    execution_permit,
+                                )
                                 .await?
                             {
                                 StepCycleOutcome::Continue => {
@@ -1272,6 +1464,7 @@ impl WorkerRuntime {
                     }
                 }
                 CancellableCall::Completed(HttpCallResult::HttpError { status, body }) => {
+                    drop(execution_permit);
                     if is_registration_missing_error(status, &body) {
                         return Ok(StepCycleOutcome::Reacquire {
                             needs_reregister: true,
@@ -1299,6 +1492,7 @@ impl WorkerRuntime {
                     });
                 }
                 CancellableCall::Completed(HttpCallResult::Transient(_)) => {
+                    drop(execution_permit);
                     transient_claim_errors = transient_claim_errors.saturating_add(1);
                     let wait_ms = compute_backoff_ms(
                         self.config.retry_base_backoff_ms,
@@ -1331,6 +1525,7 @@ impl WorkerRuntime {
         &mut self,
         work: ShardStepWork,
         next_heartbeat_at: &mut Instant,
+        execution_permit: Option<WorkerExecutionPermit>,
     ) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
         let assignment = self.active_lease.clone().ok_or_else(|| {
             CommunityShardWorkerError::InvalidLease("missing active lease".to_string())
@@ -1364,7 +1559,8 @@ impl WorkerRuntime {
         let coord_id = self.config.coordinator_id;
         let prevent_sleep_during_jobs = self.config.prevent_sleep_during_jobs;
         let work_for_exec = work.clone();
-        let mut exec_handle = tokio::task::spawn_blocking(move || {
+        let compute_permit = execution_permit.clone();
+        let mut exec_handle = spawn_blocking_with_execution_permit(compute_permit, move || {
             let _keep_awake = crate::community_worker::KeepAwake::begin(prevent_sleep_during_jobs);
             let result = exec.execute_step(coord_id, start_now_ms, &work_for_exec);
             (exec, result)
@@ -1495,15 +1691,16 @@ impl WorkerRuntime {
             },
         };
 
-        match self
+        let submit_outcome = self
             .submit_step_with_retry(
                 submit_req,
                 work.deadline_unix_ms,
                 is_completed,
                 next_heartbeat_at,
             )
-            .await?
-        {
+            .await?;
+        drop(execution_permit);
+        match submit_outcome {
             SubmitOutcome::Accepted | SubmitOutcome::StaleOrExpired => {
                 Ok(StepCycleOutcome::Continue)
             }
@@ -2154,6 +2351,20 @@ impl WorkerRuntime {
     }
 }
 
+fn spawn_blocking_with_execution_permit<F, T>(
+    execution_permit: Option<WorkerExecutionPermit>,
+    work: F,
+) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _worker_execution_permit = execution_permit;
+        work()
+    })
+}
+
 enum BodyReadOutcome {
     Bytes(Vec<u8>),
     TransportError(String),
@@ -2394,12 +2605,9 @@ fn normalize_and_validate_coordinator_url(
     Ok(canonical.trim_end_matches('/').to_string())
 }
 
-fn validate_lease_response(
+fn validate_lease_response_envelope(
     config: &CommunityShardWorkerConfig,
-    model_spec: &TrustedModelSpec,
     response: &ShardLeaseResponse,
-    now_ms: u64,
-    fence: &LeaseFenceTracker,
 ) -> Result<(), CommunityShardWorkerError> {
     if response.protocol_version != COMMUNITY_SHARD_PROTOCOL_VERSION {
         return Err(CommunityShardWorkerError::InvalidLease(format!(
@@ -2434,15 +2642,25 @@ fn validate_lease_response(
             config.request_timeout_ms
         )));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_lease_response(
+    config: &CommunityShardWorkerConfig,
+    model_spec: &TrustedModelSpec,
+    response: &ShardLeaseResponse,
+    now_ms: u64,
+    fence: &LeaseFenceTracker,
+) -> Result<(), CommunityShardWorkerError> {
+    validate_lease_response_envelope(config, response)?;
     validate_lease_assignment(config, model_spec, &response.assignment, now_ms, fence)
 }
 
-fn validate_lease_assignment(
+fn validate_lease_assignment_shape(
     config: &CommunityShardWorkerConfig,
     model_spec: &TrustedModelSpec,
     assignment: &ShardLeaseAssignment,
-    now_ms: u64,
-    fence: &LeaseFenceTracker,
 ) -> Result<(), CommunityShardWorkerError> {
     if assignment.lease_id.boot_nonce == Hash256::ZERO {
         return Err(CommunityShardWorkerError::InvalidLease(
@@ -2487,12 +2705,31 @@ fn validate_lease_assignment(
             config.max_resident_layers
         )));
     }
+    Ok(())
+}
+
+fn validate_lease_assignment_progression(
+    assignment: &ShardLeaseAssignment,
+    now_ms: u64,
+    fence: &LeaseFenceTracker,
+) -> Result<(), CommunityShardWorkerError> {
     if assignment.provisioning_deadline_unix_ms <= now_ms {
         return Err(CommunityShardWorkerError::InvalidLease(
             "lease provisioning deadline is already expired".to_string(),
         ));
     }
     fence.validate_next(assignment)
+}
+
+fn validate_lease_assignment(
+    config: &CommunityShardWorkerConfig,
+    model_spec: &TrustedModelSpec,
+    assignment: &ShardLeaseAssignment,
+    now_ms: u64,
+    fence: &LeaseFenceTracker,
+) -> Result<(), CommunityShardWorkerError> {
+    validate_lease_assignment_shape(config, model_spec, assignment)?;
+    validate_lease_assignment_progression(assignment, now_ms, fence)
 }
 
 fn checked_now_unix_ms() -> Result<u64, CommunityShardWorkerError> {
@@ -2521,6 +2758,8 @@ fn is_auto_reconnectable(error: &CommunityShardWorkerError) -> bool {
     matches!(
         error,
         CommunityShardWorkerError::TransientBudgetExhausted { .. }
+            | CommunityShardWorkerError::LeaseReacquireLimitExceeded { .. }
+            | CommunityShardWorkerError::ReregisterLimitExceeded { .. }
     )
 }
 
@@ -2531,12 +2770,17 @@ fn is_registration_missing_error(status: StatusCode, body: &str) -> bool {
             || body.contains("registration expired"))
 }
 
+fn is_lease_not_found_error(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::NOT_FOUND && body.contains("worker lease not found")
+}
+
 fn is_fatal_model_or_profile_conflict(body: &str) -> bool {
     body.contains("does not match coordinator model")
         || body.contains("does not match coordinator profile")
         || body.contains("worker model specification mismatch")
         || body.contains("must not register whole-model")
         || body.contains("missing pinned model_id")
+        || body.contains("registered model_id")
         || body.contains("missing canonical execution_profile")
         || body.contains("is not the canonical INT8 profile")
 }
@@ -2923,23 +3167,43 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn phase_matched_hb_response(
+        ready: bool,
+        cancellations: Vec<SessionCancellationNotice>,
+    ) -> ShardHeartbeatResponse {
+        let now_ms = checked_now_unix_ms().expect("unix ms");
+        let directive = if ready {
+            HeartbeatDirective::Active {
+                expires_at_unix_ms: now_ms + 45_000,
+            }
+        } else {
+            HeartbeatDirective::Provisioning {
+                deadline_unix_ms: now_ms + 60_000,
+            }
+        };
+        ShardHeartbeatResponse {
+            directive,
+            cancellations,
+        }
+    }
+
     #[tokio::test]
     async fn transient_heartbeat_backoff_grows_and_resets_after_success() {
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
         use axum::extract::State;
         use axum::routing::post;
 
         async fn flaky_hb_handler(
             State(calls): State<Arc<AtomicUsize>>,
-            _body: axum::Json<serde_json::Value>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
         ) -> Result<axum::Json<ShardHeartbeatResponse>, (StatusCode, String)> {
             let idx = calls.fetch_add(1, Ordering::SeqCst);
             if idx == 3 {
-                return Ok(axum::Json(ShardHeartbeatResponse {
-                    directive: HeartbeatDirective::Active {
-                        expires_at_unix_ms: checked_now_unix_ms().expect("unix ms") + 45_000,
-                    },
-                    cancellations: Vec::new(),
-                }));
+                let ready = signed.payload.request.ready;
+                return Ok(axum::Json(phase_matched_hb_response(ready, Vec::new())));
             }
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -3128,6 +3392,8 @@ mod tests {
         use crate::community_sharding::tests::{
             build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
         };
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
         use axum::extract::State;
         use axum::routing::post;
         use parking_lot::Mutex;
@@ -3191,13 +3457,13 @@ mod tests {
             }))
         }
 
-        async fn hb_ok(_body: axum::Json<serde_json::Value>) -> axum::Json<ShardHeartbeatResponse> {
-            axum::Json(ShardHeartbeatResponse {
-                directive: HeartbeatDirective::Active {
-                    expires_at_unix_ms: checked_now_unix_ms().unwrap() + 45_000,
-                },
-                cancellations: Vec::new(),
-            })
+        async fn hb_ok(
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            axum::Json(phase_matched_hb_response(ready, Vec::new()))
         }
 
         async fn claim_boot_mismatch(_body: axum::Json<serde_json::Value>) -> (StatusCode, String) {
@@ -3288,5 +3554,2212 @@ mod tests {
         assert!(state.weights_dropped_on_reconnect.load(Ordering::SeqCst));
         assert_eq!(loader_calls.load(Ordering::SeqCst), 2);
         assert_eq!(state.lease_calls.load(Ordering::SeqCst), 9);
+    }
+
+    #[tokio::test]
+    async fn duplicate_prior_lease_after_dropped_release_triggers_release_and_advances() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use parking_lot::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        struct DuplicateLeaseServerState {
+            lease_1: ShardLeaseAssignment,
+            lease_2: ShardLeaseAssignment,
+            prior_released: AtomicBool,
+            lease_calls: AtomicUsize,
+            release_calls: AtomicUsize,
+            accepted_releases: Mutex<Vec<(u64, u64)>>,
+            ready_seq2: Notify,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_handler(
+            State(state): State<Arc<DuplicateLeaseServerState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            let assignment = if state.prior_released.load(Ordering::SeqCst) {
+                state.lease_2.clone()
+            } else {
+                state.lease_1.clone()
+            };
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment,
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_handler(
+            State(state): State<Arc<DuplicateLeaseServerState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let req = signed.payload.request;
+            if req.lease_id.seq == 2 && req.ready {
+                state.ready_seq2.notify_one();
+            }
+            axum::Json(phase_matched_hb_response(req.ready, Vec::new()))
+        }
+
+        async fn claim_handler(
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardClaimStepRequest>>,
+            >,
+        ) -> Result<axum::Json<ShardClaimStepResponse>, (StatusCode, String)> {
+            if signed.payload.request.lease_id.seq == 1 {
+                return Err((StatusCode::CONFLICT, "stale lease".to_string()));
+            }
+            Ok(axum::Json(ShardClaimStepResponse::Idle))
+        }
+
+        async fn release_handler(
+            State(state): State<Arc<DuplicateLeaseServerState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardReleaseRequest>>,
+            >,
+        ) -> Result<axum::Json<ShardReleaseResponse>, (StatusCode, String)> {
+            let idx = state.release_calls.fetch_add(1, Ordering::SeqCst);
+            if idx < MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dropped release".to_string(),
+                ));
+            }
+            let req = signed.payload.request;
+            if req.lease_id.seq == 1 && req.lease_epoch == 1 {
+                state.prior_released.store(true, Ordering::SeqCst);
+            }
+            state
+                .accepted_releases
+                .lock()
+                .push((req.lease_id.seq, req.lease_epoch));
+            Ok(axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            }))
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"dup-lease-spec"), &full);
+        let boot = arc_crypto::hash_bytes(b"dup-lease-boot");
+        let deadline = checked_now_unix_ms().unwrap() + 60_000;
+        let lease_1 = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot,
+                seq: 1,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 0,
+                end_layer: 2,
+            },
+            provisioning_deadline_unix_ms: deadline,
+        };
+        let lease_2 = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot,
+                seq: 2,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 2,
+                end_layer: 4,
+            },
+            provisioning_deadline_unix_ms: deadline + 10_000,
+        };
+
+        let loaded_leases: Arc<Mutex<Vec<(u64, u64, ShardLayerRange)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let loaded_for_loader = Arc::clone(&loaded_leases);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            loaded_for_loader.lock().push((
+                assignment.lease_id.seq,
+                assignment.lease_epoch,
+                assignment.range,
+            ));
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        let state = Arc::new(DuplicateLeaseServerState {
+            lease_1,
+            lease_2,
+            prior_released: AtomicBool::new(false),
+            lease_calls: AtomicUsize::new(0),
+            release_calls: AtomicUsize::new(0),
+            accepted_releases: Mutex::new(Vec::new()),
+            ready_seq2: Notify::new(),
+        });
+        let app = axum::Router::new()
+            .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+            .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_handler))
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_handler))
+            .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_handler))
+            .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_handler))
+            .with_state(Arc::clone(&state));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.heartbeat_interval_ms = 50;
+        cfg.idle_poll_interval_ms = 10;
+        cfg.retry_base_backoff_ms = 5;
+        cfg.retry_max_backoff_ms = 10;
+        cfg.reacquire_base_backoff_ms = 10;
+        cfg.reacquire_max_backoff_ms = 20;
+
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(run_community_shard_worker(
+            cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            shut_rx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), state.ready_seq2.notified())
+            .await
+            .expect("worker must advance to seq 2 after releasing duplicate prior lease");
+        shut_tx.send(true).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker shutdown timeout")
+            .unwrap()
+            .expect("worker must exit cleanly");
+        server.abort();
+
+        assert_eq!(
+            *loaded_leases.lock(),
+            vec![
+                (
+                    1,
+                    1,
+                    ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                ),
+                (
+                    2,
+                    1,
+                    ShardLayerRange {
+                        start_layer: 2,
+                        end_layer: 4,
+                    },
+                ),
+            ]
+        );
+        assert!(state.lease_calls.load(Ordering::SeqCst) >= 3);
+        let accepted = state.accepted_releases.lock().clone();
+        assert!(accepted.contains(&(1, 1)));
+        assert!(accepted.contains(&(2, 1)));
+        assert_eq!(summary.leases_acquired, 2);
+        assert_eq!(summary.models_loaded, 2);
+        assert!(summary.clean_release_sent);
+    }
+
+    #[tokio::test]
+    async fn duplicate_lease_mismatched_fields_regressed_seq_or_fenced_boot_fail_closed() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+
+        struct RejectCaseState {
+            first: ShardLeaseAssignment,
+            second: ShardLeaseAssignment,
+            drop_initial_releases: bool,
+            lease_calls: AtomicUsize,
+            release_calls: AtomicUsize,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_handler(
+            State(state): State<Arc<RejectCaseState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            let idx = state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            let assignment = if idx == 0 {
+                state.first.clone()
+            } else {
+                state.second.clone()
+            };
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment,
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_ok(
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            axum::Json(phase_matched_hb_response(ready, Vec::new()))
+        }
+
+        async fn claim_conflict(_body: axum::Json<serde_json::Value>) -> (StatusCode, String) {
+            (StatusCode::CONFLICT, "stale lease".to_string())
+        }
+
+        async fn release_handler(
+            State(state): State<Arc<RejectCaseState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> Result<axum::Json<ShardReleaseResponse>, (StatusCode, String)> {
+            let idx = state.release_calls.fetch_add(1, Ordering::SeqCst);
+            if state.drop_initial_releases && idx < MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dropped release".to_string(),
+                ));
+            }
+            Ok(axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            }))
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"reject-dup-spec"), &full);
+        let boot1 = arc_crypto::hash_bytes(b"reject-dup-boot-1");
+        let boot2 = arc_crypto::hash_bytes(b"reject-dup-boot-2");
+        let deadline = checked_now_unix_ms().unwrap() + 60_000;
+        let base_first = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot1,
+                seq: 2,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 0,
+                end_layer: 2,
+            },
+            provisioning_deadline_unix_ms: deadline,
+        };
+
+        let mut mutated_range = base_first.clone();
+        mutated_range.range = ShardLayerRange {
+            start_layer: 2,
+            end_layer: 4,
+        };
+        let mut mutated_deadline = base_first.clone();
+        mutated_deadline.provisioning_deadline_unix_ms = deadline + 1_000;
+        let mut regressed_seq = base_first.clone();
+        regressed_seq.lease_id.seq = 1;
+
+        let cases = [
+            (mutated_range, true, MAX_RELEASE_TRANSIENT_ATTEMPTS + 1),
+            (mutated_deadline, true, MAX_RELEASE_TRANSIENT_ATTEMPTS + 1),
+            (base_first.clone(), false, 1),
+            (regressed_seq, true, MAX_RELEASE_TRANSIENT_ATTEMPTS + 1),
+        ];
+
+        for (second, drop_initial_releases, expected_release_calls) in cases {
+            let loader_calls = Arc::new(AtomicUsize::new(0));
+            let loader_calls_inner = Arc::clone(&loader_calls);
+            let full_for_loader = Arc::clone(&full);
+            let loader: PartialModelLoader = Arc::new(move |assignment| {
+                loader_calls_inner.fetch_add(1, Ordering::SeqCst);
+                let partial = build_partial_integer_model(&full_for_loader, assignment.range);
+                Ok(Arc::new(partial))
+            });
+            let state = Arc::new(RejectCaseState {
+                first: base_first.clone(),
+                second,
+                drop_initial_releases,
+                lease_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+            });
+            let app = axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_handler))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_ok))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_conflict))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_handler))
+                .with_state(Arc::clone(&state));
+            let (base_url, server) = spawn_hb_router(app).await;
+
+            let mut cfg = base_config(&base_url);
+            cfg.allow_insecure_for_loopback = true;
+            cfg.auto_reconnect = true;
+            cfg.heartbeat_interval_ms = 50;
+            cfg.retry_base_backoff_ms = 5;
+            cfg.retry_max_backoff_ms = 10;
+            cfg.reacquire_base_backoff_ms = 10;
+            cfg.reacquire_max_backoff_ms = 20;
+
+            let (_shut_tx, shut_rx) = watch::channel(false);
+            let err = run_community_shard_worker(
+                cfg,
+                Arc::new(KeyPair::generate_ed25519()),
+                spec.clone(),
+                loader,
+                shut_rx,
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+
+            assert!(matches!(err, CommunityShardWorkerError::InvalidLease(_)));
+            assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.lease_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                state.release_calls.load(Ordering::SeqCst),
+                expected_release_calls
+            );
+        }
+
+        let (_tx, rx) = watch::channel(false);
+        let mut cfg = base_config("https://coord.example.com");
+        cfg.auto_reconnect = true;
+        let loader: PartialModelLoader = Arc::new(|_| anyhow::bail!("loader unused"));
+        let mut runtime =
+            WorkerRuntime::new(cfg, Arc::new(KeyPair::generate_ed25519()), spec, loader, rx)
+                .unwrap();
+        let expired_prior = ShardLeaseAssignment {
+            provisioning_deadline_unix_ms: 1_000,
+            ..base_first.clone()
+        };
+        runtime.fence.record(&expired_prior);
+        runtime.unreleased_prior_lease = Some(expired_prior.clone());
+        assert!(runtime.is_unreleased_prior_assignment(&expired_prior));
+        assert!(
+            validate_lease_assignment_progression(&expired_prior, 2_000, &runtime.fence).is_err()
+        );
+        let next_boot_assignment = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot2,
+                seq: 1,
+            },
+            ..base_first
+        };
+        runtime.fence.record(&next_boot_assignment);
+        assert!(!runtime.is_unreleased_prior_assignment(&expired_prior));
+        assert!(
+            validate_lease_assignment_progression(&expired_prior, 500, &runtime.fence).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reconnect_recovers_reacquire_and_reregister_limits_and_cancels() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        struct ReacquireBudgetState {
+            spec: TrustedModelSpec,
+            boot: Hash256,
+            fail_heartbeats: usize,
+            lease_seq: AtomicUsize,
+            hb_calls: AtomicUsize,
+            ready_notify: Notify,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_inc(
+            State(state): State<Arc<ReacquireBudgetState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            let seq = (state.lease_seq.fetch_add(1, Ordering::SeqCst) + 1) as u64;
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId {
+                        boot_nonce: state.boot,
+                        seq,
+                    },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_flaky(
+            State(state): State<Arc<ReacquireBudgetState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> Result<axum::Json<ShardHeartbeatResponse>, (StatusCode, String)> {
+            if !signed.payload.request.ready {
+                return Ok(axum::Json(phase_matched_hb_response(false, Vec::new())));
+            }
+            let idx = state.hb_calls.fetch_add(1, Ordering::SeqCst);
+            if idx < state.fail_heartbeats {
+                return Err((StatusCode::CONFLICT, "lease not ready".to_string()));
+            }
+            state.ready_notify.notify_one();
+            Ok(axum::Json(phase_matched_hb_response(true, Vec::new())))
+        }
+
+        async fn claim_idle(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardClaimStepResponse> {
+            axum::Json(ShardClaimStepResponse::Idle)
+        }
+
+        async fn release_ok(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardReleaseResponse> {
+            axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            })
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"outer-budget-spec"), &full);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        let standalone_state = Arc::new(ReacquireBudgetState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"outer-budget-boot-1"),
+            fail_heartbeats: 10,
+            lease_seq: AtomicUsize::new(0),
+            hb_calls: AtomicUsize::new(0),
+            ready_notify: Notify::new(),
+        });
+        let (standalone_url, standalone_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_inc))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_flaky))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_idle))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+                .with_state(standalone_state),
+        )
+        .await;
+        let mut standalone_cfg = base_config(&standalone_url);
+        standalone_cfg.allow_insecure_for_loopback = true;
+        standalone_cfg.auto_reconnect = false;
+        standalone_cfg.max_consecutive_lease_reacquires = 1;
+        standalone_cfg.reacquire_base_backoff_ms = 5;
+        standalone_cfg.reacquire_max_backoff_ms = 10;
+        let (_tx, rx) = watch::channel(false);
+        let standalone_err = run_community_shard_worker(
+            standalone_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec.clone(),
+            Arc::clone(&loader),
+            rx,
+        )
+        .await
+        .unwrap_err();
+        standalone_srv.abort();
+        assert!(matches!(
+            standalone_err,
+            CommunityShardWorkerError::LeaseReacquireLimitExceeded { limit: 1 }
+        ));
+
+        let recover_state = Arc::new(ReacquireBudgetState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"outer-budget-boot-2"),
+            fail_heartbeats: 2,
+            lease_seq: AtomicUsize::new(0),
+            hb_calls: AtomicUsize::new(0),
+            ready_notify: Notify::new(),
+        });
+        let (recover_url, recover_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_inc))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_flaky))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_idle))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+                .with_state(Arc::clone(&recover_state)),
+        )
+        .await;
+        let mut recover_cfg = base_config(&recover_url);
+        recover_cfg.allow_insecure_for_loopback = true;
+        recover_cfg.auto_reconnect = true;
+        recover_cfg.max_consecutive_lease_reacquires = 1;
+        recover_cfg.reacquire_base_backoff_ms = 5;
+        recover_cfg.reacquire_max_backoff_ms = 10;
+        recover_cfg.reconnect_base_backoff_ms = 10;
+        recover_cfg.reconnect_max_backoff_ms = 20;
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(run_community_shard_worker(
+            recover_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec.clone(),
+            Arc::clone(&loader),
+            shut_rx,
+        ));
+        let recover_ready = recover_state.ready_notify.notified();
+        tokio::time::timeout(Duration::from_secs(10), recover_ready)
+            .await
+            .expect("auto_reconnect must recover after LeaseReacquireLimitExceeded");
+        shut_tx.send(true).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker shutdown timeout")
+            .unwrap()
+            .expect("worker must exit cleanly");
+        recover_srv.abort();
+        assert_eq!(summary.reconnect_attempts, 1);
+        assert_eq!(summary.leases_acquired, 3);
+        assert!(summary.clean_release_sent);
+
+        struct ReregisterBudgetState {
+            spec: TrustedModelSpec,
+            boot: Hash256,
+            miss_leases: usize,
+            lease_calls: AtomicUsize,
+            ready_notify: Notify,
+        }
+
+        async fn lease_reregister(
+            State(state): State<Arc<ReregisterBudgetState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> Result<axum::Json<ShardLeaseResponse>, (StatusCode, String)> {
+            let idx = state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            if idx < state.miss_leases {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "worker_id not registered - call /community/register first".to_string(),
+                ));
+            }
+            Ok(axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId {
+                        boot_nonce: state.boot,
+                        seq: 1,
+                    },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            }))
+        }
+
+        async fn hb_ready(
+            State(state): State<Arc<ReregisterBudgetState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            if ready {
+                state.ready_notify.notify_one();
+            }
+            axum::Json(phase_matched_hb_response(ready, Vec::new()))
+        }
+
+        let rereg_state = Arc::new(ReregisterBudgetState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"outer-rereg-boot"),
+            miss_leases: MAX_CONSECUTIVE_REREGISTERS + 1,
+            lease_calls: AtomicUsize::new(0),
+            ready_notify: Notify::new(),
+        });
+        let (rereg_url, rereg_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_reregister))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_ready))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_idle))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+                .with_state(Arc::clone(&rereg_state)),
+        )
+        .await;
+        let mut rereg_cfg = base_config(&rereg_url);
+        rereg_cfg.allow_insecure_for_loopback = true;
+        rereg_cfg.auto_reconnect = true;
+        rereg_cfg.reacquire_base_backoff_ms = 5;
+        rereg_cfg.reacquire_max_backoff_ms = 10;
+        rereg_cfg.reconnect_base_backoff_ms = 10;
+        rereg_cfg.reconnect_max_backoff_ms = 20;
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let rereg_task = tokio::spawn(run_community_shard_worker(
+            rereg_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec.clone(),
+            Arc::clone(&loader),
+            shut_rx,
+        ));
+        let rereg_ready = rereg_state.ready_notify.notified();
+        tokio::time::timeout(Duration::from_secs(10), rereg_ready)
+            .await
+            .expect("auto_reconnect must recover after ReregisterLimitExceeded");
+        shut_tx.send(true).unwrap();
+        let rereg_summary = tokio::time::timeout(Duration::from_secs(10), rereg_task)
+            .await
+            .expect("reregister worker shutdown timeout")
+            .unwrap()
+            .expect("reregister worker must exit cleanly");
+        rereg_srv.abort();
+        assert_eq!(rereg_summary.reconnect_attempts, 1);
+        assert_eq!(rereg_summary.leases_acquired, 1);
+
+        let cancel_state = Arc::new(ReacquireBudgetState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"outer-cancel-boot"),
+            fail_heartbeats: 10,
+            lease_seq: AtomicUsize::new(0),
+            hb_calls: AtomicUsize::new(0),
+            ready_notify: Notify::new(),
+        });
+        let (cancel_url, cancel_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_inc))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_flaky))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_idle))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+                .with_state(Arc::clone(&cancel_state)),
+        )
+        .await;
+        let mut cancel_cfg = base_config(&cancel_url);
+        cancel_cfg.allow_insecure_for_loopback = true;
+        cancel_cfg.auto_reconnect = true;
+        cancel_cfg.max_consecutive_lease_reacquires = 1;
+        cancel_cfg.reacquire_base_backoff_ms = 5;
+        cancel_cfg.reacquire_max_backoff_ms = 10;
+        cancel_cfg.reconnect_base_backoff_ms = 5_000;
+        cancel_cfg.reconnect_max_backoff_ms = 5_000;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut runtime = WorkerRuntime::new(
+            cancel_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            cancel_rx,
+        )
+        .unwrap();
+        let err = runtime.run().await.unwrap_err();
+        assert!(matches!(
+            err,
+            CommunityShardWorkerError::LeaseReacquireLimitExceeded { limit: 1 }
+        ));
+        assert!(is_auto_reconnectable(&err));
+        let leases_before_cancel = cancel_state.lease_seq.load(Ordering::SeqCst);
+        let mut reconnect = Box::pin(runtime.reconnect_after_transient(&err));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let stop_started = Instant::now();
+        cancel_tx.send(true).unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), reconnect)
+                .await
+                .unwrap()
+        );
+        runtime.cleanup_on_exit().await;
+        cancel_srv.abort();
+        assert!(stop_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            cancel_state.lease_seq.load(Ordering::SeqCst),
+            leases_before_cancel
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_gate_holds_claim_execute_submit_retries_then_quiesces_with_heartbeats() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::community_sharding::{ShardStepInput, StepId};
+        use crate::native_inference::WorkerQuiescenceResult;
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        struct GateServerState {
+            spec: TrustedModelSpec,
+            boot: Hash256,
+            claim_calls: AtomicUsize,
+            submit_calls: AtomicUsize,
+            claim1_entered: Notify,
+            claim1_release: Notify,
+            claim2_entered: Notify,
+            claim2_release: Notify,
+            submit1_entered: Notify,
+            submit1_release: Notify,
+            submit2_entered: Notify,
+            submit2_release: Notify,
+            quiesced_hb_flag: AtomicBool,
+            quiesced_hb_count: AtomicUsize,
+            quiesced_hb_target_reached: Notify,
+            resumed_claim_flag: AtomicBool,
+            resumed_claim_seen: Notify,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_ok(
+            State(state): State<Arc<GateServerState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId {
+                        boot_nonce: state.boot,
+                        seq: 1,
+                    },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_handler(
+            State(state): State<Arc<GateServerState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            if ready
+                && state.quiesced_hb_flag.load(Ordering::SeqCst)
+                && state.quiesced_hb_count.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                state.quiesced_hb_target_reached.notify_one();
+            }
+            axum::Json(phase_matched_hb_response(ready, Vec::new()))
+        }
+
+        async fn claim_handler(
+            State(state): State<Arc<GateServerState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardClaimStepResponse> {
+            let idx = state.claim_calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                state.claim1_entered.notify_one();
+                state.claim1_release.notified().await;
+                return axum::Json(ShardClaimStepResponse::Idle);
+            }
+            if idx == 1 {
+                state.claim2_entered.notify_one();
+                state.claim2_release.notified().await;
+                return axum::Json(ShardClaimStepResponse::Step {
+                    work: Box::new(ShardStepWork {
+                        session_id: SessionId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        step_id: StepId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_id: LeaseId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_epoch: 1,
+                        model_id: state.spec.model_id,
+                        execution_profile: state.spec.execution_profile.clone(),
+                        range: ShardLayerRange {
+                            start_layer: 0,
+                            end_layer: 2,
+                        },
+                        position: 0,
+                        expected_hidden_len: state.spec.d_model,
+                        expect_terminal: false,
+                        last_token: false,
+                        deadline_unix_ms: checked_now_unix_ms().unwrap() + 30_000,
+                        input: ShardStepInput::Token {
+                            token: state.spec.bos_token,
+                        },
+                        generated_tokens: Vec::new(),
+                    }),
+                });
+            }
+            if state.resumed_claim_flag.swap(false, Ordering::SeqCst) {
+                state.resumed_claim_seen.notify_one();
+            }
+            axum::Json(ShardClaimStepResponse::Idle)
+        }
+
+        async fn submit_handler(
+            State(state): State<Arc<GateServerState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> Result<axum::Json<ShardStepSubmitResponse>, (StatusCode, String)> {
+            let idx = state.submit_calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                state.submit1_entered.notify_one();
+                state.submit1_release.notified().await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "transient submit outage".to_string(),
+                ));
+            }
+            state.submit2_entered.notify_one();
+            state.submit2_release.notified().await;
+            Ok(axum::Json(ShardStepSubmitResponse {
+                accepted: true,
+                session_completed: false,
+                session_aborted: false,
+            }))
+        }
+
+        async fn release_ok(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardReleaseResponse> {
+            axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            })
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"gate-step-spec"), &full);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        let state = Arc::new(GateServerState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"gate-step-boot"),
+            claim_calls: AtomicUsize::new(0),
+            submit_calls: AtomicUsize::new(0),
+            claim1_entered: Notify::new(),
+            claim1_release: Notify::new(),
+            claim2_entered: Notify::new(),
+            claim2_release: Notify::new(),
+            submit1_entered: Notify::new(),
+            submit1_release: Notify::new(),
+            submit2_entered: Notify::new(),
+            submit2_release: Notify::new(),
+            quiesced_hb_flag: AtomicBool::new(false),
+            quiesced_hb_count: AtomicUsize::new(0),
+            quiesced_hb_target_reached: Notify::new(),
+            resumed_claim_flag: AtomicBool::new(false),
+            resumed_claim_seen: Notify::new(),
+        });
+        let app = axum::Router::new()
+            .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+            .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_ok))
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_handler))
+            .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_handler))
+            .route(COMMUNITY_SHARD_SUBMIT_STEP_PATH, post(submit_handler))
+            .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+            .with_state(Arc::clone(&state));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.heartbeat_interval_ms = 40;
+        cfg.idle_poll_interval_ms = 10;
+        cfg.retry_base_backoff_ms = 10;
+        cfg.retry_max_backoff_ms = 20;
+        cfg.worker_execution_gate = Some(Arc::clone(&gate).into());
+
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(run_community_shard_worker(
+            cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            shut_rx,
+        ));
+
+        let claim1 = state.claim1_entered.notified();
+        tokio::time::timeout(Duration::from_secs(10), claim1)
+            .await
+            .expect("first claim must arrive");
+        assert_eq!(gate.active_jobs(), 1);
+        let idle_request_id = [0xA4; 32];
+        let mut idle_quiesce = Box::pin(gate.quiesce(
+            idle_request_id,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(idle_quiesce.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(gate.is_closed());
+        state.claim1_release.notify_one();
+        let idle_quiesce_result = tokio::time::timeout(Duration::from_secs(10), idle_quiesce)
+            .await
+            .expect("idle claim must release execution gate before idle backoff");
+        assert_eq!(
+            idle_quiesce_result,
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert_eq!(gate.resume(idle_request_id), Ok(0));
+
+        let claim2 = state.claim2_entered.notified();
+        tokio::time::timeout(Duration::from_secs(10), claim2)
+            .await
+            .expect("second claim must arrive");
+        assert_eq!(gate.active_jobs(), 1);
+
+        let request_id = [0xA5; 32];
+        let mut quiesce_fut = Box::pin(gate.quiesce(
+            request_id,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(quiesce_fut.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(gate.is_closed());
+        assert_eq!(gate.active_jobs(), 1);
+
+        state.claim2_release.notify_one();
+        let submit1 = state.submit1_entered.notified();
+        tokio::time::timeout(Duration::from_secs(10), submit1)
+            .await
+            .expect("first submit attempt must arrive");
+        assert_eq!(gate.active_jobs(), 1);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(quiesce_fut.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        state.submit1_release.notify_one();
+        let submit2 = state.submit2_entered.notified();
+        tokio::time::timeout(Duration::from_secs(10), submit2)
+            .await
+            .expect("submit retry must arrive");
+        assert_eq!(gate.active_jobs(), 1);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(quiesce_fut.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        state.submit2_release.notify_one();
+        let quiesce_result = tokio::time::timeout(Duration::from_secs(10), quiesce_fut)
+            .await
+            .expect("quiesce must complete after submit retry finishes");
+        assert_eq!(
+            quiesce_result,
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert!(gate.is_closed());
+        assert_eq!(gate.active_jobs(), 0);
+
+        let claims_at_quiesce = state.claim_calls.load(Ordering::SeqCst);
+        assert_eq!(claims_at_quiesce, 2);
+        state.quiesced_hb_flag.store(true, Ordering::SeqCst);
+        let hb_reached = state.quiesced_hb_target_reached.notified();
+        tokio::time::timeout(Duration::from_secs(10), hb_reached)
+            .await
+            .expect("lease heartbeats must continue while gate is closed");
+        let claims_after_hb = state.claim_calls.load(Ordering::SeqCst);
+        assert_eq!(claims_after_hb, claims_at_quiesce);
+        assert!(state.quiesced_hb_count.load(Ordering::SeqCst) >= 2);
+
+        state.resumed_claim_flag.store(true, Ordering::SeqCst);
+        assert_eq!(gate.resume(request_id), Ok(0));
+        let resumed = state.resumed_claim_seen.notified();
+        tokio::time::timeout(Duration::from_secs(10), resumed)
+            .await
+            .expect("claims must resume once gate reopens");
+        assert!(state.claim_calls.load(Ordering::SeqCst) > claims_at_quiesce);
+
+        shut_tx.send(true).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker shutdown timeout")
+            .unwrap()
+            .expect("worker must exit cleanly");
+        server.abort();
+
+        assert_eq!(summary.steps_executed, 1);
+        assert_eq!(summary.steps_submitted, 1);
+        assert_eq!(summary.submit_retries, 1);
+        assert!(summary.clean_release_sent);
+        assert_eq!(gate.active_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_gate_drops_permit_on_rebalance_and_quiesced_shutdown_stops_promptly() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::native_inference::WorkerQuiescenceResult;
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        struct RebalanceGateState {
+            spec: TrustedModelSpec,
+            boot: Hash256,
+            epoch2_claims: AtomicUsize,
+            epoch2_ready: Notify,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_ok(
+            State(state): State<Arc<RebalanceGateState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId {
+                        boot_nonce: state.boot,
+                        seq: 1,
+                    },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_handler(
+            State(state): State<Arc<RebalanceGateState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let req = signed.payload.request;
+            if req.lease_epoch == 2 && req.ready {
+                state.epoch2_ready.notify_one();
+            }
+            axum::Json(phase_matched_hb_response(req.ready, Vec::new()))
+        }
+
+        async fn claim_handler(
+            State(state): State<Arc<RebalanceGateState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardClaimStepRequest>>,
+            >,
+        ) -> axum::Json<ShardClaimStepResponse> {
+            if signed.payload.request.lease_epoch == 1 {
+                return axum::Json(ShardClaimStepResponse::RebalanceRequired {
+                    assignment: ShardLeaseAssignment {
+                        lease_id: LeaseId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_epoch: 2,
+                        model_id: state.spec.model_id,
+                        execution_profile: state.spec.execution_profile.clone(),
+                        range: ShardLayerRange {
+                            start_layer: 2,
+                            end_layer: 4,
+                        },
+                        provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                    },
+                });
+            }
+            state.epoch2_claims.fetch_add(1, Ordering::SeqCst);
+            axum::Json(ShardClaimStepResponse::Idle)
+        }
+
+        async fn release_ok(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardReleaseResponse> {
+            axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            })
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"rebalance-gate-spec"), &full);
+        let loader_epoch2_entered = Arc::new(Notify::new());
+        let (loader_release_tx, loader_release_rx) = std::sync::mpsc::channel::<()>();
+        let loader_release_rx = std::sync::Mutex::new(Some(loader_release_rx));
+        let loader_entered_inner = Arc::clone(&loader_epoch2_entered);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            if assignment.lease_epoch == 2 {
+                loader_entered_inner.notify_one();
+                if let Some(rx) = loader_release_rx.lock().unwrap().take() {
+                    rx.recv_timeout(Duration::from_secs(10))
+                        .expect("loader release signal");
+                }
+            }
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        let state = Arc::new(RebalanceGateState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"rebalance-gate-boot"),
+            epoch2_claims: AtomicUsize::new(0),
+            epoch2_ready: Notify::new(),
+        });
+        let app = axum::Router::new()
+            .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+            .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_ok))
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_handler))
+            .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_handler))
+            .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+            .with_state(Arc::clone(&state));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.heartbeat_interval_ms = 50;
+        cfg.idle_poll_interval_ms = 10;
+        cfg.worker_execution_gate = Some(Arc::clone(&gate).into());
+
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(run_community_shard_worker(
+            cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            shut_rx,
+        ));
+
+        let loader_entered = loader_epoch2_entered.notified();
+        tokio::time::timeout(Duration::from_secs(10), loader_entered)
+            .await
+            .expect("rebalance must enter loader for epoch 2");
+        assert_eq!(gate.active_jobs(), 0);
+        let result = gate
+            .quiesce(
+                [0xA6; 32],
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await;
+        assert_eq!(result, WorkerQuiescenceResult::Quiesced { active_jobs: 0 });
+        loader_release_tx.send(()).unwrap();
+
+        let epoch2_ready = state.epoch2_ready.notified();
+        tokio::time::timeout(Duration::from_secs(10), epoch2_ready)
+            .await
+            .expect("rebalanced epoch 2 must report ready");
+        gate.commit_shutdown();
+        shut_tx.send(true).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("quiesced worker must stop promptly on shutdown")
+            .unwrap()
+            .expect("worker must exit cleanly");
+        server.abort();
+
+        assert_eq!(summary.rebalances_completed, 1);
+        assert!(summary.clean_release_sent);
+        assert_eq!(state.epoch2_claims.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.active_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_prior_lease_release_error_classification_and_recovery() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        struct TerminalReleaseState {
+            lease: ShardLeaseAssignment,
+            terminal_status: StatusCode,
+            terminal_body: &'static str,
+            register_calls: AtomicUsize,
+            lease_calls: AtomicUsize,
+            release_calls: AtomicUsize,
+        }
+
+        async fn reg_terminal(
+            State(state): State<Arc<TerminalReleaseState>>,
+            body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            state.register_calls.fetch_add(1, Ordering::SeqCst);
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_terminal(
+            State(state): State<Arc<TerminalReleaseState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: state.lease.clone(),
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_phase_ok(
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            axum::Json(phase_matched_hb_response(ready, Vec::new()))
+        }
+
+        async fn claim_stale(_body: axum::Json<serde_json::Value>) -> (StatusCode, String) {
+            (StatusCode::CONFLICT, "stale lease".to_string())
+        }
+
+        async fn release_terminal(
+            State(state): State<Arc<TerminalReleaseState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> (StatusCode, String) {
+            let idx = state.release_calls.fetch_add(1, Ordering::SeqCst);
+            if idx < MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                let body = "dropped release".to_string();
+                return (StatusCode::SERVICE_UNAVAILABLE, body);
+            }
+            (state.terminal_status, state.terminal_body.to_string())
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"dup-release-err-spec"), &full);
+        let boot = arc_crypto::hash_bytes(b"dup-release-err-boot");
+        let deadline = checked_now_unix_ms().unwrap() + 60_000;
+        let lease_1 = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot,
+                seq: 1,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 0,
+                end_layer: 2,
+            },
+            provisioning_deadline_unix_ms: deadline,
+        };
+        let lease_2 = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: boot,
+                seq: 2,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 2,
+                end_layer: 4,
+            },
+            provisioning_deadline_unix_ms: deadline + 10_000,
+        };
+
+        struct TerminalReleaseCase {
+            status: StatusCode,
+            body: &'static str,
+            expect_auth: bool,
+        }
+
+        let terminal_cases = [
+            TerminalReleaseCase {
+                status: StatusCode::BAD_REQUEST,
+                body: "worker identity must be nonzero",
+                expect_auth: false,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::METHOD_NOT_ALLOWED,
+                body: "method not allowed",
+                expect_auth: false,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::NOT_FOUND,
+                body: "route not found",
+                expect_auth: false,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::CONFLICT,
+                body: "registered worker model_id does not match coordinator model",
+                expect_auth: false,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::CONFLICT,
+                body: "invalid registered model_id hex",
+                expect_auth: false,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::UNAUTHORIZED,
+                body: "invalid worker signature",
+                expect_auth: true,
+            },
+            TerminalReleaseCase {
+                status: StatusCode::FORBIDDEN,
+                body: "worker is currently quarantined",
+                expect_auth: true,
+            },
+        ];
+
+        for case in terminal_cases {
+            let terminal_status = case.status;
+            let terminal_body = case.body;
+            let expect_auth = case.expect_auth;
+            let loader_calls = Arc::new(AtomicUsize::new(0));
+            let loader_calls_inner = Arc::clone(&loader_calls);
+            let full_for_loader = Arc::clone(&full);
+            let loader: PartialModelLoader = Arc::new(move |assignment| {
+                loader_calls_inner.fetch_add(1, Ordering::SeqCst);
+                let partial = build_partial_integer_model(&full_for_loader, assignment.range);
+                Ok(Arc::new(partial))
+            });
+            let state = Arc::new(TerminalReleaseState {
+                lease: lease_1.clone(),
+                terminal_status,
+                terminal_body,
+                register_calls: AtomicUsize::new(0),
+                lease_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+            });
+            let app = axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_terminal))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_terminal))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_phase_ok))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_stale))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_terminal))
+                .with_state(Arc::clone(&state));
+            let (base_url, server) = spawn_hb_router(app).await;
+
+            let mut cfg = base_config(&base_url);
+            cfg.allow_insecure_for_loopback = true;
+            cfg.auto_reconnect = true;
+            cfg.heartbeat_interval_ms = 50;
+            cfg.retry_base_backoff_ms = 5;
+            cfg.retry_max_backoff_ms = 10;
+            cfg.reacquire_base_backoff_ms = 5;
+            cfg.reacquire_max_backoff_ms = 10;
+
+            let (_shut_tx, shut_rx) = watch::channel(false);
+            let err = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_community_shard_worker(
+                    cfg,
+                    Arc::new(KeyPair::generate_ed25519()),
+                    spec.clone(),
+                    loader,
+                    shut_rx,
+                ),
+            )
+            .await
+            .expect("terminal duplicate release error must fail promptly")
+            .unwrap_err();
+            server.abort();
+
+            if expect_auth {
+                assert!(matches!(
+                    err,
+                    CommunityShardWorkerError::AuthenticationOrAuthorization {
+                        path: COMMUNITY_SHARD_RELEASE_PATH,
+                        status,
+                        ..
+                    } if status == terminal_status.as_u16()
+                ));
+            } else {
+                assert!(matches!(
+                    err,
+                    CommunityShardWorkerError::ProtocolRejected {
+                        path: COMMUNITY_SHARD_RELEASE_PATH,
+                        status,
+                        ..
+                    } if status == terminal_status.as_u16()
+                ));
+            }
+            assert_eq!(state.register_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.lease_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                state.release_calls.load(Ordering::SeqCst),
+                MAX_RELEASE_TRANSIENT_ATTEMPTS + 1
+            );
+            assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[derive(Clone, Copy)]
+        enum RecoveryMode {
+            MissingLeaseAdvances,
+            MissingLeaseClearsPrior,
+            ReregisterThenConflictAdvances,
+        }
+
+        struct RecoveryReleaseState {
+            mode: RecoveryMode,
+            lease_1: ShardLeaseAssignment,
+            lease_2: ShardLeaseAssignment,
+            advance_to_lease_2: AtomicBool,
+            register_calls: AtomicUsize,
+            lease_calls: AtomicUsize,
+            release_calls: AtomicUsize,
+            ready_seq2: Notify,
+        }
+
+        async fn reg_recovery(
+            State(state): State<Arc<RecoveryReleaseState>>,
+            body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            state.register_calls.fetch_add(1, Ordering::SeqCst);
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_recovery(
+            State(state): State<Arc<RecoveryReleaseState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            let assignment = if state.advance_to_lease_2.load(Ordering::SeqCst) {
+                state.lease_2.clone()
+            } else {
+                state.lease_1.clone()
+            };
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment,
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_recovery(
+            State(state): State<Arc<RecoveryReleaseState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let req = signed.payload.request;
+            if req.lease_id.seq == 2 && req.ready {
+                state.ready_seq2.notify_one();
+            }
+            axum::Json(phase_matched_hb_response(req.ready, Vec::new()))
+        }
+
+        async fn claim_recovery(
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardClaimStepRequest>>,
+            >,
+        ) -> Result<axum::Json<ShardClaimStepResponse>, (StatusCode, String)> {
+            if signed.payload.request.lease_id.seq == 1 {
+                return Err((StatusCode::CONFLICT, "stale lease".to_string()));
+            }
+            Ok(axum::Json(ShardClaimStepResponse::Idle))
+        }
+
+        async fn release_recovery(
+            State(state): State<Arc<RecoveryReleaseState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardReleaseRequest>>,
+            >,
+        ) -> Result<axum::Json<ShardReleaseResponse>, (StatusCode, String)> {
+            let idx = state.release_calls.fetch_add(1, Ordering::SeqCst);
+            if idx < MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dropped release".to_string(),
+                ));
+            }
+            if signed.payload.request.lease_id.seq == 2 {
+                return Ok(axum::Json(ShardReleaseResponse {
+                    released: true,
+                    aborted_sessions: Vec::new(),
+                }));
+            }
+            match state.mode {
+                RecoveryMode::MissingLeaseAdvances => {
+                    state.advance_to_lease_2.store(true, Ordering::SeqCst);
+                    let body = "worker lease not found".to_string();
+                    Err((StatusCode::NOT_FOUND, body))
+                }
+                RecoveryMode::MissingLeaseClearsPrior => {
+                    let body = "worker lease not found".to_string();
+                    Err((StatusCode::NOT_FOUND, body))
+                }
+                RecoveryMode::ReregisterThenConflictAdvances => {
+                    if idx == MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            "worker_id not registered - call /community/register first".to_string(),
+                        ));
+                    }
+                    state.advance_to_lease_2.store(true, Ordering::SeqCst);
+                    Err((
+                        StatusCode::CONFLICT,
+                        "stale or mismatched lease_epoch 1, expected 2".to_string(),
+                    ))
+                }
+            }
+        }
+
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        for mode in [
+            RecoveryMode::MissingLeaseAdvances,
+            RecoveryMode::MissingLeaseClearsPrior,
+            RecoveryMode::ReregisterThenConflictAdvances,
+        ] {
+            let state = Arc::new(RecoveryReleaseState {
+                mode,
+                lease_1: lease_1.clone(),
+                lease_2: lease_2.clone(),
+                advance_to_lease_2: AtomicBool::new(false),
+                register_calls: AtomicUsize::new(0),
+                lease_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                ready_seq2: Notify::new(),
+            });
+            let app = axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_recovery))
+                .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_recovery))
+                .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_recovery))
+                .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_recovery))
+                .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_recovery))
+                .with_state(Arc::clone(&state));
+            let (base_url, server) = spawn_hb_router(app).await;
+
+            let mut cfg = base_config(&base_url);
+            cfg.allow_insecure_for_loopback = true;
+            cfg.auto_reconnect = true;
+            cfg.heartbeat_interval_ms = 50;
+            cfg.idle_poll_interval_ms = 10;
+            cfg.retry_base_backoff_ms = 5;
+            cfg.retry_max_backoff_ms = 10;
+            cfg.reacquire_base_backoff_ms = 5;
+            cfg.reacquire_max_backoff_ms = 10;
+
+            let (shut_tx, shut_rx) = watch::channel(false);
+            let worker_task = tokio::spawn(run_community_shard_worker(
+                cfg,
+                Arc::new(KeyPair::generate_ed25519()),
+                spec.clone(),
+                Arc::clone(&loader),
+                shut_rx,
+            ));
+
+            match mode {
+                RecoveryMode::MissingLeaseAdvances => {
+                    tokio::time::timeout(Duration::from_secs(10), state.ready_seq2.notified())
+                        .await
+                        .expect("missing prior lease must clear and advance to seq 2");
+                    shut_tx.send(true).unwrap();
+                    let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+                        .await
+                        .expect("worker shutdown timeout")
+                        .unwrap()
+                        .expect("worker must exit cleanly");
+                    server.abort();
+                    assert_eq!(summary.registrations, 1);
+                    assert_eq!(summary.leases_acquired, 2);
+                    assert_eq!(summary.models_loaded, 2);
+                    assert_eq!(summary.reconnect_attempts, 0);
+                    assert!(summary.clean_release_sent);
+                }
+                RecoveryMode::MissingLeaseClearsPrior => {
+                    let err = tokio::time::timeout(Duration::from_secs(10), worker_task)
+                        .await
+                        .expect("re-returned lease after LeaseNotFound must fail promptly")
+                        .unwrap()
+                        .unwrap_err();
+                    server.abort();
+                    assert!(matches!(err, CommunityShardWorkerError::InvalidLease(_)));
+                    assert_eq!(state.register_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(state.lease_calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(
+                        state.release_calls.load(Ordering::SeqCst),
+                        MAX_RELEASE_TRANSIENT_ATTEMPTS + 1
+                    );
+                }
+                RecoveryMode::ReregisterThenConflictAdvances => {
+                    tokio::time::timeout(Duration::from_secs(10), state.ready_seq2.notified())
+                        .await
+                        .expect("reregister and conflict race on release must advance to seq 2");
+                    shut_tx.send(true).unwrap();
+                    let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+                        .await
+                        .expect("worker shutdown timeout")
+                        .unwrap()
+                        .expect("worker must exit cleanly");
+                    server.abort();
+                    assert_eq!(summary.registrations, 2);
+                    assert_eq!(summary.leases_acquired, 2);
+                    assert_eq!(summary.models_loaded, 2);
+                    assert_eq!(summary.reconnect_attempts, 0);
+                    assert!(summary.clean_release_sent);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_execution_gate_applies_heartbeat_cancellations_without_claiming() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use crate::community_sharding::{SessionAbortReason, ShardStepInput, StepId};
+        use crate::native_inference::WorkerQuiescenceResult;
+        use crate::rpc::CommunitySignedRequest;
+        use crate::rpc::community_shard_http::SignedShardWorkerPayload;
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        struct PausedCancelState {
+            spec: TrustedModelSpec,
+            boot: Hash256,
+            claim_calls: AtomicUsize,
+            submit_calls: AtomicUsize,
+            submit1_entered: Notify,
+            submit1_release: Notify,
+            emit_cancel_while_paused: AtomicBool,
+            cancel_sent: AtomicBool,
+            post_cancel_hb_pending: AtomicBool,
+            post_cancel_hb_seen: Notify,
+            post_stale_claim_seen: Notify,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_ok(
+            State(state): State<Arc<PausedCancelState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardLeaseResponse> {
+            axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId {
+                        boot_nonce: state.boot,
+                        seq: 1,
+                    },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            })
+        }
+
+        async fn hb_handler(
+            State(state): State<Arc<PausedCancelState>>,
+            axum::Json(signed): axum::Json<
+                CommunitySignedRequest<SignedShardWorkerPayload<ShardHeartbeatRequest>>,
+            >,
+        ) -> axum::Json<ShardHeartbeatResponse> {
+            let ready = signed.payload.request.ready;
+            let mut cancellations = Vec::new();
+            if ready {
+                if state.emit_cancel_while_paused.swap(false, Ordering::SeqCst) {
+                    state.cancel_sent.store(true, Ordering::SeqCst);
+                    cancellations.push(SessionCancellationNotice {
+                        session_id: SessionId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_id: LeaseId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_epoch: 1,
+                        reason: SessionAbortReason::CallerCancelled,
+                        expires_at_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                    });
+                } else if state.cancel_sent.load(Ordering::SeqCst)
+                    && state.post_cancel_hb_pending.swap(false, Ordering::SeqCst)
+                {
+                    state.post_cancel_hb_seen.notify_one();
+                }
+            }
+            axum::Json(phase_matched_hb_response(ready, cancellations))
+        }
+
+        async fn claim_handler(
+            State(state): State<Arc<PausedCancelState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardClaimStepResponse> {
+            let idx = state.claim_calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 || idx == 1 {
+                return axum::Json(ShardClaimStepResponse::Step {
+                    work: Box::new(ShardStepWork {
+                        session_id: SessionId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        step_id: StepId {
+                            boot_nonce: state.boot,
+                            seq: (idx + 1) as u64,
+                        },
+                        lease_id: LeaseId {
+                            boot_nonce: state.boot,
+                            seq: 1,
+                        },
+                        lease_epoch: 1,
+                        model_id: state.spec.model_id,
+                        execution_profile: state.spec.execution_profile.clone(),
+                        range: ShardLayerRange {
+                            start_layer: 0,
+                            end_layer: 2,
+                        },
+                        position: idx,
+                        expected_hidden_len: state.spec.d_model,
+                        expect_terminal: false,
+                        last_token: false,
+                        deadline_unix_ms: checked_now_unix_ms().unwrap() + 30_000,
+                        input: ShardStepInput::Token {
+                            token: state.spec.bos_token,
+                        },
+                        generated_tokens: Vec::new(),
+                    }),
+                });
+            }
+            if idx == 2 {
+                state.post_stale_claim_seen.notify_one();
+            }
+            axum::Json(ShardClaimStepResponse::Idle)
+        }
+
+        async fn submit_handler(
+            State(state): State<Arc<PausedCancelState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardStepSubmitResponse> {
+            let idx = state.submit_calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                state.submit1_entered.notify_one();
+                state.submit1_release.notified().await;
+            }
+            axum::Json(ShardStepSubmitResponse {
+                accepted: true,
+                session_completed: false,
+                session_aborted: false,
+            })
+        }
+
+        async fn release_ok(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardReleaseResponse> {
+            axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            })
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"paused-cancel-spec"), &full);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            let partial = build_partial_integer_model(&full, assignment.range);
+            Ok(Arc::new(partial))
+        });
+
+        let state = Arc::new(PausedCancelState {
+            spec: spec.clone(),
+            boot: arc_crypto::hash_bytes(b"paused-cancel-boot"),
+            claim_calls: AtomicUsize::new(0),
+            submit_calls: AtomicUsize::new(0),
+            submit1_entered: Notify::new(),
+            submit1_release: Notify::new(),
+            emit_cancel_while_paused: AtomicBool::new(false),
+            cancel_sent: AtomicBool::new(false),
+            post_cancel_hb_pending: AtomicBool::new(true),
+            post_cancel_hb_seen: Notify::new(),
+            post_stale_claim_seen: Notify::new(),
+        });
+        let app = axum::Router::new()
+            .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+            .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_ok))
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_handler))
+            .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_handler))
+            .route(COMMUNITY_SHARD_SUBMIT_STEP_PATH, post(submit_handler))
+            .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+            .with_state(Arc::clone(&state));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let keypair = Arc::new(KeyPair::generate_ed25519());
+        let status = Arc::new(CommunityWorkerStatus::new_sharded(
+            format!("0x{}", keypair.address().to_hex()),
+            "worker-unit",
+            "arc-4L-16d",
+            &spec.model_id.to_hex(),
+            spec.n_layers,
+            false,
+        ));
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.heartbeat_interval_ms = 40;
+        cfg.idle_poll_interval_ms = 10;
+        cfg.telemetry = Some(Arc::clone(&status).into());
+        cfg.worker_execution_gate = Some(Arc::clone(&gate).into());
+
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(run_community_shard_worker(
+            cfg, keypair, spec, loader, shut_rx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), state.submit1_entered.notified())
+            .await
+            .expect("first step submit must arrive");
+        assert_eq!(gate.active_jobs(), 1);
+
+        let request_id = [0xA9; 32];
+        let mut quiesce_fut = Box::pin(gate.quiesce(
+            request_id,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(quiesce_fut.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(gate.is_closed());
+
+        state.submit1_release.notify_one();
+        let quiesce_result = tokio::time::timeout(Duration::from_secs(10), quiesce_fut)
+            .await
+            .expect("quiesce must complete after first submit");
+        assert_eq!(
+            quiesce_result,
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert!(gate.is_closed());
+        assert_eq!(state.claim_calls.load(Ordering::SeqCst), 1);
+
+        state.emit_cancel_while_paused.store(true, Ordering::SeqCst);
+        let post_cancel_hb = state.post_cancel_hb_seen.notified();
+        tokio::time::timeout(Duration::from_secs(10), post_cancel_hb)
+            .await
+            .expect("heartbeat after paused cancellation must arrive");
+        assert!(gate.is_closed());
+        assert_eq!(state.claim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            status
+                .snapshot()
+                .shard
+                .expect("shard telemetry must exist")
+                .cancellations_applied,
+            1
+        );
+
+        assert_eq!(gate.resume(request_id), Ok(0));
+        let post_stale_claim = state.post_stale_claim_seen.notified();
+        tokio::time::timeout(Duration::from_secs(10), post_stale_claim)
+            .await
+            .expect("claims after resume must advance past tombstoned step");
+        shut_tx.send(true).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker shutdown timeout")
+            .unwrap()
+            .expect("worker must exit cleanly");
+        server.abort();
+
+        assert_eq!(summary.steps_executed, 1);
+        assert_eq!(summary.steps_submitted, 1);
+        assert_eq!(summary.cancellations_applied, 1);
+        assert_eq!(state.submit_calls.load(Ordering::SeqCst), 1);
+        assert!(summary.clean_release_sent);
+        assert_eq!(gate.active_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_compute_wrapper_retains_permit_on_cancel_and_handoff() {
+        use crate::native_inference::WorkerQuiescenceResult;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let gate = Arc::new(WorkerExecutionGate::default());
+
+        let outer_permit = gate.try_enter().expect("open gate must admit permit");
+        assert_eq!(gate.active_jobs(), 1);
+        let entered = Arc::new(Notify::new());
+        let entered_inner = Arc::clone(&entered);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_inner = Arc::clone(&completed);
+        let outer_dropped = Arc::new(AtomicBool::new(false));
+        let outer_dropped_inner = Arc::clone(&outer_dropped);
+
+        let mut async_step = Box::pin(async move {
+            let _drop_flag = DropFlag(outer_dropped_inner);
+            let compute_permit = Some(outer_permit.clone());
+            let handle = spawn_blocking_with_execution_permit(compute_permit, move || {
+                entered_inner.notify_one();
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("blocking compute release");
+                completed_inner.store(true, Ordering::SeqCst);
+                42usize
+            });
+            let value = handle.await.expect("blocking task join");
+            drop(outer_permit);
+            value
+        });
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(async_step.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("blocking compute closure must enter");
+        assert_eq!(gate.active_jobs(), 1);
+
+        let cancel_request_id = [0xB1; 32];
+        let mut cancel_quiesce = Box::pin(gate.quiesce(
+            cancel_request_id,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cancel_quiesce.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(gate.is_closed());
+        assert_eq!(gate.active_jobs(), 1);
+
+        drop(async_step);
+        assert!(outer_dropped.load(Ordering::SeqCst));
+        assert!(!completed.load(Ordering::SeqCst));
+        assert_eq!(gate.active_jobs(), 1);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cancel_quiesce.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        release_tx.send(()).unwrap();
+        let cancel_quiesce_result = tokio::time::timeout(Duration::from_secs(10), cancel_quiesce)
+            .await
+            .expect("quiesce must complete after blocking compute exits");
+        assert_eq!(
+            cancel_quiesce_result,
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert!(completed.load(Ordering::SeqCst));
+        assert_eq!(gate.active_jobs(), 0);
+        assert_eq!(gate.resume(cancel_request_id), Ok(0));
+
+        let outer_permit = gate.try_enter().expect("reopened gate must admit permit");
+        assert_eq!(gate.active_jobs(), 1);
+        let handoff_entered = Arc::new(Notify::new());
+        let handoff_entered_inner = Arc::clone(&handoff_entered);
+        let (handoff_release_tx, handoff_release_rx) = std::sync::mpsc::channel::<()>();
+        let compute_permit = Some(outer_permit.clone());
+        let handle = spawn_blocking_with_execution_permit(compute_permit, move || {
+            handoff_entered_inner.notify_one();
+            handoff_release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("handoff compute release");
+            7usize
+        });
+        tokio::time::timeout(Duration::from_secs(10), handoff_entered.notified())
+            .await
+            .expect("handoff compute closure must enter");
+        assert_eq!(gate.active_jobs(), 1);
+
+        let handoff_request_id = [0xB2; 32];
+        let mut handoff_quiesce = Box::pin(gate.quiesce(
+            handoff_request_id,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(handoff_quiesce.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(gate.is_closed());
+
+        handoff_release_tx.send(()).unwrap();
+        let value = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("handoff blocking task must finish")
+            .expect("handoff blocking task join");
+        assert_eq!(value, 7);
+        assert_eq!(gate.active_jobs(), 1);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(handoff_quiesce.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        drop(outer_permit);
+        let handoff_quiesce_result = tokio::time::timeout(Duration::from_secs(10), handoff_quiesce)
+            .await
+            .expect("quiesce must complete once outer permit drops after submit");
+        assert_eq!(
+            handoff_quiesce_result,
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert_eq!(gate.active_jobs(), 0);
     }
 }

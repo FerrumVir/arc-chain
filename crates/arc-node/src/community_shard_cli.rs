@@ -1119,15 +1119,25 @@ async fn drive_integrated_worker_task<F, Fut>(
     }
 }
 
+fn configure_integrated_worker_config(
+    mut config: CommunityShardWorkerConfig,
+    status: Arc<arc_node::community_worker::CommunityWorkerStatus>,
+    worker_execution_gate: Arc<arc_node::native_inference::WorkerExecutionGate>,
+) -> CommunityShardWorkerConfig {
+    config.auto_reconnect = true;
+    config.telemetry = Some(status.into());
+    config.worker_execution_gate = Some(worker_execution_gate.into());
+    config
+}
+
 pub(crate) fn spawn_integrated_worker(
     prepared: PreparedWorker,
     keypair: Arc<KeyPair>,
+    worker_execution_gate: Arc<arc_node::native_inference::WorkerExecutionGate>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<JoinHandle<()>> {
     let loader = prepared.build_loader()?;
     let report = prepared.report;
-    let mut config = prepared.config;
-    config.auto_reconnect = true;
     let status = arc_node::community_worker::install(Arc::new(
         arc_node::community_worker::CommunityWorkerStatus::new_sharded(
             format!("0x{}", keypair.address().to_hex()),
@@ -1135,10 +1145,14 @@ pub(crate) fn spawn_integrated_worker(
             &report.model_name,
             &report.model_id,
             report.n_layers,
-            config.prevent_sleep_during_jobs,
+            prepared.config.prevent_sleep_during_jobs,
         ),
     ));
-    config.telemetry = Some(Arc::clone(&status).into());
+    let config = configure_integrated_worker_config(
+        prepared.config,
+        Arc::clone(&status),
+        worker_execution_gate,
+    );
     let model_spec = prepared.model_spec;
     Ok(tokio::spawn(drive_integrated_worker_task(
         report,
@@ -1315,6 +1329,41 @@ mod tests {
         )
         .await;
         assert!(!entered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn integrated_worker_config_wires_execution_gate_while_standalone_leaves_it_none() {
+        use arc_node::community_worker::CommunityWorkerStatus;
+        use arc_node::native_inference::WorkerExecutionGate;
+
+        let base = CommunityShardWorkerConfig::new(
+            "https://coordinator.example.com",
+            Hash256([0x11; 32]),
+            Some(Hash256([0x22; 32])),
+            1,
+            "worker-integrated",
+            "arc-2L-64d-1h-32v",
+            "linux-x86_64",
+        );
+        assert!(!base.auto_reconnect);
+        assert!(base.telemetry.is_none());
+        assert!(base.worker_execution_gate.is_none());
+
+        let status = Arc::new(CommunityWorkerStatus::new_sharded(
+            format!("0x{}", Hash256([0x44; 32]).to_hex()),
+            "worker-integrated",
+            "arc-2L-64d-1h-32v",
+            &Hash256([0x33; 32]).to_hex(),
+            2,
+            false,
+        ));
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let status_arg = Arc::clone(&status);
+        let gate_arg = Arc::clone(&gate);
+        let integrated = configure_integrated_worker_config(base, status_arg, gate_arg);
+        assert!(integrated.auto_reconnect);
+        assert_eq!(integrated.telemetry, Some(status.into()));
+        assert_eq!(integrated.worker_execution_gate, Some(gate.into()));
     }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);

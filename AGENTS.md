@@ -303,10 +303,22 @@ It excludes whole-model and validator roles, requires explicit model and network
 pins and a memory budget, and defaults to one compute thread. Existing local
 recovery domains must match the supplied pin. Stop closes worker admission before
 the lifecycle waits for drained tasks and acknowledges the WAL receipt.
-Integrated workers retry exhausted transient connection failures with bounded,
-cancellable backoff while retaining lease fences. Authentication, model and
+Integrated workers retry exhausted transient connection, lease-reacquisition
+and registration-recovery budgets with bounded, cancellable backoff while
+retaining lease fences. After a lost release, an exact remembered prior
+assignment is released again rather than rebound or accepted as new work.
+Regressed assignments and fenced coordinator boots remain invalid. Integrated
+partial workers acquire the shared update-drain permit before claiming work
+and hold it through execution and submission retries. A closed gate suppresses
+new claims while heartbeats and cancellation continue. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
+An ordinary cleanly stopped desktop node can prepare an unattended update only
+with launch-on-start disabled. The idle path takes a lifecycle fence, rechecks
+the data lock and never signals detached or legacy nodes. Contention remains
+retryable; pending recovery and manual-stop intent are preserved. Successful
+preparation cancels startup retries, while Busy leaves them intact. The existing
+fenced durability-repair path retains its separate recovery behavior.
 All desktop update schedules use the `UpdateDeadline` wrapper for wall-clock
 deadlines and callback identity. Native ticks recover suspended startup,
 periodic, failed-check, install and shutdown-reconciliation waits exactly once.
@@ -523,7 +535,7 @@ request-success evidence.
 
 ## Releases and versions
 
-Both the checked-in candidate version and the published release version are
+The checked-in candidate is 0.8.28; the published release remains
 0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while
 validators remain on v0.8.26. The headless installer defaults `--worker-mode`
 to `auto`. With a model it qualifies the pinned community partial-shard mode
@@ -557,13 +569,13 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.27 entry is a release-preparation
-  snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
+- `CHANGELOG.md` is newest first. Its v0.8.28 entry is a release-preparation
+  snapshot dated 2026-11-28 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins both the published version and the candidate at
-  0.8.27, pins the exact published installer digest, requires the
+- The doc contract test pins the published version at 0.8.27 and the candidate
+  at 0.8.28, pins the exact published installer digest, requires the
   `desktop-update-existing-validators-v1` release profile, and keeps the actual
   validator baseline at v0.8.26. Active install links change only after
   immutable publication is verified; historical version observations remain

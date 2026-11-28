@@ -466,6 +466,12 @@ fn lifecycle_lock_error(error: std::io::Error) -> anyhow::Error {
     }
 }
 
+fn is_managed_lifecycle_contention(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ManagedLifecycleContention>())
+}
+
 pub fn probe_existing_managed_lifecycle_owner(configured_data_dir: &str) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(configured_data_dir);
     validate_configured_directory_ancestry_no_link(&data_dir)?;
@@ -2794,6 +2800,87 @@ impl NodeManager {
         Ok(())
     }
 
+    fn release_idle_auto_update_fence(&mut self) {
+        self.update_fenced = false;
+        self.update_restart_was_desired = false;
+        drop(self.update_lifecycle_lock.take());
+    }
+
+    fn prepare_idle_auto_update_relaunch_with_probe<F>(
+        &mut self,
+        mut data_dir_held: F,
+    ) -> anyhow::Result<crate::auto_update::PrepareResult>
+    where
+        F: FnMut(&Path) -> std::io::Result<bool>,
+    {
+        use crate::auto_update::PrepareResult;
+
+        if self.child.is_some()
+            || self.desired_running
+            || self.lifecycle_lock.is_some()
+            || self.legacy_windows_stop_context.is_some()
+        {
+            return Ok(PrepareResult::busy(
+                "Managed node lifecycle, recovery, or legacy reconciliation is still pending",
+                0,
+            ));
+        }
+        if let Some(error) = self.legacy_windows_stop_error.as_deref() {
+            anyhow::bail!(
+                "legacy desktop node reconciliation is unresolved; refusing the update boundary: {error}"
+            );
+        }
+        let Some(data_dir) = self.managed_data_dir.clone() else {
+            return Ok(PrepareResult::busy(
+                "The managed node data directory is not configured",
+                0,
+            ));
+        };
+        if data_dir_held(&data_dir)? {
+            return Ok(PrepareResult::busy(
+                "Another node still holds the managed data directory",
+                0,
+            ));
+        }
+        match probe_existing_managed_lifecycle_owner(&data_dir.to_string_lossy()) {
+            Ok(()) => {}
+            Err(error) if is_managed_lifecycle_contention(&error) => {
+                return Ok(PrepareResult::busy(
+                    "Another managed lifecycle owner currently holds the data directory",
+                    0,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        if let Err(error) = self.prepare_fenced_update_relaunch() {
+            if is_managed_lifecycle_contention(&error) {
+                return Ok(PrepareResult::busy(
+                    "Another managed lifecycle owner currently holds the data directory",
+                    0,
+                ));
+            }
+            return Err(error);
+        }
+        let locked_data_dir = match self.update_lifecycle_lock.as_ref() {
+            Some(lock) => lock.data_dir.clone(),
+            None => data_dir,
+        };
+        match data_dir_held(&locked_data_dir) {
+            Ok(false) => Ok(PrepareResult::Prepared),
+            Ok(true) => {
+                self.release_idle_auto_update_fence();
+                Ok(PrepareResult::busy(
+                    "Another node acquired the managed data directory before the update fence settled",
+                    0,
+                ))
+            }
+            Err(error) => {
+                self.release_idle_auto_update_fence();
+                Err(error.into())
+            }
+        }
+    }
+
     pub async fn prepare_auto_update_relaunch(
         &mut self,
     ) -> anyhow::Result<crate::auto_update::PrepareResult> {
@@ -2813,10 +2900,7 @@ impl NodeManager {
             ));
         }
         let Some(pid) = self.pid() else {
-            return Ok(PrepareResult::busy(
-                "The managed node must be running before an unattended update can prove it is idle",
-                0,
-            ));
+            return self.prepare_idle_auto_update_relaunch_with_probe(node_data_directory_held);
         };
         let Some(nonce) = self.shutdown_control.as_ref().and_then(|c| c.receipt_nonce) else {
             return Ok(PrepareResult::busy(
@@ -6349,6 +6433,373 @@ mod tests {
         manager.update_restart_plan = Some(plan.clone());
         manager.update_restart_was_desired = true;
         (root, configured, manager, plan)
+    }
+
+    #[tokio::test]
+    async fn auto_update_of_a_cleanly_stopped_node_holds_a_fence_and_does_not_start_it() {
+        let root = resource_test_dir("auto-update-cleanly-stopped");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let preserved = data.join("operator-state");
+        std::fs::write(&preserved, b"preserved operator state").unwrap();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        let preserved_crash = CrashInfo {
+            exit_code: Some(17),
+            message: "prior crash details must survive idle update fencing".into(),
+            at_millis: 1_700_000_000_000,
+        };
+        *manager.crash_info.lock().await = Some(preserved_crash.clone());
+        manager.durability_failure = Some("preserved durability diagnostic".into());
+
+        assert!(!manager.ordinary_update_boundary_is_fenced());
+        assert_eq!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Prepared
+        );
+        assert!(manager.update_fenced);
+        let has_no_namespace_guard = manager
+            .update_lifecycle_lock
+            .as_ref()
+            .is_some_and(|lock| lock.namespace_guard.is_none());
+        assert!(has_no_namespace_guard);
+        drop(arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(&data).unwrap());
+        assert!(manager.child.is_none());
+        assert!(manager.update_restart_plan.is_none());
+        assert!(!manager.update_restart_was_desired);
+        assert!(!manager.desired_running);
+        assert!(manager.refuse_start_during_update().is_err());
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert!(
+            contender.contains(crate::start_fence::ALREADY_OPEN),
+            "{contender}"
+        );
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        let recorded_crash = manager.crash_info.lock().await.clone();
+        assert_eq!(
+            recorded_crash.as_ref().map(|info| info.exit_code),
+            Some(preserved_crash.exit_code)
+        );
+        assert_eq!(
+            recorded_crash.as_ref().map(|info| info.message.as_str()),
+            Some(preserved_crash.message.as_str())
+        );
+        assert_eq!(
+            manager.durability_failure.as_deref(),
+            Some("preserved durability diagnostic")
+        );
+
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        assert!(manager.child.is_none());
+        assert!(!manager.desired_running);
+        assert!(manager.refuse_start_during_update().is_ok());
+        let recorded_crash = manager.crash_info.lock().await.clone();
+        assert_eq!(
+            recorded_crash.as_ref().map(|info| info.exit_code),
+            Some(preserved_crash.exit_code)
+        );
+        assert_eq!(
+            recorded_crash.as_ref().map(|info| info.message.as_str()),
+            Some(preserved_crash.message.as_str())
+        );
+        assert_eq!(
+            manager.durability_failure.as_deref(),
+            Some("preserved durability diagnostic")
+        );
+        assert_eq!(
+            std::fs::read(&preserved).unwrap(),
+            b"preserved operator state"
+        );
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+
+        assert_eq!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Prepared
+        );
+        manager.begin_update_handoff().unwrap();
+        assert!(manager.abort_update_relaunch().await.is_err());
+        assert!(manager.refuse_start_during_update().is_err());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_auto_update_defers_to_a_live_data_writer_and_pending_crash_recovery() {
+        let root = resource_test_dir("auto-update-idle-deferrals");
+        let data = root.join("data-v3");
+        let legacy_dir = root.join("legacy-v07");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let seeds = root.join("testnet-seeds.txt");
+        let genesis = root.join("genesis.toml");
+        std::fs::write(&seeds, b"127.0.0.1:9000\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let configured = data.to_string_lossy().into_owned();
+
+        let mut unconfigured = NodeManager::new();
+        assert!(matches!(
+            unconfigured.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(unconfigured.update_lifecycle_lock.is_none());
+
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        let node_lock_path = data.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(node_data_directory_held(&data).unwrap());
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+
+        manager.desired_running = true;
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.desired_running);
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(manager.child.is_none());
+        manager.desired_running = false;
+
+        manager.lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.lifecycle_lock.is_some());
+        assert!(manager.update_lifecycle_lock.is_none());
+        manager.lifecycle_lock = None;
+
+        let external_owner = acquire_managed_lifecycle_lock(&configured).unwrap();
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        drop(external_owner);
+
+        let legacy_config = NodeConfig {
+            data_dir: configured.clone(),
+            ..NodeConfig::default()
+        };
+        let notice = DataMigrationNotice {
+            legacy_data_dir: legacy_dir.to_string_lossy().into_owned(),
+            active_data_dir: configured.clone(),
+            migrated_at: 1,
+            reason: "legacy data preserved".into(),
+        };
+        let resources = TestnetResources {
+            seeds_file: Some(seeds),
+            genesis_file: Some(genesis),
+        };
+        manager
+            .configure_legacy_windows_stop_context(
+                &legacy_config,
+                &notice,
+                Zeroizing::new("legacy seed stays private".into()),
+                &resources,
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.legacy_windows_stop_context.is_some());
+        assert!(manager.update_lifecycle_lock.is_none());
+        manager.legacy_windows_stop_context = None;
+
+        manager.block_legacy_windows_reconciliation("legacy migration unresolved");
+        let legacy_error = manager.prepare_auto_update_relaunch().await.unwrap_err();
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("legacy desktop node reconciliation is unresolved"),
+            "{legacy_error}"
+        );
+        assert!(manager.update_lifecycle_lock.is_none());
+        manager.legacy_windows_stop_error = None;
+
+        assert_eq!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Prepared
+        );
+        manager.abort_update_relaunch().await.unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_auto_update_post_lock_race_and_io_error_release_fence_without_masking() {
+        let root = resource_test_dir("auto-update-post-lock-race");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+
+        let mut race_calls = 0usize;
+        let raced = manager
+            .prepare_idle_auto_update_relaunch_with_probe(|path| {
+                race_calls += 1;
+                if race_calls == 1 {
+                    Ok(false)
+                } else {
+                    assert!(
+                        probe_existing_managed_lifecycle_owner(&path.to_string_lossy()).is_err(),
+                        "post-lock probe must execute while the owner fence is held"
+                    );
+                    Ok(true)
+                }
+            })
+            .unwrap();
+        assert_eq!(race_calls, 2);
+        assert!(matches!(
+            raced,
+            crate::auto_update::PrepareResult::Busy { active_jobs: 0, .. }
+        ));
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        assert!(manager.refuse_start_during_update().is_ok());
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+
+        let mut post_error_calls = 0usize;
+        let post_error = manager
+            .prepare_idle_auto_update_relaunch_with_probe(|path| {
+                post_error_calls += 1;
+                if post_error_calls == 1 {
+                    Ok(false)
+                } else {
+                    assert!(
+                        probe_existing_managed_lifecycle_owner(&path.to_string_lossy()).is_err(),
+                        "post-lock probe must execute while the owner fence is held"
+                    );
+                    Err(std::io::Error::other("simulated post-lock io error"))
+                }
+            })
+            .unwrap_err();
+        assert_eq!(post_error_calls, 2);
+        assert!(
+            post_error
+                .to_string()
+                .contains("simulated post-lock io error"),
+            "{post_error}"
+        );
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        assert!(manager.refuse_start_during_update().is_ok());
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+
+        let pre_error = manager
+            .prepare_idle_auto_update_relaunch_with_probe(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated pre-lock io error",
+                ))
+            })
+            .unwrap_err();
+        assert!(
+            pre_error
+                .to_string()
+                .contains("simulated pre-lock io error"),
+            "{pre_error}"
+        );
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_auto_update_never_signals_a_detached_process_and_defers_for_unreaped_child() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = resource_test_dir("auto-update-detached-untouched");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let genesis = data.join("receipt-genesis.toml");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &genesis,
+            b"[chain]\nname='desktop-idle-update-test'\n",
+        )
+        .unwrap();
+        let control = prepare_desktop_shutdown_control(&data).unwrap();
+        let mut detached = KillOnDrop(
+            std::process::Command::new("/bin/bash")
+                .arg("-c")
+                .arg("sleep 30")
+                .arg("arc-node")
+                .arg("--data-dir")
+                .arg(&data)
+                .arg("--desktop-shutdown-token-file")
+                .arg(&control.token_file)
+                .arg("--genesis")
+                .arg(&genesis)
+                .spawn()
+                .expect("spawn disposable detached stand-in"),
+        );
+
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        let result = manager.prepare_auto_update_relaunch().await.unwrap();
+        assert_eq!(result, crate::auto_update::PrepareResult::Prepared);
+        assert!(
+            !control.request_file.exists(),
+            "idle auto-update must never publish a detached shutdown request"
+        );
+        assert!(
+            detached.0.try_wait().unwrap().is_none(),
+            "idle auto-update must never stop or signal a detached writer"
+        );
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(!control.request_file.exists());
+        assert!(detached.0.try_wait().unwrap().is_none());
+        drop(detached);
+
+        let mut exited_child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        exited_child.wait().await.unwrap();
+        manager.child = Some(exited_child);
+        assert!(manager.pid().is_none());
+        assert!(matches!(
+            manager.prepare_auto_update_relaunch().await.unwrap(),
+            crate::auto_update::PrepareResult::Busy { .. }
+        ));
+        assert!(manager.update_lifecycle_lock.is_none());
+        manager.child = None;
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

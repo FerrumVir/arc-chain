@@ -9801,6 +9801,7 @@ async fn run_arc_node() -> Result<()> {
         let shard_worker_task = community_shard_cli::spawn_integrated_worker(
             prepared_shard_worker,
             Arc::new(validator_keypair.clone()),
+            native_request_admission.worker_execution_gate(),
             background_admission_shutdown_rx.clone(),
         )?;
         runtime_tasks.push(shard_worker_task);
