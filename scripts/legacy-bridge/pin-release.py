@@ -14,8 +14,8 @@ never from memory:
 3. Each pinned asset's manifest digest must equal GitHub's own asset digest.
 4. `worker_names_privacy_safe` is true only if the tag's arc-node no longer
    registers workers under "name (hostname)" (PR #134).
-5. The community RPC origins come from the tag's install.sh, and the model
-   pin from the tag's arc-node TESTNET_MODEL_SHA256.
+5. The community RPC origins and shard worker pins come from the tag's
+   install.sh, and the model pin from the tag's arc-node TESTNET_MODEL_SHA256.
 
 Usage:
   pin-release.py --tag v0.8.13 --write   # regenerate the pin file
@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,12 +57,35 @@ PLATFORM_ASSETS = [
 ]
 HOSTNAME_REGISTRATION = 'format!("{} ({})", public_node_name_c, hostname_c)'
 MODEL_SIZE = 4_081_004_224
+SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR = 6
 
 
 def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "arc-legacy-bridge-pin-release"})
     with urllib.request.urlopen(request, timeout=60) as response:
         return response.read()
+
+
+class RejectMetadataRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def release_metadata(tag: str) -> dict:
+    headers = {"User-Agent": "arc-legacy-bridge-pin-release", "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}",
+        headers=headers,
+    )
+    opener = urllib.request.build_opener(RejectMetadataRedirects())
+    with opener.open(request, timeout=60) as response:
+        payload = response.read(4 * 1024 * 1024 + 1)
+    if len(payload) > 4 * 1024 * 1024:
+        raise ValueError("Release metadata exceeds 4 MiB; inspect the release assets before pinning")
+    return json.loads(payload)
 
 
 def git_show(tag: str, path: str) -> str:
@@ -100,6 +125,121 @@ def verify_manifest(manifest: bytes, signature: bytes, key: str) -> None:
             raise SystemExit(f"SHA256SUMS.sig does not verify: {result.stderr.decode(errors='replace')}")
 
 
+def is_valid_port(port: str) -> bool:
+    return (
+        bool(port)
+        and not port.startswith("0")
+        and port.isascii()
+        and port.isdigit()
+        and 1 <= int(port) <= 65535
+    )
+
+
+def is_valid_host(host: str) -> bool:
+    if not host or host.startswith(".") or host.endswith(".") or ".." in host or not host.isascii():
+        return False
+    if all(ch.isdigit() or ch == "." for ch in host):
+        try:
+            ipaddress.IPv4Address(host)
+            return True
+        except ValueError:
+            return False
+    for label in host.split("."):
+        if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
+            return False
+        if not all(ch.isalnum() or ch == "-" for ch in label):
+            return False
+    return True
+
+
+def is_valid_https_origin(origin: str) -> bool:
+    if not origin.startswith("https://"):
+        return False
+    authority = origin[len("https://"):]
+    if not authority or any(ord(ch) < 33 or ord(ch) == 127 or ch in "/?#@\\" for ch in authority):
+        return False
+    if authority.startswith("["):
+        if "]" not in authority:
+            return False
+        address, after = authority[1:].split("]", 1)
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return False
+        if not after:
+            return True
+        if not after.startswith(":"):
+            return False
+        return is_valid_port(after[1:])
+    if ":" in authority:
+        host, port = authority.split(":", 1)
+        if ":" in port:
+            return False
+        return is_valid_host(host) and is_valid_port(port)
+    return is_valid_host(authority)
+
+
+def is_nonzero_lower_hex(value: str, length: int) -> bool:
+    return (
+        len(value) == length
+        and all(ch in "0123456789abcdef" for ch in value)
+        and any(ch != "0" for ch in value)
+    )
+
+
+def extract_shell_assignment(install_text: str, name: str, tag: str) -> str:
+    matches = re.findall(rf"^{re.escape(name)}=([^\r\n]+)$", install_text, re.MULTILINE)
+    if len(matches) != 1:
+        raise ValueError(f"{tag}: install.sh must define {name} exactly once (found {len(matches)})")
+    value = matches[0]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value
+
+
+def parse_shard_worker_pin(install_text: str, tag: str) -> dict:
+    coordinator_url = extract_shell_assignment(install_text, "SHARD_COORDINATOR_URL", tag)
+    coordinator_id = extract_shell_assignment(install_text, "SHARD_COORDINATOR_ID", tag)
+    transaction_domain = extract_shell_assignment(install_text, "SHARD_TRANSACTION_DOMAIN", tag)
+    expected_model_id = extract_shell_assignment(install_text, "SHARD_EXPECTED_MODEL_ID", tag)
+    raw_layers = extract_shell_assignment(install_text, "SHARD_REQUIRED_ADMITTED_LAYERS", tag)
+
+    if not is_valid_https_origin(coordinator_url):
+        raise ValueError(f"{tag}: invalid SHARD_COORDINATOR_URL {coordinator_url!r}")
+    for field_name, digest in (
+        ("SHARD_COORDINATOR_ID", coordinator_id),
+        ("SHARD_TRANSACTION_DOMAIN", transaction_domain),
+        ("SHARD_EXPECTED_MODEL_ID", expected_model_id),
+    ):
+        if not is_nonzero_lower_hex(digest, 64):
+            raise ValueError(f"{tag}: invalid {field_name} {digest!r}")
+    if (
+        not raw_layers.isascii()
+        or not raw_layers.isdigit()
+        or (len(raw_layers) > 1 and raw_layers.startswith("0"))
+    ):
+        raise ValueError(f"{tag}: invalid SHARD_REQUIRED_ADMITTED_LAYERS {raw_layers!r}")
+    required_layers = int(raw_layers)
+    if required_layers < SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR:
+        raise ValueError(
+            f"{tag}: SHARD_REQUIRED_ADMITTED_LAYERS={required_layers} is below floor {SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR}"
+        )
+    return {
+        "coordinator_url": coordinator_url,
+        "coordinator_id": coordinator_id,
+        "transaction_domain": transaction_domain,
+        "expected_model_id": expected_model_id,
+        "required_admitted_layers": required_layers,
+    }
+
+
+def shard_worker_pin(tag: str) -> dict:
+    try:
+        return parse_shard_worker_pin(git_show(tag, "install.sh"), tag)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+
 def community_origins(tag: str) -> list[str]:
     install = git_show(tag, "install.sh")
     block = re.search(r"COMMUNITY_RPC_ORIGINS=\(\n(.*?)\n\)", install, re.S)
@@ -129,7 +269,7 @@ def model_pin(tag: str, previous: dict | None) -> dict:
 
 
 def build_pins(tag: str, bridge_version: str, previous: dict | None) -> dict:
-    release = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}"))
+    release = release_metadata(tag)
     problems = []
     if release.get("draft") or release.get("prerelease"):
         problems.append("draft or prerelease")
@@ -181,6 +321,7 @@ def build_pins(tag: str, bridge_version: str, previous: dict | None) -> dict:
         "manifest_signer": {"principal": SIGNER, "namespace": NAMESPACE, "public_key": release_key()},
         "community_rpc_origins": community_origins(tag),
         "model": model_pin(tag, (previous or {}).get("model")),
+        "shard_worker": shard_worker_pin(tag),
     }
 
 
@@ -211,7 +352,7 @@ def main() -> int:
             if pins.get(key) != previous.get(key):
                 print(f"  {key}: committed {json.dumps(previous.get(key))[:200]} != derived {json.dumps(pins.get(key))[:200]}", file=sys.stderr)
         return 1
-    print(f"committed pins match {tag}: signed manifest, GitHub digests, origins, model, privacy flag")
+    print(f"committed pins match {tag}: signed manifest, GitHub digests, origins, model, shard worker, privacy flag")
     return 0
 
 

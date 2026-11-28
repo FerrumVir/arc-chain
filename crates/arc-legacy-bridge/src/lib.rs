@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod pins;
 pub mod release;
 pub mod run;
+pub mod shard_policy;
 pub mod sshsig;
 pub mod state;
 

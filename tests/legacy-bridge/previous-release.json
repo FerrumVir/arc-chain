@@ -1,0 +1,27 @@
+{
+  "schema": "arc.legacy-bridge.previous-release.v1",
+  "bridge_tag": "v0.7.14",
+  "node_tag": "v0.8.13",
+  "assets": {
+    "arc-node-linux-aarch64": {
+      "sha256": "e545c9ddb4ff0f2eb2e1230fdc0fd240b1e97018a1bc2b2cb884a83eaa5ae0e5",
+      "size": 2167024
+    },
+    "arc-node-linux-x86_64": {
+      "sha256": "813cc6545dc3dfcc47fd697c8bcc5acfd21e99339f45e8547c31c735a752f29c",
+      "size": 2667280
+    },
+    "arc-node-macos-arm64": {
+      "sha256": "2d4a5932ab701efbaefe44b4b717a47135ffdb9010eab817adfa10b3574fec02",
+      "size": 1945744
+    },
+    "arc-node-macos-x86_64": {
+      "sha256": "ab490449261923fafac395f611fc5da2b086f335aef370043d6ca8ca87e7b0f8",
+      "size": 2303544
+    },
+    "arc-node-windows-x86_64.exe": {
+      "sha256": "db48c1d0a1b550137c29d265a6ca14229e1cdade8d3dd30398df6854131c4dc1",
+      "size": 2223616
+    }
+  }
+}

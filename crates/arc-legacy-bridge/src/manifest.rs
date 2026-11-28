@@ -109,14 +109,14 @@ impl ReleaseManifest {
 mod tests {
     use super::*;
 
-    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS");
+    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS");
 
     #[test]
-    fn real_v0813_manifest_parses_and_matches_pins() {
+    fn real_v0827_manifest_parses_and_matches_pins() {
         let manifest = parse(MANIFEST).unwrap();
         assert_eq!(manifest.repository, "FerrumVir/arc-chain");
-        assert_eq!(manifest.tag, "v0.8.13");
-        assert_eq!(manifest.commit, "aec8c9f36fef387dc073bcafbce40281b3108e51");
+        assert_eq!(manifest.tag, "v0.8.27");
+        assert_eq!(manifest.commit, "cd6b059dc9ab606e32c42f9ba78169dffcdd809f");
         assert_eq!(manifest.digests.len(), 28);
         manifest.check_pins(&Pins::embedded().unwrap()).unwrap();
     }
@@ -144,7 +144,7 @@ mod tests {
         let pins = Pins::embedded().unwrap();
         let text = std::str::from_utf8(MANIFEST)
             .unwrap()
-            .replace("# tag=v0.8.13", "# tag=v0.8.12");
+            .replace("# tag=v0.8.27", "# tag=v0.8.12");
         assert!(parse(text.as_bytes()).unwrap().check_pins(&pins).is_err());
         let mut manifest = parse(MANIFEST).unwrap();
         manifest

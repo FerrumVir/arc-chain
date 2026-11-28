@@ -523,6 +523,52 @@ request-success evidence.
 
 ## Releases and versions
 
+The separate legacy bridge candidate is v0.7.15 and pins the signed v0.8.27
+node release. GitHub's published global Latest remains v0.7.14 until the
+candidate's legacy acceptance and handoff qualify and its publication is
+verified. Modern v0.8 releases must remain non-Latest. The headless acceptance
+runs both a fresh v0.7 install and an existing immutable v0.7.14 bridge; the
+latter checks that the v0.8.13-to-v0.8.27 update preserves the bridge identity,
+data directory, WAL prefix, genesis binding and saved compute opt-out. It also
+reopens upgraded data with the previous node, recovers through the real updater,
+and qualifies an explicitly opted-in worker against the old 30-second health
+deadline on a remote runner with enough memory. Desktop acceptance exercises
+the same bridge-to-bridge rollback after its normal child-kill lifecycle on
+Linux, Windows and the opt-in macOS leg. These are release qualification gates,
+not evidence that operator machines have adopted the candidate. Legacy
+headless updaters pull on their existing schedule; v0.7 desktop app updates
+still require their local update check. Neither path supplies remote control
+or proves a count of active operators. Bridge compute consent choices are
+unchanged: absent consent, saved opt-outs and v0.7 desktops remain observers.
+For consenting headless nodes with a verified regular model file (symlinked
+model paths are rejected before compute activation for every role), the bridge
+defaults to `auto` worker mode (persisted separately in `compute-worker-mode`
+so `BridgeState` keeps its v0.7.14 schema): on Linux, macOS and Windows, when
+optional `shard_worker` pins (derived from the tag's `install.sh` by
+`pin-release.py`) are present, it checks fresh host memory (16 GB nominal
+floor, 6 GiB available, 4 GiB OS reserve, half-visible cap, clamped on Linux
+by effective cgroup v1/v2 limits including ancestors and on Windows by
+physical, commit, virtual and hard working-set limits only when
+`IsProcessInJob` positively reports not in a Job Object; any direct or nested
+Windows Job Object membership or failed query fails closed before spawning
+preflight because `QueryInformationJobObject(NULL, ...)` only inspects the
+immediate job and not ancestor limits or aggregate job headroom), runs a
+bounded 10-second unverified header-admission check (`community-shard-worker --check-header-only`, supervised in a Unix
+process group or suspended-spawn kill-on-close Windows Job Object, requiring
+exact outer fields with `mode="header-admission-only"`, `artifact_verified=false`,
+and at least 6 admitted layers), rechecks memory after preflight, and launches
+`--community-shard-worker` (rewards disabled) without whole-model flags. The
+launched `arc-node` still performs full-file BLAKE3 model verification after
+early `/health` bind before registration or weights (`install.sh` retains full
+`--check-only`); unsupported platforms fail closed before probing or spawning,
+v0.7 Windows desktops remain observer-only until the v0.8 desktop update, and
+the checked-in `v0.8.27` pin lacks `--check-header-only`, so `auto` falls back
+to `--full-integer-worker` until `v0.8.28` is published and repinned. Explicit
+`full` bypasses preflight, and explicit `shard` fails closed.
+Rollback and original-binary preservation classify exact version output and
+reject every bridge executable, including an older bridge version. An existing
+preserved original is never replaced by a later updater's previous binary.
+
 Both the checked-in candidate version and the published release version are
 0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while
 validators remain on v0.8.26. The headless installer defaults `--worker-mode`

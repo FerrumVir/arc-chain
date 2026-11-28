@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt -p arc-legacy-bridge -- --check
       - name: clippy (deny warnings)
         run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
-      - name: Unit tests (real v0.8.13 signed manifest, local HTTP server)
+      - name: Unit tests (real v0.8.27 signed manifest, local HTTP server)
         run: cargo test -p arc-legacy-bridge --locked
 
   scripts:
@@ -64,9 +64,13 @@ jobs:
       - name: ShellCheck and Python syntax
         run: |
           shellcheck -S warning tests/legacy-bridge/headless-v07-acceptance.sh tests/legacy-bridge/fake-github/curl
-          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py
+          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py tests/legacy-bridge/fetch_release_metadata.py tests/legacy-bridge/worker_startup_readiness.py tests/legacy-bridge/test_desktop_harness.py
       - name: Offline privacy boolean parsing under errexit (no node)
         run: python3 tests/legacy-bridge/test_privacy_flag.py -v
+      - name: Release metadata authentication boundaries
+        run: python3 tests/legacy-bridge/test_pin_release_metadata.py -v
+      - name: Desktop harness port probe, fixture and headless metadata checks
+        run: python3 tests/legacy-bridge/test_desktop_harness.py -v
       - name: The harness reproduces the released v0.7.11 desktop source
         run: |
           git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
@@ -117,10 +121,15 @@ jobs:
           retention-days: 14
 
   headless-linux:
-    name: v0.7.11 headless install consumes the bridge (systemd, real updater)
+    name: headless ${{ matrix.scenario }} consumes the bridge (systemd, real updater)
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario: [fresh, previous-bridge]
     needs: build-linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -130,6 +139,9 @@ jobs:
           name: bridge-linux-x86_64
           path: dist
       - name: Run the acceptance
+        env:
+          ARC_BRIDGE_ACCEPTANCE_SCENARIO: ${{ matrix.scenario }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           chmod 0755 dist/arc-node-linux-x86_64
           bash tests/legacy-bridge/headless-v07-acceptance.sh dist/arc-node-linux-x86_64 evidence/headless
@@ -137,16 +149,21 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: evidence-headless-linux
+          name: evidence-headless-linux-${{ matrix.scenario }}
           path: evidence/
           if-no-files-found: warn
           retention-days: 30
 
   desktop-linux:
-    name: v0.7.11 desktop consumes the bridge (Linux)
+    name: v0.7.11 desktop ${{ matrix.scenario }} consumes the bridge (Linux)
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario: [fresh, previous-bridge]
     needs: build-linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -180,25 +197,29 @@ jobs:
       - name: The v0.7.11 desktop lifecycle consumes the bridge
         run: |
           python3 tests/legacy-bridge/desktop_v07_harness.py run \
+            --scenario "${{ matrix.scenario }}" \
             --bridge dist/arc-node-linux-x86_64 \
             --legacy-node legacy/arc-node-v0.7.7 \
             --legacy-seeds legacy/testnet-seeds.txt \
             --legacy-genesis legacy/genesis.toml \
             --pins crates/arc-legacy-bridge/pins/active.json \
-            --evidence evidence/desktop-linux
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+            --evidence "evidence/desktop-linux-${{ matrix.scenario }}"
+      - if: matrix.scenario == 'fresh'
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
       - name: The v0.7.11 Tauri updater accepts a v0.8 desktop latest.json
+        if: matrix.scenario == 'fresh'
         run: |
           set -euo pipefail
           cargo build --release --locked --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
           verifier=tests/release/tauri-updater-verifier/target/release/tauri-updater-verifier
           out=evidence/tauri-updater
           mkdir -p "$out"
+          node_tag="$(jq -er .node_release.tag crates/arc-legacy-bridge/pins/active.json)"
           pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er '.plugins.updater.pubkey')"
           curl -fsSL --retry 3 -o "$out/latest.json" \
-            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.13/latest.json
+            "https://github.com/FerrumVir/arc-chain/releases/download/$node_tag/latest.json"
           python3 - "$out/latest.json" <<'PY'
           import json, sys
           manifest = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -220,7 +241,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: evidence-desktop-linux
+          name: evidence-desktop-linux-${{ matrix.scenario }}
           path: evidence/
           if-no-files-found: warn
           retention-days: 30
@@ -269,22 +290,35 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
           python tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+          python tests/legacy-bridge/test_desktop_harness.py -v
           mkdir -p legacy
           git show v0.7.11:desktop/src-tauri/resources/testnet-seeds.txt > legacy/testnet-seeds.txt
           git show v0.7.11:desktop/src-tauri/resources/genesis.toml > legacy/genesis.toml
           curl -fsSL --retry 3 -o legacy/arc-node-v0.7.7.exe \
             https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/arc-node-windows-x86_64.exe
           echo "8c1530cfb41954079236dfdd5518dad52071b18f3a032630470b853e7249f240  legacy/arc-node-v0.7.7.exe" | sha256sum -c -
-      - name: The v0.7.11 desktop lifecycle consumes the bridge
+      - name: The v0.7.11 desktop fresh install consumes the bridge
         shell: bash
         run: |
           python tests/legacy-bridge/desktop_v07_harness.py run \
+            --scenario fresh \
             --bridge dist/arc-node-windows-x86_64.exe \
             --legacy-node legacy/arc-node-v0.7.7.exe \
             --legacy-seeds legacy/testnet-seeds.txt \
             --legacy-genesis legacy/genesis.toml \
             --pins crates/arc-legacy-bridge/pins/active.json \
-            --evidence evidence/desktop-windows
+            --evidence evidence/desktop-windows/fresh
+      - name: The v0.7.11 desktop previous-bridge upgrade and rollback recovery
+        shell: bash
+        run: |
+          python tests/legacy-bridge/desktop_v07_harness.py run \
+            --scenario previous-bridge \
+            --bridge dist/arc-node-windows-x86_64.exe \
+            --legacy-node legacy/arc-node-v0.7.7.exe \
+            --legacy-seeds legacy/testnet-seeds.txt \
+            --legacy-genesis legacy/genesis.toml \
+            --pins crates/arc-legacy-bridge/pins/active.json \
+            --evidence evidence/desktop-windows/previous-bridge
       - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -300,7 +334,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.macos) ||
       (github.event_name == 'push' && contains(github.event.head_commit.message, '[macos-acceptance]'))
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -319,6 +353,8 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
+          python3 tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+          python3 tests/legacy-bridge/test_desktop_harness.py -v
           git show v0.7.11:desktop/src-tauri/resources/testnet-seeds.txt > legacy/testnet-seeds.txt
           git show v0.7.11:desktop/src-tauri/resources/genesis.toml > legacy/genesis.toml
           curl -fsSL --retry 3 -o legacy/arc-node-v0.7.7 \
@@ -335,12 +371,21 @@ jobs:
             exit 1
           fi
           python3 tests/legacy-bridge/desktop_v07_harness.py run \
+            --scenario fresh \
             --bridge dist/arc-node-macos-arm64 \
             --legacy-node legacy/arc-node-v0.7.7 \
             --legacy-seeds legacy/testnet-seeds.txt \
             --legacy-genesis legacy/genesis.toml \
             --pins crates/arc-legacy-bridge/pins/active.json \
-            --evidence evidence/desktop-macos
+            --evidence evidence/desktop-macos/fresh
+          python3 tests/legacy-bridge/desktop_v07_harness.py run \
+            --scenario previous-bridge \
+            --bridge dist/arc-node-macos-arm64 \
+            --legacy-node legacy/arc-node-v0.7.7 \
+            --legacy-seeds legacy/testnet-seeds.txt \
+            --legacy-genesis legacy/genesis.toml \
+            --pins crates/arc-legacy-bridge/pins/active.json \
+            --evidence evidence/desktop-macos/previous-bridge
       - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

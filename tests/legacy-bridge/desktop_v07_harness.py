@@ -127,8 +127,11 @@ def ensure_binary(home: Path, github: str, desktop_version: str) -> dict[str, ob
 
 def port_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if not WINDOWS:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(("127.0.0.1", port))
+            probe.listen(128)
         except OSError:
             return False
     return True
@@ -176,14 +179,14 @@ class DesktopNode:
         if config.get("model_path"):
             args += ["--model", str(config["model_path"])]
         environment = dict(os.environ, HOME=str(self.home))
-        log = self.log_path.open("ab")
-        self.process = subprocess.Popen(
-            args,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=environment,
-            creationflags=creation_flags(),
-        )
+        with self.log_path.open("ab") as log:
+            self.process = subprocess.Popen(
+                args,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                creationflags=creation_flags(),
+            )
         self.rpc_port = rpc_port
         return args
 
@@ -245,9 +248,17 @@ def http_json(port: int, path: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def wait_health(port: int, seconds: int) -> dict[str, object]:
+def wait_health(
+    port: int,
+    seconds: int,
+    process: subprocess.Popen[bytes] | None = None,
+) -> dict[str, object]:
     deadline = time.time() + seconds
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise AssertionError(
+                f"node launcher exited with code {process.returncode} before answering /health on 127.0.0.1:{port}"
+            )
         try:
             return http_json(port, "/health")
         except (OSError, ValueError):
@@ -324,12 +335,103 @@ def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
     return unreadable
 
 
+def bridge_identity(state_path: Path) -> dict[str, str]:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return {
+        "address": state["node_address"],
+        "data": state["node_data_dir"],
+        "key_sha256": sha256(Path(state["node_keyfile"])),
+        "genesis_sha256": sha256(Path(state["node_data_dir"]) / "genesis.network-hash"),
+    }
+
+
+def read_wal_snapshot(data_dir: Path) -> bytes:
+    wal_path = data_dir / "state.wal"
+    assert wal_path.is_file(), f"bridged node wrote no state WAL at {wal_path}"
+    size = wal_path.stat().st_size
+    assert 0 < size <= 8 * 1024 * 1024, f"unexpected isolated WAL size {size} at {wal_path}"
+    return wal_path.read_bytes()
+
+
+def assert_wal_prefix_retained(data_dir: Path, expected_prefix: bytes, label: str) -> bytes:
+    wal_path = data_dir / "state.wal"
+    assert wal_path.is_file(), f"{label}: missing state WAL at {wal_path}"
+    size = wal_path.stat().st_size
+    assert 0 < size <= 8 * 1024 * 1024, f"{label}: unexpected isolated WAL size {size}"
+    with wal_path.open("rb") as stream:
+        head = stream.read(len(expected_prefix))
+    assert expected_prefix and head == expected_prefix, f"{label}: persisted WAL prefix changed or was truncated"
+    return wal_path.read_bytes()
+
+
+def verify_running_bridge_node(
+    node: DesktopNode,
+    expected_binary: Path,
+    expected_sha: str | None,
+    expected_version: str,
+    timeout: int,
+    expected_address: str | None = None,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    assert node.process is not None, "desktop node process was not started"
+    health = wait_health(node.rpc_port, timeout, node.process)
+    assert health["chain_participation_enabled"] is False, health
+    info = http_json(node.rpc_port, "/node/info")
+    assert info["stake"] == 0, info
+    assert info["version"] == expected_version, info
+    validator_address = str(info["validator"]).removeprefix("0x")
+    if expected_address is not None:
+        assert validator_address == expected_address, info
+    assert expected_binary.is_file(), f"expected node binary missing: {expected_binary}"
+    if expected_sha is not None:
+        assert sha256(expected_binary) == expected_sha, expected_binary
+    running = node_process(node.process.pid, expected_binary)
+    cmdline = str(running["cmdline"])
+    assert "--rpc" in cmdline and f"127.0.0.1:{node.rpc_port}" in cmdline, cmdline
+    return health, info, running
+
+
+def stop_and_verify_child_exit(
+    node: DesktopNode,
+    running_pid: int,
+    timeout_seconds: float = 30.0,
+) -> None:
+    node.stop()
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not pid_alive(running_pid):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    raise AssertionError(f"stopping the desktop's child left node pid {running_pid} running")
+
+
+def previous_bridge_payload(asset: str, evidence: Path) -> tuple[str, str, bytes]:
+    previous = json.loads((HERE / "previous-release.json").read_text(encoding="utf-8"))
+    assert previous["schema"] == "arc.legacy-bridge.previous-release.v1"
+    tag = previous["bridge_tag"]
+    node_tag = previous["node_tag"]
+    assert isinstance(tag, str) and tag.startswith("v")
+    assert isinstance(node_tag, str) and node_tag.startswith("v")
+    expected = previous["assets"][asset]
+    assert 0 < expected["size"] <= 4 * 1024 * 1024
+    url = f"https://github.com/{REPO}/releases/download/{tag}/{asset}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        payload = response.read(expected["size"] + 1)
+    assert len(payload) == expected["size"], "previous bridge size differs from the immutable release"
+    assert hashlib.sha256(payload).hexdigest() == expected["sha256"], "previous bridge digest differs"
+    (evidence / "previous-release.json").write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+    return tag, node_tag, payload
+
+
 def run(args: argparse.Namespace) -> None:
+    scenario: str = args.scenario
     evidence: Path = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
     pins = json.loads(args.pins.read_text(encoding="utf-8"))
     asset = platform_release_asset()
     node_tag = pins["node_release"]["tag"]
+    node_version = pins["node_release"]["version"]
     node_asset = {
         "arc-node-linux-x86_64": "arc-node-linux-x86_64",
         "arc-node-windows-x86_64.exe": "arc-node-windows-x86_64.exe",
@@ -338,7 +440,7 @@ def run(args: argparse.Namespace) -> None:
     }[asset]
     pinned_node_sha = pins["node_release"]["assets"][node_asset]["sha256"]
     privacy_safe = pins["node_release"]["worker_names_privacy_safe"] is True
-    report: dict[str, object] = {"platform": asset, "node_release": node_tag}
+    report: dict[str, object] = {"scenario": scenario, "platform": asset, "node_release": node_tag}
 
     home = (evidence / "home").resolve()
     shutil.rmtree(home, ignore_errors=True)
@@ -353,104 +455,207 @@ def run(args: argparse.Namespace) -> None:
     github.releases[bridge_tag] = {asset: args.bridge.read_bytes()}
     config = {"rpc_port": 9944, "p2p_port": 9945, "data_dir": "~/.arc", "role": "worker", "model_path": None}
     node = DesktopNode(home, resources, evidence / "desktop-node.log")
-
-    print("== v0.7.7 era: the app and its node agree; the node writes real v0.7 state")
-    shutil.copyfile(args.legacy_node, managed_binary_path(home))
-    if not WINDOWS:
-        os.chmod(managed_binary_path(home), 0o755)
-    github.latest = "v0.7.7"
-    start_node(node, github.base, "0.7.7", config)
-    wait_health(node.rpc_port, 90)
-    time.sleep(10)
-    node.stop()
-    v07_files = sorted(p.name for p in arc.iterdir())
-    report["v07_data_entries"] = v07_files
-    assert (arc / "state.wal").is_file(), f"v0.7.7 wrote no state WAL: {v07_files}"
-
-    print("== today: a v0.7.11 app cannot start its node because Latest has no arc-node asset")
-    github.latest = "v0.7.11"
-    try:
-        start_node(node, github.base, "0.7.11", config)
-        raise AssertionError("a v0.7.11 desktop started a node from a desktop-only Latest")
-    except RuntimeError as error:
-        report["stranded_error"] = str(error)
-        assert "returned HTTP 404" in str(error)
-    snapshot_tree.write_json(evidence / "v07-data.before.json", {"entries": snapshot_tree.snapshot(arc, True)})
-
-    print("== the bridge is Latest: the next start installs it and the node joins as v0.8 stake 0")
-    github.latest = bridge_tag
-    started = time.time()
-    argv = start_node(node, github.base, "0.7.11", config)
-    report["spawn_argv"] = [arg if arg != SEED_PHRASE else "<seed phrase>" for arg in argv]
-    assert "--stake" not in argv, "the v0.7 desktop never passed --stake"
-    health = wait_health(node.rpc_port, 240)
-    report["first_start_seconds"] = round(time.time() - started, 1)
-    info = http_json(node.rpc_port, "/node/info")
-    report["health"], report["node_info"] = health, info
-    assert info["stake"] == 0, info
-    assert info["version"] == pins["node_release"]["version"], info
-    assert health["chain_participation_enabled"] is False, health
     bridge_root = arc / "legacy-bridge"
     node_binary = bridge_root / "releases" / node_tag / node_asset
-    assert sha256(node_binary) == pinned_node_sha
-    running = node_process(node.process.pid, node_binary)
-    report["node_process"] = {k: v for k, v in running.items() if k != "cmdline"}
-    cmdline = str(running["cmdline"])
-    for required in ("--stake 0", "--min-stake 0", "--community-mode" if privacy_safe else "--no-community"):
-        assert required in cmdline, f"{required} missing from {cmdline}"
-    if privacy_safe:
-        assert "--no-community" not in cmdline, f"--no-community in {cmdline}"
-        assert cmdline.count("--community-rpc-url") == len(pins["community_rpc_origins"]), cmdline
-    for forbidden in ("--validator-seed", "--model", "--shard-range", "--insecure-dev-validator-seed"):
-        assert forbidden not in cmdline, f"{forbidden} in {cmdline}"
-    states = list(bridge_root.glob("nodes/desktop-*/bridge-state.json"))
-    assert len(states) == 1, states
-    state = json.loads(states[0].read_text(encoding="utf-8"))
-    report["bridge_state"] = state
-    assert state["legacy_kind"] == "desktop" and state["stake"] == 0
-    assert state["community_registration"] is privacy_safe, state
-    assert state["compute"].startswith("off: the updated ARC desktop app asks")
-    assert (states[0].parent / "data" / "genesis.network-hash").is_file()
-    assert not (arc / "genesis.network-hash").exists(), "v0.8 initialized the v0.7 data directory"
-    log_text = (evidence / "desktop-node.log").read_text(encoding="utf-8", errors="replace")
-    assert "Your ARC node is upgrading to the new network" in log_text
-    assert "Settings > Check for updates > Install" in log_text
-    snapshot_tree.write_json(evidence / "v07-data.after.json", {"entries": snapshot_tree.snapshot(arc, True)})
-    before = json.loads((evidence / "v07-data.before.json").read_text(encoding="utf-8"))["entries"]
-    after = json.loads((evidence / "v07-data.after.json").read_text(encoding="utf-8"))["entries"]
-    assert before == after and "state.wal" in before, "the v0.7 data changed"
-    locked = assert_no_seed([bridge_root], cmdline)
-    report["seed_scan_locked_by_running_node"] = locked
-    bridge_outputs = [
-        path
-        for path in locked
-        if Path(path).name in ("bridge.log", "bridge-state.json")
-        or Path(path).name.startswith("v0.7-data-archive")
-    ]
-    assert not bridge_outputs, f"bridge outputs could not be scanned: {bridge_outputs}"
 
-    print("== stop and start again: the launcher is fetched again, the verified cache is reused")
-    node_pid = int(running["pid"])
-    address = state["node_address"]
-    node.stop()
-    for _ in range(30):
-        if not pid_alive(node_pid):
-            break
-        time.sleep(1)
-    assert not pid_alive(node_pid), "stopping the desktop's child left the v0.8 node running"
-    start_node(node, github.base, "0.7.11", config)
-    wait_health(node.rpc_port, 120)
-    state = json.loads(states[0].read_text(encoding="utf-8"))
-    assert state["node_address"] == address, "a restart changed the identity"
-    bridge_log = (bridge_root / "bridge.log").read_text(encoding="utf-8")
-    assert f"reusing the verified {node_tag} release cache" in bridge_log
-    after_restart = snapshot_tree.snapshot(arc, True)
-    assert after_restart == before, "the v0.7 data changed across a restart"
-    node.stop()
-    report["fake_github_requests"] = github.requests
-    (evidence / "desktop-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    github.shutdown()
-    print(f"PASS: v0.7.11 desktop on {asset} bridged to {node_tag} at stake 0; v0.7 data untouched")
+    try:
+        print("== v0.7.7 era: the app and its node agree; the node writes real v0.7 state")
+        shutil.copyfile(args.legacy_node, managed_binary_path(home))
+        if not WINDOWS:
+            os.chmod(managed_binary_path(home), 0o755)
+        github.latest = "v0.7.7"
+        start_node(node, github.base, "0.7.7", config)
+        assert node.process is not None
+        v07_pid = node.process.pid
+        wait_health(node.rpc_port, 90, node.process)
+        time.sleep(10)
+        stop_and_verify_child_exit(node, v07_pid)
+        v07_files = sorted(p.name for p in arc.iterdir())
+        report["v07_data_entries"] = v07_files
+        assert (arc / "state.wal").is_file(), f"v0.7.7 wrote no state WAL: {v07_files}"
+
+        print("== today: a v0.7.11 app cannot start its node because Latest has no arc-node asset")
+        github.latest = "v0.7.11"
+        try:
+            start_node(node, github.base, "0.7.11", config)
+            raise AssertionError("a v0.7.11 desktop started a node from a desktop-only Latest")
+        except RuntimeError as error:
+            report["stranded_error"] = str(error)
+            assert "returned HTTP 404" in str(error)
+        snapshot_tree.write_json(evidence / "v07-data.before.json", {"entries": snapshot_tree.snapshot(arc, True)})
+
+        previous_tag = ""
+        previous_node_tag = ""
+        previous_node_version = ""
+        previous_node_binary = Path()
+        previous_node_sha = ""
+        previous_state_path: Path | None = None
+        original_identity: dict[str, str] | None = None
+        original_wal = b""
+        preserved_data = Path()
+
+        if scenario == "previous-bridge":
+            print("== an existing bridge install creates the identity and data retained across upgrades")
+            previous_tag, previous_node_tag, previous_payload = previous_bridge_payload(asset, evidence)
+            previous_node_version = previous_node_tag.removeprefix("v")
+            previous_node_binary = bridge_root / "releases" / previous_node_tag / node_asset
+            github.releases[previous_tag] = {asset: previous_payload}
+            github.latest = previous_tag
+            start_node(node, github.base, "0.7.11", config)
+            _, previous_info, previous_running = verify_running_bridge_node(
+                node,
+                previous_node_binary,
+                None,
+                previous_node_version,
+                240,
+            )
+            previous_node_sha = sha256(previous_node_binary)
+            previous_states = list(bridge_root.glob("nodes/desktop-*/bridge-state.json"))
+            assert len(previous_states) == 1
+            previous_state_path = previous_states[0]
+            previous_state = json.loads(previous_state_path.read_text(encoding="utf-8"))
+            assert previous_state["node_address"] == str(previous_info["validator"]).removeprefix("0x")
+            stop_and_verify_child_exit(node, int(previous_running["pid"]))
+            original_identity = bridge_identity(previous_state_path)
+            original_wal = read_wal_snapshot(Path(original_identity["data"]))
+            preserved_data = Path(original_identity["data"]) / "bridge-upgrade-preservation.txt"
+            preserved_data.write_bytes(b"preserve existing bridge data\n")
+            report["previous_bridge_identity"] = original_identity
+
+        print("== the bridge is Latest: the next start installs it and the node joins as v0.8 stake 0")
+        log_path = evidence / "desktop-node.log"
+        log_offset = log_path.stat().st_size if log_path.is_file() else 0
+        github.latest = bridge_tag
+        started = time.time()
+        argv = start_node(node, github.base, "0.7.11", config)
+        report["spawn_argv"] = [arg if arg != SEED_PHRASE else "<seed phrase>" for arg in argv]
+        assert "--stake" not in argv, "the v0.7 desktop never passed --stake"
+        health, info, running = verify_running_bridge_node(
+            node,
+            node_binary,
+            pinned_node_sha,
+            node_version,
+            240,
+            expected_address=original_identity["address"] if original_identity is not None else None,
+        )
+        report["first_start_seconds"] = round(time.time() - started, 1)
+        report["health"], report["node_info"] = health, info
+        report["node_process"] = {k: v for k, v in running.items() if k != "cmdline"}
+        cmdline = str(running["cmdline"])
+        for required in ("--stake 0", "--min-stake 0", "--community-mode" if privacy_safe else "--no-community"):
+            assert required in cmdline, f"{required} missing from {cmdline}"
+        if privacy_safe:
+            assert "--no-community" not in cmdline, f"--no-community in {cmdline}"
+            assert cmdline.count("--community-rpc-url") == len(pins["community_rpc_origins"]), cmdline
+        for forbidden in ("--validator-seed", "--model", "--shard-range", "--insecure-dev-validator-seed"):
+            assert forbidden not in cmdline, f"{forbidden} in {cmdline}"
+        states = list(bridge_root.glob("nodes/desktop-*/bridge-state.json"))
+        assert len(states) == 1, states
+        state = json.loads(states[0].read_text(encoding="utf-8"))
+        report["bridge_state"] = state
+        assert state["legacy_kind"] == "desktop" and state["stake"] == 0
+        assert state["community_registration"] is privacy_safe, state
+        assert state["compute"].startswith("off: the updated ARC desktop app asks")
+        assert state["node_address"] == str(info["validator"]).removeprefix("0x")
+        if previous_state_path is not None:
+            assert states[0] == previous_state_path, "upgrade replaced the bridge context"
+        else:
+            assert state["archive_generation"] == 1, state
+        assert (states[0].parent / "data" / "genesis.network-hash").is_file()
+        assert not (arc / "genesis.network-hash").exists(), "v0.8 initialized the v0.7 data directory"
+        candidate_log = log_path.read_bytes()[log_offset:].decode("utf-8", errors="replace")
+        assert "Your ARC node is upgrading to the new network" in candidate_log
+        assert "Settings > Check for updates > Install" in candidate_log
+        snapshot_tree.write_json(evidence / "v07-data.after.json", {"entries": snapshot_tree.snapshot(arc, True)})
+        before = json.loads((evidence / "v07-data.before.json").read_text(encoding="utf-8"))["entries"]
+        after = json.loads((evidence / "v07-data.after.json").read_text(encoding="utf-8"))["entries"]
+        assert before == after and "state.wal" in before, "the v0.7 data changed"
+        locked = assert_no_seed([bridge_root], cmdline)
+        report["seed_scan_locked_by_running_node"] = locked
+        bridge_outputs = [
+            path
+            for path in locked
+            if Path(path).name in ("bridge.log", "bridge-state.json")
+            or Path(path).name.startswith("v0.7-data-archive")
+        ]
+        assert not bridge_outputs, f"bridge outputs could not be scanned: {bridge_outputs}"
+
+        print("== stop and start again: the launcher is fetched again, the verified cache is reused")
+        stop_and_verify_child_exit(node, int(running["pid"]))
+        if original_identity is None:
+            original_identity = bridge_identity(states[0])
+            original_wal = read_wal_snapshot(Path(original_identity["data"]))
+            preserved_data = Path(original_identity["data"]) / "bridge-upgrade-preservation.txt"
+            preserved_data.write_bytes(b"preserve existing bridge data\n")
+            report["fresh_bridge_identity"] = original_identity
+        else:
+            assert bridge_identity(states[0]) == original_identity, "upgrade changed the existing bridge identity or genesis"
+            assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+            assert_wal_prefix_retained(Path(original_identity["data"]), original_wal, "candidate upgrade")
+
+        start_node(node, github.base, "0.7.11", config)
+        _, restart_info, restart_running = verify_running_bridge_node(
+            node,
+            node_binary,
+            pinned_node_sha,
+            node_version,
+            120,
+            expected_address=original_identity["address"],
+        )
+        report["restart_node_info"] = restart_info
+        state = json.loads(states[0].read_text(encoding="utf-8"))
+        assert state["node_address"] == original_identity["address"], "a restart changed the identity"
+        bridge_log = (bridge_root / "bridge.log").read_text(encoding="utf-8")
+        assert f"reusing the verified {node_tag} release cache" in bridge_log
+        after_restart = snapshot_tree.snapshot(arc, True)
+        assert after_restart == before, "the v0.7 data changed across a restart"
+        stop_and_verify_child_exit(node, int(restart_running["pid"]))
+        assert bridge_identity(states[0]) == original_identity, "restart changed the bridge identity or genesis"
+        assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+        assert_wal_prefix_retained(Path(original_identity["data"]), original_wal, "candidate restart")
+
+        if scenario == "previous-bridge":
+            print("== the previous node reopens upgraded data after the desktop kills its child")
+            github.latest = previous_tag
+            start_node(node, github.base, "0.7.11", config)
+            _, rollback_info, rollback_running = verify_running_bridge_node(
+                node,
+                previous_node_binary,
+                previous_node_sha,
+                previous_node_version,
+                120,
+                expected_address=original_identity["address"],
+            )
+            stop_and_verify_child_exit(node, int(rollback_running["pid"]))
+            assert bridge_identity(states[0]) == original_identity, "rollback changed the bridge identity or genesis"
+            assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+            assert_wal_prefix_retained(Path(original_identity["data"]), original_wal, "previous-bridge downgrade")
+            report["previous_bridge_rollback"] = rollback_info
+
+            github.latest = bridge_tag
+            start_node(node, github.base, "0.7.11", config)
+            _, recovered_info, recovered_running = verify_running_bridge_node(
+                node,
+                node_binary,
+                pinned_node_sha,
+                node_version,
+                120,
+                expected_address=original_identity["address"],
+            )
+            stop_and_verify_child_exit(node, int(recovered_running["pid"]))
+            assert bridge_identity(states[0]) == original_identity, "recovery changed the bridge identity or genesis"
+            assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+            assert_wal_prefix_retained(Path(original_identity["data"]), original_wal, "candidate recovery")
+            assert snapshot_tree.snapshot(arc, True) == before, "rollback and recovery changed v0.7 data"
+            report["bridge_rollback_recovery"] = recovered_info
+
+        report["fake_github_requests"] = github.requests
+        (evidence / "desktop-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"PASS: v0.7.11 desktop ({scenario}) on {asset} bridged to {node_tag} at stake 0; v0.7 data untouched")
+    finally:
+        node.stop()
+        github.shutdown()
+        github.server_close()
 
 
 def check_source(repo: Path) -> None:
@@ -508,6 +713,11 @@ def main() -> int:
     scenario.add_argument("--legacy-genesis", type=Path, required=True)
     scenario.add_argument("--pins", type=Path, required=True)
     scenario.add_argument("--evidence", type=Path, required=True)
+    scenario.add_argument(
+        "--scenario",
+        choices=("fresh", "previous-bridge"),
+        default="fresh",
+    )
     args = parser.parse_args()
     if args.command == "check-source":
         check_source(args.repo)

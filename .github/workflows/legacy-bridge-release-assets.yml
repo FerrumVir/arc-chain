@@ -22,7 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.13' }}
+  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.27' }}
 
 jobs:
   pins:
@@ -34,6 +34,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Recompute every pin from the release and its owner signature
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/legacy-bridge/pin-release.py --check
 
   build:
@@ -122,6 +124,8 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
       - name: Verify the desktop release and every updater signature
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$DESKTOP_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -132,7 +136,7 @@ jobs:
           for tag in v0.5.4 v0.6.0 v0.7.0 v0.7.7 v0.7.10; do
             [ "$(git show "$tag:desktop/src-tauri/tauri.conf.json" | jq -er .plugins.updater.pubkey)" = "$pubkey" ]
           done
-          curl -fsS --retry 3 "https://api.github.com/repos/FerrumVir/arc-chain/releases/tags/$DESKTOP_TAG" > release.json
+          gh api "repos/FerrumVir/arc-chain/releases/tags/$DESKTOP_TAG" > release.json
           jq -e '.draft == false and .prerelease == false and .immutable == true and .author.login == "github-actions[bot]"' release.json
           mkdir -p handoff-desktop
           curl -fsSL --retry 3 -o handoff-desktop/latest.json \

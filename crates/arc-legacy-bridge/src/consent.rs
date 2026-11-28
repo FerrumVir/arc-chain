@@ -64,6 +64,71 @@ pub fn read_consent(layout: &Layout) -> Result<Option<bool>> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkerModePreference {
+    #[default]
+    Auto,
+    Shard,
+    Full,
+}
+
+impl WorkerModePreference {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "shard" => Ok(Self::Shard),
+            "full" => Ok(Self::Full),
+            _ => Err(exit::usage(format!(
+                "worker mode must be auto, shard, or full, not {value:?}"
+            ))),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Shard => "shard",
+            Self::Full => "full",
+        }
+    }
+}
+
+pub fn read_worker_mode(layout: &Layout) -> Result<WorkerModePreference> {
+    let path = layout.worker_mode_file();
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(exit::refused(format!(
+                    "{} must be a regular file, not a link or directory",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkerModePreference::Auto);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    match text.trim() {
+        "auto" => Ok(WorkerModePreference::Auto),
+        "shard" => Ok(WorkerModePreference::Shard),
+        "full" => Ok(WorkerModePreference::Full),
+        _ => Err(exit::refused(format!(
+            "{} must contain exactly auto, shard, or full",
+            path.display()
+        ))),
+    }
+}
+
+pub fn write_worker_mode(layout: &Layout, mode: WorkerModePreference) -> Result<()> {
+    let contents = format!("{}\n", mode.label());
+    write_atomic(&layout.worker_mode_file(), contents.as_bytes())
+}
+
 pub fn write_consent(layout: &Layout, yes: bool) -> Result<()> {
     let answer: &[u8] = if yes { b"yes\n" } else { b"no\n" };
     write_atomic(&layout.consent_file(), answer)
@@ -86,10 +151,11 @@ pub fn verified_model(layout: &Layout, pins: &Pins) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let model = PathBuf::from(&record.path);
-    let Ok(metadata) = fs::metadata(&model) else {
+    let Ok(metadata) = fs::symlink_metadata(&model) else {
         return Ok(None);
     };
-    if !metadata.is_file()
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
         || metadata.len() != record.size
         || modified_nanos(&metadata) != record.modified_unix_nanos
     {
@@ -104,10 +170,21 @@ pub fn verify_and_record_model(
     model: &Path,
     progress: impl FnMut(u64),
 ) -> Result<()> {
+    let caller_metadata =
+        fs::symlink_metadata(model).with_context(|| format!("cannot read {}", model.display()))?;
+    if caller_metadata.file_type().is_symlink() || !caller_metadata.file_type().is_file() {
+        return Err(exit::refused(format!(
+            "{} must be a regular file, not a symlink or directory",
+            model.display()
+        )));
+    }
     let model = crate::layout::canonical_or_lexical(model);
     let metadata =
-        fs::metadata(&model).with_context(|| format!("cannot read {}", model.display()))?;
-    if !metadata.is_file() || metadata.len() != pins.model.size {
+        fs::symlink_metadata(&model).with_context(|| format!("cannot read {}", model.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != pins.model.size
+    {
         return Err(exit::refused(format!(
             "{} is not the {} ({} bytes) the network runs",
             model.display(),
@@ -456,5 +533,125 @@ mod tests {
         assert!(read_consent(&layout).is_err());
         fs::write(layout.consent_file(), b"yes").unwrap();
         assert_eq!(read_consent(&layout).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn worker_mode_defaults_to_auto_round_trips_and_never_touches_consent() {
+        let temp = TempDir::new("worker-mode");
+        let (layout, _) = headless(&temp, None);
+        let default_mode = read_worker_mode(&layout).unwrap();
+        assert_eq!(default_mode, WorkerModePreference::Auto);
+
+        for (raw, expected) in [
+            ("auto", WorkerModePreference::Auto),
+            ("shard", WorkerModePreference::Shard),
+            ("full", WorkerModePreference::Full),
+        ] {
+            let parsed = WorkerModePreference::parse(raw).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.label(), raw);
+            write_worker_mode(&layout, parsed).unwrap();
+            assert_eq!(read_worker_mode(&layout).unwrap(), expected);
+        }
+
+        assert_eq!(read_consent(&layout).unwrap(), None);
+        assert!(!layout.consent_file().exists());
+        assert!(!layout.model_record().exists());
+
+        let usage_error = WorkerModePreference::parse("partial").unwrap_err();
+        assert_eq!(exit::code_for(&usage_error), exit::EX_USAGE);
+
+        fs::write(layout.worker_mode_file(), b"partial\n").unwrap();
+        let config_error = read_worker_mode(&layout).unwrap_err();
+        assert_eq!(exit::code_for(&config_error), exit::EX_CONFIG);
+
+        #[cfg(unix)]
+        {
+            let target = temp.path().join("other-mode");
+            fs::write(&target, b"shard\n").unwrap();
+            fs::remove_file(layout.worker_mode_file()).unwrap();
+            std::os::unix::fs::symlink(&target, layout.worker_mode_file()).unwrap();
+            let symlink_error = read_worker_mode(&layout).unwrap_err();
+            assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_and_record_model_refuses_symlink_before_canonicalization() {
+        let temp = TempDir::new("consent-verify-symlink");
+        let model_body = b"exact pinned model bytes for direct symlink test".to_vec();
+        let real_model = temp.path().join("real.gguf");
+        let link_model = temp.path().join("link.gguf");
+        fs::write(&real_model, &model_body).unwrap();
+        std::os::unix::fs::symlink(&real_model, &link_model).unwrap();
+        let (layout, _) = headless(&temp, Some(link_model.clone()));
+        let pins = privacy_safe_pins(&model_body);
+
+        let symlink_error =
+            verify_and_record_model(&layout, &pins, &link_model, |_| {}).unwrap_err();
+        assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
+        assert!(!layout.model_record().exists());
+
+        let dir_error = verify_and_record_model(&layout, &pins, temp.path(), |_| {}).unwrap_err();
+        assert_eq!(exit::code_for(&dir_error), exit::EX_CONFIG);
+        assert!(!layout.model_record().exists());
+
+        verify_and_record_model(&layout, &pins, &real_model, |_| {}).unwrap();
+        assert!(layout.model_record().exists());
+        assert_eq!(
+            verified_model(&layout, &pins).unwrap(),
+            Some(crate::layout::canonical_or_lexical(&real_model))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_recorded_model_is_rejected_for_auto_full_and_shard_roles() {
+        let temp = TempDir::new("consent-symlink-model");
+        let model_body = b"exact pinned model bytes for symlink test".to_vec();
+        let recorded = temp.path().join("recorded.gguf");
+        let target = temp.path().join("target.gguf");
+        fs::write(&recorded, &model_body).unwrap();
+        let (layout, invocation) = headless(&temp, Some(recorded.clone()));
+        let pins = privacy_safe_pins(&model_body);
+
+        write_consent(&layout, true).unwrap();
+        verify_and_record_model(&layout, &pins, &recorded, |_| {}).unwrap();
+        assert_eq!(
+            decide(&layout, &invocation, &pins).unwrap(),
+            Compute::On(crate::layout::canonical_or_lexical(&recorded))
+        );
+
+        fs::rename(&recorded, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &recorded).unwrap();
+
+        assert_eq!(verified_model(&layout, &pins).unwrap(), None);
+        let compute = decide(&layout, &invocation, &pins).unwrap();
+        assert!(
+            !compute.is_on(),
+            "symlinked recorded model must never return Compute::On"
+        );
+
+        let mut log = crate::logging::Log::stderr_only();
+        for mode in [
+            WorkerModePreference::Auto,
+            WorkerModePreference::Full,
+            WorkerModePreference::Shard,
+        ] {
+            write_worker_mode(&layout, mode).unwrap();
+            let role = crate::shard_policy::resolve_worker_role(
+                &layout,
+                &pins,
+                Path::new("/nonexistent/arc-node"),
+                &compute,
+                &mut log,
+            )
+            .unwrap();
+            assert!(
+                matches!(role, crate::shard_policy::WorkerLaunchRole::Observer(_)),
+                "mode {mode:?} must stay observer when verified_model rejects symlink"
+            );
+        }
     }
 }

@@ -15,6 +15,7 @@ pub const GENESIS_NAME: &str = "genesis.toml";
 pub const SEEDS_NAME: &str = "testnet-seeds.txt";
 pub const SIGNER_PRINCIPAL: &str = "arc-release";
 pub const SIGNER_NAMESPACE: &str = "arc-release-manifest-v1";
+pub const SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR: usize = 6;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +61,16 @@ pub struct ModelPin {
     pub url: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWorkerPin {
+    pub coordinator_url: String,
+    pub coordinator_id: String,
+    pub transaction_domain: String,
+    pub expected_model_id: String,
+    pub required_admitted_layers: usize,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pins {
@@ -70,6 +81,8 @@ pub struct Pins {
     pub manifest_signer: ManifestSigner,
     pub community_rpc_origins: Vec<String>,
     pub model: ModelPin,
+    #[serde(default)]
+    pub shard_worker: Option<ShardWorkerPin>,
 }
 
 impl Pins {
@@ -177,6 +190,28 @@ impl Pins {
             self.model.url.starts_with("https://"),
             "the model URL must use https"
         );
+        if let Some(shard) = &self.shard_worker {
+            ensure!(
+                is_valid_https_origin(&shard.coordinator_url),
+                "shard_worker.coordinator_url must be a strict https:// origin without path, query, fragment, or userinfo"
+            );
+            ensure!(
+                is_nonzero_lower_hex(&shard.coordinator_id, 64),
+                "shard_worker.coordinator_id must be a nonzero 64-character lowercase hex digest"
+            );
+            ensure!(
+                is_nonzero_lower_hex(&shard.transaction_domain, 64),
+                "shard_worker.transaction_domain must be a nonzero 64-character lowercase hex digest"
+            );
+            ensure!(
+                is_nonzero_lower_hex(&shard.expected_model_id, 64),
+                "shard_worker.expected_model_id must be a nonzero 64-character lowercase hex digest"
+            );
+            ensure!(
+                shard.required_admitted_layers >= SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR,
+                "shard_worker.required_admitted_layers must be at least {SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR}"
+            );
+        }
         Ok(())
     }
 
@@ -214,6 +249,66 @@ pub fn is_lower_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn is_nonzero_lower_hex(value: &str, len: usize) -> bool {
+    is_lower_hex(value, len) && value.bytes().any(|byte| byte != b'0')
+}
+
+pub fn is_valid_https_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'/' | b'?' | b'#' | b'@' | b'\\')
+        })
+    {
+        return false;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return match after {
+            "" => true,
+            _ => after.strip_prefix(':').is_some_and(is_valid_port),
+        };
+    }
+    match authority.split_once(':') {
+        Some((host, port)) => !port.contains(':') && is_valid_host(host) && is_valid_port(port),
+        None => is_valid_host(authority),
+    }
+}
+
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn is_valid_host(host: &str) -> bool {
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return false;
+    }
+    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return host.parse::<std::net::Ipv4Addr>().is_ok();
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 pub fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
@@ -319,13 +414,13 @@ mod tests {
     use super::*;
     use crate::manifest;
 
-    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS");
-    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS.sig");
+    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS");
+    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS.sig");
 
     #[test]
     fn embedded_pins_parse_and_validate() {
         let pins = Pins::embedded().unwrap();
-        assert_eq!(pins.node_release.tag, "v0.8.13");
+        assert_eq!(pins.node_release.tag, "v0.8.27");
         assert!(pins.node_release.worker_names_privacy_safe);
         assert_eq!(pins.community_rpc_origins.len(), 6);
     }
@@ -371,12 +466,12 @@ mod tests {
 
     #[test]
     fn pins_reject_tampering() {
-        let text = EMBEDDED_PINS.replace("\"v0.8.13\"", "\"v0.8.9\"");
+        let text = EMBEDDED_PINS.replace("\"v0.8.27\"", "\"v0.8.9\"");
         assert!(
             Pins::parse(&text).is_err(),
             "tag/version mismatch must fail"
         );
-        let text = EMBEDDED_PINS.replace("\"0.7.14\"", "\"0.7.x\"");
+        let text = EMBEDDED_PINS.replace("\"0.7.15\"", "\"0.7.x\"");
         assert!(
             Pins::parse(&text).is_err(),
             "non-strict bridge version must fail"
@@ -422,5 +517,103 @@ mod tests {
                 platform.node_asset().ends_with(".exe")
             );
         }
+    }
+
+    fn pins_json_with_shard(shard: serde_json::Value) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(EMBEDDED_PINS).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("shard_worker".to_string(), shard);
+        serde_json::to_string(&value).unwrap()
+    }
+
+    fn valid_shard_json() -> serde_json::Value {
+        serde_json::json!({
+            "coordinator_url": "https://149.28.153.31",
+            "coordinator_id": "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+            "transaction_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+            "expected_model_id": "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+            "required_admitted_layers": 6,
+        })
+    }
+
+    #[test]
+    fn shard_worker_pin_is_optional_and_strictly_validated() {
+        let mut without_shard: serde_json::Value = serde_json::from_str(EMBEDDED_PINS).unwrap();
+        without_shard
+            .as_object_mut()
+            .unwrap()
+            .remove("shard_worker");
+        let parsed = Pins::parse(&serde_json::to_string(&without_shard).unwrap()).unwrap();
+        assert_eq!(parsed.shard_worker, None);
+
+        let valid = Pins::parse(&pins_json_with_shard(valid_shard_json())).unwrap();
+        let shard = valid.shard_worker.unwrap();
+        assert_eq!(shard.coordinator_url, "https://149.28.153.31");
+        assert_eq!(shard.required_admitted_layers, 6);
+
+        let mut with_port = valid_shard_json();
+        with_port["coordinator_url"] = serde_json::json!("https://coord.arc.network:8443");
+        assert!(Pins::parse(&pins_json_with_shard(with_port)).is_ok());
+
+        let mut with_ipv6 = valid_shard_json();
+        with_ipv6["coordinator_url"] = serde_json::json!("https://[2001:db8::1]:8443");
+        assert!(Pins::parse(&pins_json_with_shard(with_ipv6)).is_ok());
+
+        for bad_url in [
+            "http://149.28.153.31",
+            "https://",
+            "https://149.28.153.31/",
+            "https://149.28.153.31/api",
+            "https://149.28.153.31?a=1",
+            "https://149.28.153.31#frag",
+            "https://user@149.28.153.31",
+            "https://user:pass@149.28.153.31",
+            "https://149.28.153.31:0",
+            "https://149.28.153.31:0443",
+            "https://149.28.153.31:70000",
+            "https://999.28.153.31",
+            "https://149.28.153.31\\path",
+            "https://149.28.153.31 ",
+            "https://[not-ipv6]:443",
+        ] {
+            let mut candidate = valid_shard_json();
+            candidate["coordinator_url"] = serde_json::json!(bad_url);
+            assert!(
+                Pins::parse(&pins_json_with_shard(candidate)).is_err(),
+                "{bad_url}"
+            );
+        }
+
+        let zero = "0".repeat(64);
+        let short = "a".repeat(63);
+        let upper = "A".repeat(64);
+        for field in ["coordinator_id", "transaction_domain", "expected_model_id"] {
+            for bad in [&zero, &short, &upper] {
+                let mut candidate = valid_shard_json();
+                candidate[field] = serde_json::json!(bad);
+                assert!(
+                    Pins::parse(&pins_json_with_shard(candidate)).is_err(),
+                    "{field}={bad}"
+                );
+            }
+        }
+
+        for bad_layers in [0usize, 1, 5] {
+            let mut candidate = valid_shard_json();
+            candidate["required_admitted_layers"] = serde_json::json!(bad_layers);
+            assert!(
+                Pins::parse(&pins_json_with_shard(candidate)).is_err(),
+                "layers={bad_layers}"
+            );
+        }
+
+        let mut extra = valid_shard_json();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        assert!(Pins::parse(&pins_json_with_shard(extra)).is_err());
     }
 }
