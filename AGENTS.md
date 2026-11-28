@@ -307,6 +307,14 @@ Integrated workers retry exhausted transient connection failures with bounded,
 cancellable backoff while retaining lease fences. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
+All desktop update schedules use the `UpdateDeadline` wrapper for wall-clock
+deadlines and callback identity. Native ticks recover suspended startup,
+periodic, failed-check, install and shutdown-reconciliation waits exactly once.
+A manual reconciliation wait still recovers with automatic checks disabled.
+Disabling, disposing or replacing a schedule invalidates its queued callbacks.
+Focused regressions and a reference-model check exercise stale delivery,
+same-clock replacement and callbacks scheduling successors without a browser
+or node. A source check prevents controller timers bypassing the wrapper.
 The desktop derives partial-worker mode from existing compute consent and typed
 release pins, preserving managed identity and update rollback. The release pins
 Singapore's verified coordinator identity, recovered domain and canonical model.
@@ -524,12 +532,12 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.26 entry is a release-preparation
+- `CHANGELOG.md` is newest first. Its v0.8.27 entry is a release-preparation
   snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published and candidate versions at 0.8.26
+- The doc contract test pins the published version at 0.8.26, the candidate at 0.8.27,
   and the exact published installer digest. Active install links change only
   after immutable publication is verified; historical version observations
   remain dated. The contract checks the current-status heading link, separates
