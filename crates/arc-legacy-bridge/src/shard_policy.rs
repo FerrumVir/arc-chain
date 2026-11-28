@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::process::{Child, Stdio};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::thread;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 use anyhow::Result;
@@ -23,10 +23,12 @@ use serde::Deserialize;
 use crate::argv::LegacyKind;
 use crate::consent::{self, Compute, WorkerModePreference};
 use crate::exit;
+#[cfg(windows)]
+use crate::launch::windows_job;
 use crate::layout::Layout;
 use crate::logging::Log;
 use crate::pins::{Pins, SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR, ShardWorkerPin};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::release;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -172,7 +174,7 @@ impl fmt::Display for BoundedCommandError {
         match self {
             Self::UnsupportedPlatform => write!(
                 f,
-                "bounded process-group command execution is supported only on Unix"
+                "bounded child-tree command execution is not supported on this platform"
             ),
             Self::Spawn(error) => write!(f, "could not spawn child process: {error}"),
             Self::Wait(error) => write!(f, "could not wait for child process: {error}"),
@@ -810,19 +812,164 @@ pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
     })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
-    Err("headless shard worker is not supported on this platform".to_string())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsMemorySnapshot {
+    pub total_phys_bytes: u64,
+    pub avail_phys_bytes: u64,
+    pub total_pagefile_bytes: u64,
+    pub avail_pagefile_bytes: u64,
+    pub total_virtual_bytes: u64,
+    pub avail_virtual_bytes: u64,
+    pub process_working_set_bytes: u64,
+    pub hard_max_working_set_bytes: Option<u64>,
 }
 
-#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsJobMembership {
+    NotInJob,
+    InJob,
+}
+
+pub fn apply_windows_memory_limits(
+    snapshot: WindowsMemorySnapshot,
+    job: WindowsJobMembership,
+) -> std::result::Result<HostMemory, String> {
+    if job == WindowsJobMembership::InJob {
+        return Err(
+            "Windows process is running inside a Job Object whose ancestor limits and aggregate memory headroom cannot be verified"
+                .to_string(),
+        );
+    }
+    if snapshot.total_phys_bytes == 0 {
+        return Err("GlobalMemoryStatusEx reported zero total physical memory".to_string());
+    }
+    if snapshot.total_pagefile_bytes == 0 {
+        return Err("GlobalMemoryStatusEx reported zero commit limit".to_string());
+    }
+    if snapshot.total_virtual_bytes == 0 {
+        return Err("GlobalMemoryStatusEx reported zero virtual address space".to_string());
+    }
+
+    let mut visible_bytes = snapshot
+        .total_phys_bytes
+        .min(snapshot.total_pagefile_bytes)
+        .min(snapshot.total_virtual_bytes);
+    let mut available_bytes = snapshot
+        .avail_phys_bytes
+        .min(snapshot.avail_pagefile_bytes)
+        .min(snapshot.avail_virtual_bytes);
+
+    if let Some(hard_ws) = snapshot.hard_max_working_set_bytes {
+        if hard_ws == 0 {
+            return Err("process hard maximum working set limit is zero".to_string());
+        }
+        visible_bytes = visible_bytes.min(hard_ws);
+        available_bytes =
+            available_bytes.min(hard_ws.saturating_sub(snapshot.process_working_set_bytes));
+    }
+
+    available_bytes = available_bytes.min(visible_bytes);
+    Ok(HostMemory {
+        visible_bytes,
+        available_bytes,
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Memory::GetProcessWorkingSetSizeEx;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::core::BOOL;
+
+    const QUOTA_LIMITS_HARDWS_MAX_ENABLE: u32 = 0x0000_0004;
+
+    let current_process = unsafe { GetCurrentProcess() };
+    let mut in_job: BOOL = 0;
+    if unsafe { IsProcessInJob(current_process, std::ptr::null_mut(), &mut in_job) } == 0 {
+        return Err(format!(
+            "IsProcessInJob failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if in_job != 0 {
+        return Err(
+            "Windows process is running inside a Job Object whose ancestor limits and aggregate memory headroom cannot be verified"
+                .to_string(),
+        );
+    }
+
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    let status_size = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>())
+        .map_err(|_| "MEMORYSTATUSEX size does not fit in u32".to_string())?;
+    status.dwLength = status_size;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(format!(
+            "GlobalMemoryStatusEx failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let counters_size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
+        .map_err(|_| "PROCESS_MEMORY_COUNTERS size does not fit in u32".to_string())?;
+    counters.cb = counters_size;
+    if unsafe { K32GetProcessMemoryInfo(current_process, &mut counters, counters_size) } == 0 {
+        return Err(format!(
+            "K32GetProcessMemoryInfo failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let mut min_ws: usize = 0;
+    let mut max_ws: usize = 0;
+    let mut ws_flags: u32 = 0;
+    let ws_ok = unsafe {
+        GetProcessWorkingSetSizeEx(current_process, &mut min_ws, &mut max_ws, &mut ws_flags)
+    };
+    if ws_ok == 0 {
+        return Err(format!(
+            "GetProcessWorkingSetSizeEx failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let hard_max_working_set_bytes = if ws_flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE != 0 {
+        Some(u64::try_from(max_ws).map_err(|_| "working set limit overflow".to_string())?)
+    } else {
+        None
+    };
+
+    let snapshot = WindowsMemorySnapshot {
+        total_phys_bytes: status.ullTotalPhys,
+        avail_phys_bytes: status.ullAvailPhys,
+        total_pagefile_bytes: status.ullTotalPageFile,
+        avail_pagefile_bytes: status.ullAvailPageFile,
+        total_virtual_bytes: status.ullTotalVirtual,
+        avail_virtual_bytes: status.ullAvailVirtual,
+        process_working_set_bytes: u64::try_from(counters.WorkingSetSize)
+            .map_err(|_| "process working set usage overflow".to_string())?,
+        hard_max_working_set_bytes,
+    };
+    apply_windows_memory_limits(snapshot, WindowsJobMembership::NotInJob)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
+    Err("shard worker is not supported on this platform".to_string())
+}
+
+#[cfg(any(unix, windows))]
 struct StreamStatus {
     done: AtomicBool,
     overflow: AtomicBool,
     read_error: AtomicBool,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl StreamStatus {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -833,10 +980,10 @@ impl StreamStatus {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct StreamDoneGuard(Arc<StreamStatus>);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for StreamDoneGuard {
     fn drop(&mut self) {
         if thread::panicking() {
@@ -846,7 +993,7 @@ impl Drop for StreamDoneGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum BoundedWaitOutcome {
     Exited(ExitStatus),
     Timeout,
@@ -855,7 +1002,7 @@ enum BoundedWaitOutcome {
     WaitError(io::Error),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_capped_stream<R: Read>(
     mut reader: R,
     limit: usize,
@@ -885,20 +1032,74 @@ fn read_capped_stream<R: Read>(
 }
 
 #[cfg(unix)]
-fn terminate_child(child: &mut Child) {
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|pgid| *pgid > 0)
-    {
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+struct SupervisedChild {
+    child: Child,
 }
 
-#[cfg(not(unix))]
+#[cfg(unix)]
+impl SupervisedChild {
+    fn spawn(program: &Path, args: &[OsString]) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = release::quiet_command(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command.spawn()?;
+        Ok(Self { child })
+    }
+
+    fn terminate(&mut self) {
+        if let Some(pgid) = libc::pid_t::try_from(self.child.id())
+            .ok()
+            .filter(|pgid| *pgid > 0)
+        {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(windows)]
+struct SupervisedChild {
+    job: windows_job::WindowsJob,
+    child: Child,
+}
+
+#[cfg(windows)]
+impl SupervisedChild {
+    fn spawn(program: &Path, args: &[OsString]) -> io::Result<Self> {
+        let mut command = release::quiet_command(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (job, child) = windows_job::spawn_in_kill_on_close_job(&mut command)?;
+        Ok(Self { job, child })
+    }
+
+    fn terminate(&mut self) {
+        self.job.terminate();
+        let _ = self.child.kill();
+        let _ = windows_job::wait_for_child_exit_bounded(&mut self.child, Duration::from_secs(5));
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        self.job.terminate();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn run_bounded_command(
     _program: &Path,
     _args: &[OsString],
@@ -909,7 +1110,7 @@ pub fn run_bounded_command(
     Err(BoundedCommandError::UnsupportedPlatform)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run_bounded_command(
     program: &Path,
     args: &[OsString],
@@ -917,24 +1118,16 @@ pub fn run_bounded_command(
     stdout_cap: usize,
     stderr_cap: usize,
 ) -> std::result::Result<BoundedOutput, BoundedCommandError> {
-    use std::os::unix::process::CommandExt;
-
-    let mut command = release::quiet_command(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = command.spawn().map_err(BoundedCommandError::Spawn)?;
-    let Some(stdout_pipe) = child.stdout.take() else {
-        terminate_child(&mut child);
+    let mut supervised =
+        SupervisedChild::spawn(program, args).map_err(BoundedCommandError::Spawn)?;
+    let Some(stdout_pipe) = supervised.child.stdout.take() else {
+        supervised.terminate();
         return Err(BoundedCommandError::Spawn(io::Error::other(
             "child stdout pipe unavailable",
         )));
     };
-    let Some(stderr_pipe) = child.stderr.take() else {
-        terminate_child(&mut child);
+    let Some(stderr_pipe) = supervised.child.stderr.take() else {
+        supervised.terminate();
         return Err(BoundedCommandError::Spawn(io::Error::other(
             "child stderr pipe unavailable",
         )));
@@ -951,7 +1144,7 @@ pub fn run_bounded_command(
     {
         Ok(handle) => handle,
         Err(error) => {
-            terminate_child(&mut child);
+            supervised.terminate();
             return Err(BoundedCommandError::Spawn(error));
         }
     };
@@ -961,7 +1154,7 @@ pub fn run_bounded_command(
     {
         Ok(handle) => handle,
         Err(error) => {
-            terminate_child(&mut child);
+            supervised.terminate();
             let _ = stdout_handle.join();
             return Err(BoundedCommandError::Spawn(error));
         }
@@ -974,31 +1167,31 @@ pub fn run_bounded_command(
         let stderr_done = stderr_status.done.load(Ordering::Acquire);
         let both_done = stdout_done && stderr_done;
         if stdout_status.overflow.load(Ordering::Acquire) {
-            terminate_child(&mut child);
+            supervised.terminate();
             break BoundedWaitOutcome::Overflow("stdout", stdout_cap);
         }
         if stderr_status.overflow.load(Ordering::Acquire) {
-            terminate_child(&mut child);
+            supervised.terminate();
             break BoundedWaitOutcome::Overflow("stderr", stderr_cap);
         }
         if stdout_status.read_error.load(Ordering::Acquire)
             || stderr_status.read_error.load(Ordering::Acquire)
         {
-            terminate_child(&mut child);
+            supervised.terminate();
             break BoundedWaitOutcome::ReadError;
         }
         if both_done {
-            match child.try_wait() {
+            match supervised.child.try_wait() {
                 Ok(Some(status)) => break BoundedWaitOutcome::Exited(status),
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_child(&mut child);
+                    supervised.terminate();
                     break BoundedWaitOutcome::WaitError(error);
                 }
             }
         }
         if started.elapsed() >= timeout {
-            terminate_child(&mut child);
+            supervised.terminate();
             break BoundedWaitOutcome::Timeout;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -1208,8 +1401,12 @@ fn try_qualify_shard(
     preflight_timeout: Duration,
     mut measure_memory: impl FnMut() -> std::result::Result<HostMemory, String>,
 ) -> std::result::Result<WorkerLaunchRole, String> {
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
-        return Err("headless shard worker is not supported on this platform".to_string());
+    if !cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )) {
+        return Err("shard worker is not supported on this platform".to_string());
     }
     let Some(pin) = pins.shard_worker.as_ref() else {
         return Err("the pinned release does not include a shard worker configuration".to_string());
@@ -2240,18 +2437,157 @@ Pages inactive: 2000.
         );
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn windows_memory_limits_accept_unconstrained_not_in_job_and_reject_any_job_membership() {
+        let base = WindowsMemorySnapshot {
+            total_phys_bytes: 16 * GIB,
+            avail_phys_bytes: 8 * GIB,
+            total_pagefile_bytes: 24 * GIB,
+            avail_pagefile_bytes: 14 * GIB,
+            total_virtual_bytes: 128 * 1024 * GIB,
+            avail_virtual_bytes: 128 * 1024 * GIB,
+            process_working_set_bytes: 256 * 1024 * 1024,
+            hard_max_working_set_bytes: None,
+        };
+        let unrestricted =
+            apply_windows_memory_limits(base, WindowsJobMembership::NotInJob).unwrap();
+        assert_eq!(
+            unrestricted,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 8 * GIB,
+            }
+        );
+        assert_eq!(qualify_host_memory(unrestricted).unwrap(), 8 * GIB);
+
+        let abundant_in_job = WindowsMemorySnapshot {
+            total_phys_bytes: 64 * GIB,
+            avail_phys_bytes: 48 * GIB,
+            total_pagefile_bytes: 80 * GIB,
+            avail_pagefile_bytes: 60 * GIB,
+            ..base
+        };
+        let in_job_err =
+            apply_windows_memory_limits(abundant_in_job, WindowsJobMembership::InJob).unwrap_err();
+        assert!(in_job_err.contains("Job Object"), "{in_job_err}");
+
+        let tight_commit = WindowsMemorySnapshot {
+            total_phys_bytes: 32 * GIB,
+            avail_phys_bytes: 20 * GIB,
+            total_pagefile_bytes: 8 * GIB,
+            avail_pagefile_bytes: 6 * GIB,
+            ..base
+        };
+        let clamped_commit =
+            apply_windows_memory_limits(tight_commit, WindowsJobMembership::NotInJob).unwrap();
+        assert_eq!(
+            clamped_commit,
+            HostMemory {
+                visible_bytes: 8 * GIB,
+                available_bytes: 6 * GIB,
+            }
+        );
+        assert!(qualify_host_memory(clamped_commit).is_err());
+
+        let low_commit_headroom = WindowsMemorySnapshot {
+            avail_pagefile_bytes: 4 * GIB,
+            ..base
+        };
+        let clamped_headroom =
+            apply_windows_memory_limits(low_commit_headroom, WindowsJobMembership::NotInJob)
+                .unwrap();
+        assert_eq!(clamped_headroom.visible_bytes, 16 * GIB);
+        assert_eq!(clamped_headroom.available_bytes, 4 * GIB);
+        assert!(qualify_host_memory(clamped_headroom).is_err());
+
+        let wow64_virtual_cap = WindowsMemorySnapshot {
+            total_virtual_bytes: 2 * GIB,
+            avail_virtual_bytes: GIB,
+            ..base
+        };
+        let clamped_virtual =
+            apply_windows_memory_limits(wow64_virtual_cap, WindowsJobMembership::NotInJob).unwrap();
+        assert_eq!(
+            clamped_virtual,
+            HostMemory {
+                visible_bytes: 2 * GIB,
+                available_bytes: GIB,
+            }
+        );
+        assert!(qualify_host_memory(clamped_virtual).is_err());
+
+        let hard_ws_limited = apply_windows_memory_limits(
+            WindowsMemorySnapshot {
+                process_working_set_bytes: 2 * GIB,
+                hard_max_working_set_bytes: Some(8 * GIB),
+                ..base
+            },
+            WindowsJobMembership::NotInJob,
+        )
+        .unwrap();
+        assert_eq!(
+            hard_ws_limited,
+            HostMemory {
+                visible_bytes: 8 * GIB,
+                available_bytes: 6 * GIB,
+            }
+        );
+        assert!(qualify_host_memory(hard_ws_limited).is_err());
+
+        let hard_ws_below_usage = apply_windows_memory_limits(
+            WindowsMemorySnapshot {
+                process_working_set_bytes: 18 * GIB,
+                hard_max_working_set_bytes: Some(16 * GIB),
+                ..base
+            },
+            WindowsJobMembership::NotInJob,
+        )
+        .unwrap();
+        assert_eq!(
+            hard_ws_below_usage,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 0,
+            }
+        );
+        assert!(qualify_host_memory(hard_ws_below_usage).is_err());
+
+        for bad_snapshot in [
+            WindowsMemorySnapshot {
+                total_phys_bytes: 0,
+                ..base
+            },
+            WindowsMemorySnapshot {
+                total_pagefile_bytes: 0,
+                ..base
+            },
+            WindowsMemorySnapshot {
+                total_virtual_bytes: 0,
+                ..base
+            },
+            WindowsMemorySnapshot {
+                hard_max_working_set_bytes: Some(0),
+                ..base
+            },
+        ] {
+            assert!(
+                apply_windows_memory_limits(bad_snapshot, WindowsJobMembership::NotInJob).is_err()
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[test]
     fn unsupported_platform_memory_probe_fails_closed() {
         assert!(measure_host_memory().is_err());
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
-    fn non_unix_bounded_command_and_shard_qualification_fail_closed_without_spawning() {
+    fn unsupported_platform_bounded_command_and_shard_qualification_fail_closed_without_spawning() {
         use crate::layout::test_support::TempDir;
 
-        let temp = TempDir::new("non-unix-no-spawn");
+        let temp = TempDir::new("unsupported-no-spawn");
         let model = temp.path().join("model.gguf");
         fs::write(&model, b"regular-model").unwrap();
         let sentinel = temp.path().join("spawned.txt");
@@ -2345,6 +2681,916 @@ Pages inactive: 2000.
         assert_eq!(probe_calls, 0);
         assert_eq!(exit::code_for(&shard_err), exit::EX_CONFIG);
         assert!(!sentinel.exists());
+    }
+
+    #[cfg(windows)]
+    mod windows_preflight_tests {
+        use super::*;
+        use crate::layout::test_support::TempDir;
+        use std::io::Write;
+        use std::os::windows::io::AsRawHandle;
+        use std::process::Command;
+
+        const HELPER_TEST_NAME: &str =
+            "shard_policy::tests::windows_preflight_tests::windows_test_child_helper";
+
+        fn write_cmd(path: &Path, body: &str) {
+            fs::write(path, body.replace('\n', "\r\n").as_bytes()).unwrap();
+        }
+
+        fn write_pid_atomic(path: &Path, pid: u32) {
+            let tmp = path.with_extension("pid.tmp");
+            fs::write(&tmp, format!("{pid}\n").as_bytes()).unwrap();
+            fs::rename(&tmp, path).unwrap();
+        }
+
+        fn verify_open_process_absence_error(error: &io::Error) -> std::result::Result<(), String> {
+            use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "OpenProcess failed with unexpected error instead of ERROR_INVALID_PARAMETER: {error}"
+                ))
+            }
+        }
+
+        fn assert_pid_exited(pid: u32) {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            };
+
+            assert!(pid > 0);
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                let error = io::Error::last_os_error();
+                if let Err(message) = verify_open_process_absence_error(&error) {
+                    panic!("descendant pid {pid}: {message}");
+                }
+                return;
+            }
+            let waited = unsafe { WaitForSingleObject(handle, 2_000) };
+            unsafe {
+                CloseHandle(handle);
+            }
+            assert_eq!(
+                waited, WAIT_OBJECT_0,
+                "descendant pid {pid} is still running after bounded command termination"
+            );
+        }
+
+        fn write_helper_wrapper(path: &Path, mode: &str, pid_file: Option<&Path>) {
+            let exe = std::env::current_exe().unwrap();
+            let mut script = format!("@echo off\nset \"ARC_BRIDGE_WIN_TEST_HELPER={mode}\"\n");
+            if let Some(pid_file) = pid_file {
+                script.push_str(&format!(
+                    "set \"ARC_BRIDGE_WIN_PID_FILE={}\"\n",
+                    pid_file.display()
+                ));
+            }
+            script.push_str(&format!(
+                "\"{}\" --exact {HELPER_TEST_NAME} --nocapture\n",
+                exe.display()
+            ));
+            write_cmd(path, &script);
+        }
+
+        fn run_in_jobs_and_read_result(
+            jobs: Vec<windows_job::WindowsJob>,
+            mode: &str,
+            result_file: &Path,
+        ) -> String {
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = Command::new(exe);
+            cmd.args(["--exact", HELPER_TEST_NAME, "--nocapture"])
+                .env("ARC_BRIDGE_WIN_TEST_HELPER", mode)
+                .env("ARC_BRIDGE_WIN_RESULT_FILE", result_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = windows_job::spawn_suspended(&mut cmd).unwrap();
+            for job in &jobs {
+                if let Err(error) = job.assign_process(child.as_raw_handle()) {
+                    for owned in &jobs {
+                        owned.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = windows_job::wait_for_child_exit_bounded(
+                        &mut child,
+                        Duration::from_secs(2),
+                    );
+                    panic!("failed to assign helper child to job: {error}");
+                }
+            }
+            if let Err(error) = windows_job::resume_suspended_process(child.id()) {
+                for owned in &jobs {
+                    owned.terminate();
+                }
+                let _ = child.kill();
+                let _ =
+                    windows_job::wait_for_child_exit_bounded(&mut child, Duration::from_secs(2));
+                panic!("failed to resume helper child: {error}");
+            }
+            let wait_timeout = Duration::from_secs(10);
+            let status = match windows_job::wait_for_child_exit_bounded(&mut child, wait_timeout) {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    for owned in &jobs {
+                        owned.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = windows_job::wait_for_child_exit_bounded(
+                        &mut child,
+                        Duration::from_secs(2),
+                    );
+                    panic!("job helper child timed out after 10s");
+                }
+                Err(error) => {
+                    for owned in &jobs {
+                        owned.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = windows_job::wait_for_child_exit_bounded(
+                        &mut child,
+                        Duration::from_secs(2),
+                    );
+                    panic!("failed waiting for job helper child: {error}");
+                }
+            };
+            for owned in &jobs {
+                owned.terminate();
+            }
+            drop(jobs);
+            assert!(status.success(), "helper exited with {status}");
+            fs::read_to_string(result_file).unwrap()
+        }
+
+        #[test]
+        fn windows_test_child_helper() {
+            let Ok(mode) = std::env::var("ARC_BRIDGE_WIN_TEST_HELPER") else {
+                return;
+            };
+            match mode.as_str() {
+                "sleep_hold" => {
+                    thread::sleep(Duration::from_secs(30));
+                    std::process::exit(0);
+                }
+                "orphan_pipes" => {
+                    let pid_file =
+                        PathBuf::from(std::env::var_os("ARC_BRIDGE_WIN_PID_FILE").unwrap());
+                    let exe = std::env::current_exe().unwrap();
+                    let grandchild = Command::new(exe)
+                        .args(["--exact", HELPER_TEST_NAME, "--nocapture"])
+                        .env("ARC_BRIDGE_WIN_TEST_HELPER", "sleep_hold")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .unwrap();
+                    write_pid_atomic(&pid_file, grandchild.id());
+                    let _ = io::stdout().write_all(b"parent-exiting\n");
+                    let _ = io::stdout().flush();
+                    let _ = io::stderr().write_all(b"parent-stderr\n");
+                    let _ = io::stderr().flush();
+                    std::process::exit(0);
+                }
+                "overflow_descendant" => {
+                    let pid_file =
+                        PathBuf::from(std::env::var_os("ARC_BRIDGE_WIN_PID_FILE").unwrap());
+                    let exe = std::env::current_exe().unwrap();
+                    let grandchild = Command::new(exe)
+                        .args(["--exact", HELPER_TEST_NAME, "--nocapture"])
+                        .env("ARC_BRIDGE_WIN_TEST_HELPER", "sleep_hold")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .unwrap();
+                    write_pid_atomic(&pid_file, grandchild.id());
+                    let _ = io::stdout().write_all(&[b'x'; 1025]);
+                    let _ = io::stdout().flush();
+                    std::process::exit(0);
+                }
+                "verify_job_fail_closed" => {
+                    let result_file =
+                        PathBuf::from(std::env::var_os("ARC_BRIDGE_WIN_RESULT_FILE").unwrap());
+                    let temp = TempDir::new("win-in-job-check");
+                    let model = temp.path().join("model.gguf");
+                    fs::write(&model, b"regular-model").unwrap();
+                    let sentinel = temp.path().join("spawned.txt");
+                    let script = temp.path().join("never-run.cmd");
+                    write_cmd(
+                        &script,
+                        &format!("@echo off\necho bad > \"{}\"\n", sentinel.display()),
+                    );
+                    let pins = pins_with_shard();
+                    let mut log = Log::stderr_only();
+
+                    let outcome = (|| -> std::result::Result<(), String> {
+                        let probe_err = match measure_host_memory() {
+                            Ok(mem) => {
+                                return Err(format!(
+                                    "measure_host_memory unexpectedly succeeded in job: {mem:?}"
+                                ));
+                            }
+                            Err(err) => err,
+                        };
+                        if !probe_err.contains("Job Object") {
+                            return Err(format!("unexpected probe error: {probe_err}"));
+                        }
+                        let auto_role = resolve_worker_role_with(
+                            WorkerModePreference::Auto,
+                            &pins,
+                            &script,
+                            &model,
+                            &mut log,
+                            Duration::from_secs(5),
+                            measure_host_memory,
+                        )
+                        .map_err(|err| format!("auto mode failed: {err}"))?;
+                        if !matches!(
+                            auto_role,
+                            WorkerLaunchRole::FullIntegerWorker {
+                                fallback_reason: Some(_),
+                                ..
+                            }
+                        ) {
+                            return Err(format!("auto mode did not fall back: {auto_role:?}"));
+                        }
+                        let shard_err = resolve_worker_role_with(
+                            WorkerModePreference::Shard,
+                            &pins,
+                            &script,
+                            &model,
+                            &mut log,
+                            Duration::from_secs(5),
+                            measure_host_memory,
+                        )
+                        .unwrap_err();
+                        if exit::code_for(&shard_err) != exit::EX_CONFIG {
+                            return Err(format!(
+                                "shard mode returned exit code {} instead of EX_CONFIG",
+                                exit::code_for(&shard_err)
+                            ));
+                        }
+                        let full_role = resolve_worker_role_with(
+                            WorkerModePreference::Full,
+                            &pins,
+                            &script,
+                            &model,
+                            &mut log,
+                            Duration::from_secs(5),
+                            measure_host_memory,
+                        )
+                        .map_err(|err| format!("full mode failed: {err}"))?;
+                        if full_role
+                            != (WorkerLaunchRole::FullIntegerWorker {
+                                model: model.clone(),
+                                fallback_reason: None,
+                            })
+                        {
+                            return Err(format!("unexpected full role: {full_role:?}"));
+                        }
+                        if sentinel.exists() {
+                            return Err("preflight child was unexpectedly spawned".to_string());
+                        }
+                        Ok(())
+                    })();
+                    let payload = match outcome {
+                        Ok(()) => "ok:job-refused\n".to_string(),
+                        Err(err) => format!("err:{err}\n"),
+                    };
+                    fs::write(result_file, payload.as_bytes()).unwrap();
+                }
+                other => panic!("unexpected windows helper mode {other:?}"),
+            }
+        }
+
+        #[test]
+        fn windows_open_process_absence_only_accepts_invalid_parameter() {
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+            assert!(
+                verify_open_process_absence_error(&io::Error::from_raw_os_error(
+                    ERROR_INVALID_PARAMETER as i32
+                ))
+                .is_ok()
+            );
+            assert!(
+                verify_open_process_absence_error(&io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED as i32
+                ))
+                .is_err()
+            );
+            assert!(verify_open_process_absence_error(&io::Error::other("unexpected")).is_err());
+        }
+
+        #[test]
+        fn windows_host_memory_probe_and_real_direct_and_nested_jobs_fail_closed() {
+            use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::core::BOOL;
+
+            let current_process = unsafe { GetCurrentProcess() };
+            let mut in_job: BOOL = 0;
+            let ok = unsafe { IsProcessInJob(current_process, std::ptr::null_mut(), &mut in_job) };
+            assert_ne!(
+                ok,
+                0,
+                "IsProcessInJob failed: {}",
+                io::Error::last_os_error()
+            );
+            if in_job == 0 {
+                let host = measure_host_memory().unwrap();
+                assert!(host.visible_bytes > 0);
+                assert!(host.available_bytes <= host.visible_bytes);
+            } else {
+                let err = measure_host_memory().unwrap_err();
+                assert!(err.contains("Job Object"), "{err}");
+            }
+
+            let temp = TempDir::new("win-job-fail-closed");
+
+            let direct_unrestricted = windows_job::WindowsJob::create_kill_on_close().unwrap();
+            let direct_unrestricted_res = run_in_jobs_and_read_result(
+                vec![direct_unrestricted],
+                "verify_job_fail_closed",
+                &temp.path().join("direct-unrestricted.txt"),
+            );
+            assert_eq!(direct_unrestricted_res.trim(), "ok:job-refused");
+
+            let direct_limited =
+                windows_job::WindowsJob::create_with_job_memory_limit(GIB as usize).unwrap();
+            let direct_limited_res = run_in_jobs_and_read_result(
+                vec![direct_limited],
+                "verify_job_fail_closed",
+                &temp.path().join("direct-limited.txt"),
+            );
+            assert_eq!(direct_limited_res.trim(), "ok:job-refused");
+
+            let outer_job =
+                windows_job::WindowsJob::create_with_job_memory_limit(GIB as usize).unwrap();
+            let inner_job = windows_job::WindowsJob::create_kill_on_close().unwrap();
+            let nested_res = run_in_jobs_and_read_result(
+                vec![outer_job, inner_job],
+                "verify_job_fail_closed",
+                &temp.path().join("nested.txt"),
+            );
+            assert_eq!(nested_res.trim(), "ok:job-refused");
+        }
+
+        #[test]
+        fn windows_valid_preflight_qualifies_and_rechecks_memory_after_header_check() {
+            let temp = TempDir::new("win-shard-ok");
+            let model = temp.path().join("model.gguf");
+            fs::write(&model, b"regular-model").unwrap();
+            let pins = pins_with_shard();
+            let pin = pins.shard_worker.as_ref().unwrap();
+            let report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 6))
+                    .unwrap();
+            let report_file = temp.path().join("report.json");
+            fs::write(&report_file, report.as_bytes()).unwrap();
+            let args_log = temp.path().join("args.txt");
+            let script = temp.path().join("fake-node.cmd");
+            write_cmd(
+                &script,
+                &format!(
+                    "@echo off\ndel /q \"{0}\" 2>nul\n:loop\nif \"%~1\"==\"\" goto done\n>>\"{0}\" echo %~1\nshift\ngoto loop\n:done\ntype \"{1}\"\nexit /b 0\n",
+                    args_log.display(),
+                    report_file.display()
+                ),
+            );
+
+            let mut log = Log::stderr_only();
+            let mut readings = [
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                },
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 7 * GIB,
+                },
+            ]
+            .into_iter();
+            let role = resolve_worker_role_with(
+                WorkerModePreference::Auto,
+                &pins,
+                &script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                || Ok(readings.next().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(readings.next(), None);
+            assert_eq!(
+                role,
+                WorkerLaunchRole::CommunityShardWorker {
+                    model: model.clone(),
+                    pin: Box::new(pin.clone()),
+                    max_working_set_bytes: 8 * GIB,
+                    admitted_max_resident_layers: 6,
+                }
+            );
+            assert!(role.describe().contains("rewards disabled"));
+            let captured_args = fs::read_to_string(&args_log).unwrap();
+            let lines: Vec<&str> = captured_args.lines().map(str::trim).collect();
+            assert_eq!(lines[0], "community-shard-worker");
+            assert!(lines.contains(&"--check-header-only"));
+            assert!(!lines.contains(&"--check-only"));
+            assert!(lines.contains(&"--max-working-set-bytes"));
+            assert!(lines.contains(&"--max-resident-layers"));
+            assert!(lines.contains(&"6"));
+        }
+
+        #[test]
+        fn windows_post_preflight_memory_drop_falls_back_in_auto_and_refuses_in_shard() {
+            let temp = TempDir::new("win-shard-drop");
+            let model = temp.path().join("model.gguf");
+            fs::write(&model, b"regular-model").unwrap();
+            let pins = pins_with_shard();
+            let pin = pins.shard_worker.as_ref().unwrap();
+            let report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 6))
+                    .unwrap();
+            let report_file = temp.path().join("report.json");
+            fs::write(&report_file, report.as_bytes()).unwrap();
+            let script = temp.path().join("fake-node.cmd");
+            write_cmd(
+                &script,
+                &format!("@echo off\ntype \"{}\"\nexit /b 0\n", report_file.display()),
+            );
+
+            let mut log = Log::stderr_only();
+            let mut auto_readings = [
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                },
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 5 * GIB,
+                },
+            ]
+            .into_iter();
+            let auto_role = resolve_worker_role_with(
+                WorkerModePreference::Auto,
+                &pins,
+                &script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                || Ok(auto_readings.next().unwrap()),
+            )
+            .unwrap();
+            assert!(matches!(
+                auto_role,
+                WorkerLaunchRole::FullIntegerWorker {
+                    fallback_reason: Some(_),
+                    ..
+                }
+            ));
+
+            let mut shard_readings = [
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                },
+                HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 5 * GIB,
+                },
+            ]
+            .into_iter();
+            let shard_err = resolve_worker_role_with(
+                WorkerModePreference::Shard,
+                &pins,
+                &script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                || Ok(shard_readings.next().unwrap()),
+            )
+            .unwrap_err();
+            assert_eq!(exit::code_for(&shard_err), exit::EX_CONFIG);
+        }
+
+        #[test]
+        fn windows_tampered_failing_and_probe_error_fall_back_in_auto_and_refuse_in_shard() {
+            let temp = TempDir::new("win-shard-fail");
+            let model = temp.path().join("model.gguf");
+            fs::write(&model, b"regular-model").unwrap();
+            let pins = pins_with_shard();
+            let pin = pins.shard_worker.as_ref().unwrap();
+
+            let bad_report_file = temp.path().join("bad-report.json");
+            let bad_report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 5))
+                    .unwrap();
+            fs::write(&bad_report_file, bad_report.as_bytes()).unwrap();
+            let bad_script = temp.path().join("tampered-node.cmd");
+            write_cmd(
+                &bad_script,
+                &format!(
+                    "@echo off\ntype \"{}\"\nexit /b 0\n",
+                    bad_report_file.display()
+                ),
+            );
+
+            let failing_script = temp.path().join("failing-node.cmd");
+            write_cmd(
+                &failing_script,
+                "@echo off\necho header admission failed 1>&2\nexit /b 1\n",
+            );
+
+            let legacy_flag_script = temp.path().join("legacy-v0827-node.cmd");
+            write_cmd(
+                &legacy_flag_script,
+                "@echo off\necho error: unexpected argument '--check-header-only' found 1>&2\nexit /b 2\n",
+            );
+
+            let legacy_mode_file = temp.path().join("legacy-mode.json");
+            let legacy_report = serde_json::json!({
+                "mode": "check-only",
+                "coordinator_url": pin.coordinator_url,
+                "coordinator_id": pin.coordinator_id,
+                "transaction_domain": pin.transaction_domain,
+                "model_id": pin.expected_model_id,
+                "max_working_set_bytes": 8 * GIB,
+                "admission": {
+                    "admitted_max_resident_layers": 6
+                }
+            })
+            .to_string();
+            fs::write(&legacy_mode_file, legacy_report.as_bytes()).unwrap();
+            let legacy_mode_script = temp.path().join("legacy-mode-node.cmd");
+            write_cmd(
+                &legacy_mode_script,
+                &format!(
+                    "@echo off\ntype \"{}\"\nexit /b 0\n",
+                    legacy_mode_file.display()
+                ),
+            );
+
+            let ok_memory = || {
+                Ok(HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                })
+            };
+            let mut log = Log::stderr_only();
+
+            for script in [
+                bad_script.as_path(),
+                failing_script.as_path(),
+                legacy_flag_script.as_path(),
+                legacy_mode_script.as_path(),
+            ] {
+                let auto_role = resolve_worker_role_with(
+                    WorkerModePreference::Auto,
+                    &pins,
+                    script,
+                    &model,
+                    &mut log,
+                    Duration::from_secs(5),
+                    ok_memory,
+                )
+                .unwrap();
+                assert!(matches!(
+                    auto_role,
+                    WorkerLaunchRole::FullIntegerWorker {
+                        fallback_reason: Some(_),
+                        ..
+                    }
+                ));
+
+                let shard_err = resolve_worker_role_with(
+                    WorkerModePreference::Shard,
+                    &pins,
+                    script,
+                    &model,
+                    &mut log,
+                    Duration::from_secs(5),
+                    ok_memory,
+                )
+                .unwrap_err();
+                assert_eq!(exit::code_for(&shard_err), exit::EX_CONFIG);
+            }
+
+            let sentinel = temp.path().join("probe-err-spawned");
+            let probe_sentinel_script = temp.path().join("never-run.cmd");
+            write_cmd(
+                &probe_sentinel_script,
+                &format!("@echo off\necho bad > \"{}\"\n", sentinel.display()),
+            );
+            let fail_probe = || Err("QueryInformationJobObject failed".to_string());
+            let auto_probe_fallback = resolve_worker_role_with(
+                WorkerModePreference::Auto,
+                &pins,
+                &probe_sentinel_script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                fail_probe,
+            )
+            .unwrap();
+            assert!(matches!(
+                auto_probe_fallback,
+                WorkerLaunchRole::FullIntegerWorker {
+                    fallback_reason: Some(_),
+                    ..
+                }
+            ));
+            assert!(!sentinel.exists());
+
+            let shard_probe_err = resolve_worker_role_with(
+                WorkerModePreference::Shard,
+                &pins,
+                &probe_sentinel_script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                fail_probe,
+            )
+            .unwrap_err();
+            assert_eq!(exit::code_for(&shard_probe_err), exit::EX_CONFIG);
+            assert!(!sentinel.exists());
+
+            let mut full_probe_calls = 0usize;
+            let full_role = resolve_worker_role_with(
+                WorkerModePreference::Full,
+                &pins,
+                &probe_sentinel_script,
+                &model,
+                &mut log,
+                Duration::from_secs(5),
+                || {
+                    full_probe_calls += 1;
+                    Err("probe must not run in full mode".to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(full_probe_calls, 0);
+            assert_eq!(
+                full_role,
+                WorkerLaunchRole::FullIntegerWorker {
+                    model: model.clone(),
+                    fallback_reason: None,
+                }
+            );
+            assert!(!sentinel.exists());
+        }
+
+        #[test]
+        fn windows_bounded_command_enforces_timeout_caps_exit_codes_and_fast_overflow() {
+            let temp = TempDir::new("win-bounded-cmd");
+            let timeout = Duration::from_secs(10);
+
+            let out_normal = temp.path().join("normal-out.bin");
+            let err_normal = temp.path().join("normal-err.bin");
+            fs::write(&out_normal, b"hello-stdout\n").unwrap();
+            fs::write(&err_normal, b"hello-stderr\n").unwrap();
+            let normal = temp.path().join("normal.cmd");
+            write_cmd(
+                &normal,
+                &format!(
+                    "@echo off\ntype \"{}\"\ntype \"{}\" 1>&2\nexit /b 0\n",
+                    out_normal.display(),
+                    err_normal.display()
+                ),
+            );
+            let output = run_bounded_command(&normal, &[], timeout, 1024, 256).unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"hello-stdout\n");
+            assert_eq!(output.stderr, b"hello-stderr\n");
+
+            let nonzero = temp.path().join("nonzero.cmd");
+            write_cmd(
+                &nonzero,
+                &format!(
+                    "@echo off\ntype \"{}\" 1>&2\nexit /b 42\n",
+                    err_normal.display()
+                ),
+            );
+            let nonzero_out = run_bounded_command(&nonzero, &[], timeout, 1024, 256).unwrap();
+            assert!(!nonzero_out.status.success());
+            assert_eq!(nonzero_out.status.code(), Some(42));
+            assert_eq!(nonzero_out.stderr, b"hello-stderr\n");
+
+            let exact_out = temp.path().join("exact-1024.bin");
+            let exact_err = temp.path().join("exact-256.bin");
+            fs::write(&exact_out, vec![b'x'; 1024]).unwrap();
+            fs::write(&exact_err, vec![b'y'; 256]).unwrap();
+            let exact_caps = temp.path().join("exact-caps.cmd");
+            write_cmd(
+                &exact_caps,
+                &format!(
+                    "@echo off\ntype \"{}\"\ntype \"{}\" 1>&2\nexit /b 0\n",
+                    exact_out.display(),
+                    exact_err.display()
+                ),
+            );
+            let exact = run_bounded_command(&exact_caps, &[], timeout, 1024, 256).unwrap();
+            assert!(exact.status.success());
+            assert_eq!(exact.stdout.len(), 1024);
+            assert_eq!(exact.stderr.len(), 256);
+
+            let fast_out_file = temp.path().join("fast-1025.bin");
+            fs::write(&fast_out_file, vec![b'x'; 1025]).unwrap();
+            let fast_stdout = temp.path().join("fast-stdout.cmd");
+            write_cmd(
+                &fast_stdout,
+                &format!(
+                    "@echo off\ntype \"{}\"\nexit /b 0\n",
+                    fast_out_file.display()
+                ),
+            );
+            let stdout_err =
+                run_bounded_command(&fast_stdout, &[], timeout, 1024, 256).unwrap_err();
+            assert!(matches!(
+                stdout_err,
+                BoundedCommandError::OutputLimitExceeded {
+                    stream: "stdout",
+                    limit: 1024
+                }
+            ));
+
+            let fast_err_file = temp.path().join("fast-257.bin");
+            fs::write(&fast_err_file, vec![b'y'; 257]).unwrap();
+            let fast_stderr = temp.path().join("fast-stderr.cmd");
+            write_cmd(
+                &fast_stderr,
+                &format!(
+                    "@echo off\ntype \"{}\" 1>&2\nexit /b 0\n",
+                    fast_err_file.display()
+                ),
+            );
+            let stderr_err =
+                run_bounded_command(&fast_stderr, &[], timeout, 1024, 256).unwrap_err();
+            assert!(matches!(
+                stderr_err,
+                BoundedCommandError::OutputLimitExceeded {
+                    stream: "stderr",
+                    limit: 256
+                }
+            ));
+
+            let loud_out_file = temp.path().join("loud-stdout.bin");
+            fs::write(&loud_out_file, vec![b'x'; 300 * 1024]).unwrap();
+            let loud_stdout = temp.path().join("loud-stdout.cmd");
+            write_cmd(
+                &loud_stdout,
+                &format!(
+                    "@echo off\ntype \"{}\"\nexit /b 0\n",
+                    loud_out_file.display()
+                ),
+            );
+            let loud_stdout_err = run_bounded_command(
+                &loud_stdout,
+                &[],
+                timeout,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                loud_stdout_err,
+                BoundedCommandError::OutputLimitExceeded {
+                    stream: "stdout",
+                    limit: HEADER_CHECK_STDOUT_CAP_BYTES
+                }
+            ));
+
+            let loud_err_file = temp.path().join("loud-stderr.bin");
+            fs::write(&loud_err_file, vec![b'y'; 24 * 1024]).unwrap();
+            let loud_stderr = temp.path().join("loud-stderr.cmd");
+            write_cmd(
+                &loud_stderr,
+                &format!(
+                    "@echo off\ntype \"{}\" 1>&2\nexit /b 0\n",
+                    loud_err_file.display()
+                ),
+            );
+            let loud_stderr_err = run_bounded_command(
+                &loud_stderr,
+                &[],
+                timeout,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                loud_stderr_err,
+                BoundedCommandError::OutputLimitExceeded {
+                    stream: "stderr",
+                    limit: HEADER_CHECK_STDERR_CAP_BYTES
+                }
+            ));
+
+            let dual_out_file = temp.path().join("dual-out.bin");
+            let dual_err_file = temp.path().join("dual-err.bin");
+            fs::write(&dual_out_file, vec![b'x'; 128 * 1024]).unwrap();
+            fs::write(&dual_err_file, vec![b'y'; HEADER_CHECK_STDERR_CAP_BYTES]).unwrap();
+            let dual_pipes = temp.path().join("dual-pipes.cmd");
+            write_cmd(
+                &dual_pipes,
+                &format!(
+                    "@echo off\ntype \"{}\"\ntype \"{}\" 1>&2\nexit /b 0\n",
+                    dual_out_file.display(),
+                    dual_err_file.display()
+                ),
+            );
+            let dual_output = run_bounded_command(
+                &dual_pipes,
+                &[],
+                timeout,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
+            )
+            .unwrap();
+            assert!(dual_output.status.success());
+            assert_eq!(dual_output.stdout.len(), 128 * 1024);
+            assert_eq!(dual_output.stderr.len(), HEADER_CHECK_STDERR_CAP_BYTES);
+
+            let sleeper = temp.path().join("sleep-child.cmd");
+            write_helper_wrapper(&sleeper, "sleep_hold", None);
+            let started = Instant::now();
+            let timeout_err = run_bounded_command(
+                &sleeper,
+                &[],
+                Duration::from_millis(400),
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(timeout_err, BoundedCommandError::Timeout(_)));
+            assert!(
+                started.elapsed() < Duration::from_secs(6),
+                "timeout must terminate and reap job object promptly"
+            );
+        }
+
+        #[test]
+        fn windows_bounded_command_kills_pipe_holding_descendants_on_timeout_and_overflow() {
+            let temp = TempDir::new("win-bounded-descendant");
+
+            let orphan_pid_file = temp.path().join("orphan.pid");
+            let orphan_script = temp.path().join("orphan-pipes.cmd");
+            write_helper_wrapper(&orphan_script, "orphan_pipes", Some(&orphan_pid_file));
+            let started = Instant::now();
+            let timeout_err = run_bounded_command(
+                &orphan_script,
+                &[],
+                Duration::from_millis(1_500),
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(timeout_err, BoundedCommandError::Timeout(_)));
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "deadline must cover both child exit and reader joins"
+            );
+            let orphan_pid: u32 = fs::read_to_string(&orphan_pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_pid_exited(orphan_pid);
+
+            let overflow_pid_file = temp.path().join("overflow.pid");
+            let overflow_script = temp.path().join("overflow-descendant.cmd");
+            write_helper_wrapper(
+                &overflow_script,
+                "overflow_descendant",
+                Some(&overflow_pid_file),
+            );
+            let started = Instant::now();
+            let overflow_err =
+                run_bounded_command(&overflow_script, &[], Duration::from_secs(10), 1024, 256)
+                    .unwrap_err();
+            assert!(matches!(
+                overflow_err,
+                BoundedCommandError::OutputLimitExceeded {
+                    stream: "stdout",
+                    limit: 1024
+                }
+            ));
+            assert!(
+                started.elapsed() < Duration::from_secs(6),
+                "overflow must terminate descendants promptly instead of waiting for timeout"
+            );
+            let overflow_pid: u32 = fs::read_to_string(&overflow_pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_pid_exited(overflow_pid);
+        }
     }
 
     #[cfg(unix)]

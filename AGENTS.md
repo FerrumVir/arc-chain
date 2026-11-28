@@ -543,18 +543,25 @@ unchanged: absent consent, saved opt-outs and v0.7 desktops remain observers.
 For consenting headless nodes with a verified regular model file (symlinked
 model paths are rejected before compute activation for every role), the bridge
 defaults to `auto` worker mode (persisted separately in `compute-worker-mode`
-so `BridgeState` keeps its v0.7.14 schema): on Linux and macOS, when optional
-`shard_worker` pins (derived from the tag's `install.sh` by `pin-release.py`)
-are present, it checks fresh host memory (16 GB nominal floor, 6 GiB available,
-4 GiB OS reserve, half-visible cap, clamped on Linux by effective cgroup v1/v2
-limits including ancestors), runs a bounded 10-second unverified
-header-admission check (`community-shard-worker --check-header-only`, requiring
+so `BridgeState` keeps its v0.7.14 schema): on Linux, macOS and Windows, when
+optional `shard_worker` pins (derived from the tag's `install.sh` by
+`pin-release.py`) are present, it checks fresh host memory (16 GB nominal
+floor, 6 GiB available, 4 GiB OS reserve, half-visible cap, clamped on Linux
+by effective cgroup v1/v2 limits including ancestors and on Windows by
+physical, commit, virtual and hard working-set limits only when
+`IsProcessInJob` positively reports not in a Job Object; any direct or nested
+Windows Job Object membership or failed query fails closed before spawning
+preflight because `QueryInformationJobObject(NULL, ...)` only inspects the
+immediate job and not ancestor limits or aggregate job headroom), runs a
+bounded 10-second unverified header-admission check (`community-shard-worker --check-header-only`, supervised in a Unix
+process group or suspended-spawn kill-on-close Windows Job Object, requiring
 exact outer fields with `mode="header-admission-only"`, `artifact_verified=false`,
 and at least 6 admitted layers), rechecks memory after preflight, and launches
 `--community-shard-worker` (rewards disabled) without whole-model flags. The
 launched `arc-node` still performs full-file BLAKE3 model verification after
 early `/health` bind before registration or weights (`install.sh` retains full
-`--check-only`); non-Unix platforms fail closed before probing or spawning, and
+`--check-only`); unsupported platforms fail closed before probing or spawning,
+v0.7 Windows desktops remain observer-only until the v0.8 desktop update, and
 the checked-in `v0.8.27` pin lacks `--check-header-only`, so `auto` falls back
 to `--full-integer-worker` until `v0.8.28` is published and repinned. Explicit
 `full` bypasses preflight, and explicit `shard` fails closed.
