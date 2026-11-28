@@ -486,7 +486,7 @@ impl StartupRpcServer {
         Self::start_tcp_with_router(address, startup_loading_router(loading_state))
     }
 
-    pub fn start_tcp_with_router(address: &str, initial_router: Router) -> anyhow::Result<Self> {
+    fn start_tcp_with_router(address: &str, initial_router: Router) -> anyhow::Result<Self> {
         let socket_addr: SocketAddr = address.parse()?;
         let listener = bind_rpc_tcp_listener(socket_addr)?;
         let local_addr = listener.local_addr()?;
@@ -623,16 +623,57 @@ impl StartupRpcServer {
         })
     }
 
+    async fn wait_for_tracker_drain(&self, timeout: Duration) -> bool {
+        if self.tracker.active_connections() == 0 && self.tracker.active_handlers() == 0 {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let drained = self.tracker.drained_notify.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.tracker.active_connections() == 0 && self.tracker.active_handlers() == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, drained).await.is_err() {
+                return self.tracker.active_connections() == 0
+                    && self.tracker.active_handlers() == 0;
+            }
+        }
+    }
+
     pub async fn stop_bounded(
         mut self,
         drain_timeout: Duration,
     ) -> anyhow::Result<StartupStopOutcome> {
         let Some(mut server_task) = self.server_task.take() else {
-            return Ok(StartupStopOutcome::Drained);
+            if self.tracker.active_connections() == 0 && self.tracker.active_handlers() == 0 {
+                return Ok(StartupStopOutcome::Drained);
+            }
+            return Ok(StartupStopOutcome::ForcedCloseAfterTimeout {
+                remaining_connections: self.tracker.active_connections(),
+                remaining_handlers: self.tracker.active_handlers(),
+            });
         };
+        let drain_deadline = Instant::now() + drain_timeout;
         let _ = self.shutdown_tx.send(true);
         match tokio::time::timeout(drain_timeout, &mut server_task).await {
-            Ok(Ok(Ok(()))) => Ok(StartupStopOutcome::Drained),
+            Ok(Ok(Ok(()))) => {
+                let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                if self.wait_for_tracker_drain(remaining).await {
+                    Ok(StartupStopOutcome::Drained)
+                } else {
+                    self.tracker.trigger_force_close();
+                    Ok(StartupStopOutcome::ForcedCloseAfterTimeout {
+                        remaining_connections: self.tracker.active_connections(),
+                        remaining_handlers: self.tracker.active_handlers(),
+                    })
+                }
+            }
             Ok(Ok(Err(error))) => Err(error.into()),
             Ok(Err(error)) => Err(anyhow::anyhow!(
                 "startup RPC server task failed to join: {error}"
@@ -640,8 +681,12 @@ impl StartupRpcServer {
             Err(_) => {
                 self.tracker.trigger_force_close();
                 let force_close_timeout = drain_timeout.min(STARTUP_FORCE_CLOSE_TIMEOUT);
+                let force_deadline = Instant::now() + force_close_timeout;
                 match tokio::time::timeout(force_close_timeout, &mut server_task).await {
-                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Ok(()))) => {
+                        let remaining = force_deadline.saturating_duration_since(Instant::now());
+                        let _ = self.wait_for_tracker_drain(remaining).await;
+                    }
                     Ok(Ok(Err(error))) => return Err(error.into()),
                     Ok(Err(error)) => {
                         return Err(anyhow::anyhow!(
@@ -1288,43 +1333,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_bounded_reports_live_handlers_until_completion_and_refuses_new_connections() {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
-        let entered_slot = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
-        let release_slot = Arc::new(parking_lot::Mutex::new(Some(release_rx)));
-        let exited_slot = Arc::new(parking_lot::Mutex::new(Some(exited_tx)));
+    async fn stop_bounded_force_close_cancels_pending_async_handler_and_refuses_new_connections() {
+        struct HandlerDropOutcome {
+            outcome_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+            completed: bool,
+        }
 
-        let router = Router::new().route(
-            "/slow",
-            get({
-                let entered_slot = Arc::clone(&entered_slot);
-                let release_slot = Arc::clone(&release_slot);
-                let exited_slot = Arc::clone(&exited_slot);
-                move || {
+        impl Drop for HandlerDropOutcome {
+            fn drop(&mut self) {
+                if let Some(tx) = self.outcome_tx.take() {
+                    let _ = tx.send(self.completed);
+                }
+            }
+        }
+
+        let make_slow_router = || {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<bool>();
+            let entered_slot = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
+            let release_slot = Arc::new(parking_lot::Mutex::new(Some(release_rx)));
+            let outcome_slot = Arc::new(parking_lot::Mutex::new(Some(outcome_tx)));
+
+            let router = Router::new().route(
+                "/slow",
+                get({
                     let entered_slot = Arc::clone(&entered_slot);
                     let release_slot = Arc::clone(&release_slot);
-                    let exited_slot = Arc::clone(&exited_slot);
-                    async move {
-                        let entered_tx = entered_slot.lock().take();
-                        if let Some(tx) = entered_tx {
-                            let _ = tx.send(());
+                    let outcome_slot = Arc::clone(&outcome_slot);
+                    move || {
+                        let entered_slot = Arc::clone(&entered_slot);
+                        let release_slot = Arc::clone(&release_slot);
+                        let outcome_slot = Arc::clone(&outcome_slot);
+                        async move {
+                            let entered_tx = entered_slot.lock().take();
+                            let release_rx = release_slot.lock().take();
+                            let outcome_tx = outcome_slot.lock().take();
+                            let mut drop_guard = HandlerDropOutcome {
+                                outcome_tx,
+                                completed: false,
+                            };
+                            if let Some(tx) = entered_tx {
+                                let _ = tx.send(());
+                            }
+                            if let Some(rx) = release_rx {
+                                let _ = rx.await;
+                            }
+                            drop_guard.completed = true;
+                            (StatusCode::OK, close_connection_headers(), "done")
                         }
-                        let release_rx = release_slot.lock().take();
-                        if let Some(rx) = release_rx {
-                            let _ = rx.await;
-                        }
-                        let exited_tx = exited_slot.lock().take();
-                        if let Some(tx) = exited_tx {
-                            let _ = tx.send(());
-                        }
-                        (StatusCode::OK, close_connection_headers(), "done")
                     }
-                }
-            }),
-        );
+                }),
+            );
+            (router, entered_rx, release_tx, outcome_rx)
+        };
 
+        let (router, entered_rx, _release_tx, outcome_rx) = make_slow_router();
         let server = StartupRpcServer::start_tcp_with_router("127.0.0.1:0", router).unwrap();
         let addr = server.local_addr();
         let tracker = Arc::clone(&server.tracker);
@@ -1332,45 +1396,87 @@ mod tests {
         let slow_url = format!("http://{addr}/slow");
         let request_task = tokio::spawn(async move { client.get(slow_url).send().await });
 
-        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
             .await
-            .expect("slow handler must start executing")
+            .expect("pending async handler must start executing")
             .unwrap();
+        assert_eq!(tracker.active_handlers(), 1);
+        assert_eq!(tracker.active_connections(), 1);
 
         let stop_outcome = server
             .stop_bounded(Duration::from_millis(50))
             .await
             .unwrap();
         assert!(!stop_outcome.drained_cleanly());
-        assert!(stop_outcome.has_live_handlers());
+        assert!(!stop_outcome.has_live_handlers());
         assert_eq!(
             stop_outcome,
             StartupStopOutcome::ForcedCloseAfterTimeout {
-                remaining_connections: 1,
-                remaining_handlers: 1,
+                remaining_connections: 0,
+                remaining_handlers: 0,
             }
+        );
+        let completed = tokio::time::timeout(Duration::from_secs(5), outcome_rx)
+            .await
+            .expect("canceled async handler must run its Drop guard promptly")
+            .unwrap();
+        assert!(
+            !completed,
+            "forced socket close must cancel the pending async handler before completion"
         );
         assert!(
             tokio::net::TcpStream::connect(addr).await.is_err(),
-            "listener must refuse new connections even while a live handler finishes"
+            "stopped startup listener must refuse new connections"
         );
-
-        let drained = tracker.drained_notify.notified();
-        tokio::pin!(drained);
-        drained.as_mut().enable();
-        let _ = release_tx.send(());
-        tokio::time::timeout(Duration::from_secs(2), exited_rx)
-            .await
-            .expect("released handler must reach completion")
-            .unwrap();
-        if tracker.active_connections() > 0 || tracker.active_handlers() > 0 {
-            tokio::time::timeout(Duration::from_secs(2), drained)
-                .await
-                .expect("active handler and connection must drain once released");
-        }
         let _ = request_task.await;
         assert_eq!(tracker.active_handlers(), 0);
         assert_eq!(tracker.active_connections(), 0);
+
+        let (drain_router, drain_entered_rx, drain_release_tx, drain_outcome_rx) =
+            make_slow_router();
+        let drain_server =
+            StartupRpcServer::start_tcp_with_router("127.0.0.1:0", drain_router).unwrap();
+        let drain_addr = drain_server.local_addr();
+        let drain_tracker = Arc::clone(&drain_server.tracker);
+        let drain_client = http_client();
+        let drain_url = format!("http://{drain_addr}/slow");
+        let drain_request = tokio::spawn(async move { drain_client.get(drain_url).send().await });
+
+        tokio::time::timeout(Duration::from_secs(5), drain_entered_rx)
+            .await
+            .expect("graceful-drain async handler must start executing")
+            .unwrap();
+        assert_eq!(drain_tracker.active_handlers(), 1);
+        assert_eq!(drain_tracker.active_connections(), 1);
+
+        let drain_outcome = {
+            let stop_fut = drain_server.stop_bounded(Duration::from_secs(2));
+            tokio::pin!(stop_fut);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut stop_fut)
+                    .await
+                    .is_err(),
+                "graceful stop must wait while the in-flight handler completes within budget"
+            );
+            assert!(tokio::net::TcpStream::connect(drain_addr).await.is_err());
+            let _ = drain_release_tx.send(());
+            tokio::time::timeout(Duration::from_secs(5), &mut stop_fut)
+                .await
+                .expect("graceful stop must finish once in-flight handler completes")
+                .unwrap()
+        };
+        assert_eq!(drain_outcome, StartupStopOutcome::Drained);
+        assert!(drain_outcome.drained_cleanly());
+        assert!(!drain_outcome.has_live_handlers());
+        let drain_completed = tokio::time::timeout(Duration::from_secs(5), drain_outcome_rx)
+            .await
+            .expect("drained handler must report completion via its Drop guard")
+            .unwrap();
+        assert!(drain_completed);
+        let response = drain_request.await.unwrap().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(drain_tracker.active_handlers(), 0);
+        assert_eq!(drain_tracker.active_connections(), 0);
     }
 
     #[tokio::test]

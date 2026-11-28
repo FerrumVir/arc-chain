@@ -706,7 +706,9 @@ def verify_loopback_port_released(port: int, timeout_secs: float = 5.0) -> None:
     while time.monotonic() < deadline:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind(("127.0.0.1", port))
+                sock.listen(1)
             return
         except OSError as error:
             last_error = error

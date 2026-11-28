@@ -50,7 +50,7 @@ EXPECTED_BINARY_TESTS = {
     'worker_startup_main_tests::early_worker_startup_role_for_cli_matches_eligible_and_ineligible_cli_invocations',
     'worker_startup_main_tests::prepare_full_integer_worker_model_blocking_honors_cancel_and_reports_real_errors',
     'worker_startup_main_tests::early_startup_abort_stops_listener_joins_watchers_and_gates_clean_shutdown',
-    'worker_startup_main_tests::early_startup_live_handler_blocks_clean_cancellation_and_receipt_while_preserving_fatal_error',
+    'worker_startup_main_tests::early_startup_cleanup_drains_owned_blocking_runtime_task_before_receipt_and_preserves_fatal_error',
     'worker_startup_main_tests::validate_community_rewards_v1_state_rejects_missing_activation_height_prebind',
     'worker_startup_main_tests::post_bind_rpc_failure_cleanup_stops_tasks_syncs_wal_completes_eth_and_preserves_fatal_err',
 }
@@ -163,7 +163,7 @@ EXPECTED_LIBRARY_TESTS = {
     'worker_startup::tests::startup_loading_serves_health_loading_and_rejects_readiness_and_mutations_503',
     'worker_startup::tests::startup_rpc_server_hands_off_to_full_router_on_same_listener_without_gap',
     'worker_startup::tests::cancellable_preparation_joins_before_cleanup_and_distinguishes_shutdown_from_errors',
-    'worker_startup::tests::stop_bounded_reports_live_handlers_until_completion_and_refuses_new_connections',
+    'worker_startup::tests::stop_bounded_force_close_cancels_pending_async_handler_and_refuses_new_connections',
     'worker_startup::tests::serve_eth_rejects_occupied_tcp_port',
     'worker_startup::tests::serve_on_startup_server_pre_handoff_error_signals_and_drains_rpc_tasks',
     'worker_startup::tests::serve_on_startup_server_unexpected_stop_and_panic_signal_and_drain_rpc_tasks',

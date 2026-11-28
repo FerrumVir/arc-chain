@@ -189,6 +189,39 @@ def send_raw_http(port: int, payload: bytes, timeout_secs: float = 2.0) -> bytes
 
 
 class WorkerStartupQualificationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux runner TCP semantics")
+    def test_released_port_accepts_time_wait_and_rejects_live_listeners(self) -> None:
+        for address in ("127.0.0.1", "0.0.0.0"):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((address, 0))
+                listener.listen(1)
+                port = listener.getsockname()[1]
+                with self.assertRaisesRegex(QUALIFY.QualificationError, "remained bound"):
+                    QUALIFY.verify_loopback_port_released(port, timeout_secs=0.05)
+            QUALIFY.verify_loopback_port_released(port, timeout_secs=0.2)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.settimeout(2.0)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(2.0)
+                    connection.shutdown(socket.SHUT_WR)
+                    self.assertEqual(client.recv(1), b"")
+                    client.shutdown(socket.SHUT_WR)
+                    self.assertEqual(connection.recv(1), b"")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with self.assertRaises(OSError) as raised:
+                probe.bind(("127.0.0.1", port))
+            self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+        QUALIFY.verify_loopback_port_released(port, timeout_secs=0.2)
+
     def test_log_head_and_tail_are_independent_of_read_chunk_boundaries(self) -> None:
         payload = b"HEAD-LINE\n" + bytes(range(256)) * 8 + b"\nTAIL-LINE\n"
         budget = 256 - len(QUALIFY.TRUNCATION_MARKER)

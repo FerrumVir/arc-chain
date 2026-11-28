@@ -11087,57 +11087,58 @@ mod worker_startup_main_tests {
         }
     }
 
-    type BlockingSlowServerHandle = (
-        StartupRpcServer,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
-    );
+    struct ReleaseBlockingOnDrop(Option<std::sync::mpsc::Sender<()>>);
 
-    fn spawn_blocking_slow_server() -> BlockingSlowServerHandle {
+    impl ReleaseBlockingOnDrop {
+        fn release(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseBlockingOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct OwnedBlockingRuntimeTask {
+        task: tokio::task::JoinHandle<()>,
+        entered_rx: tokio::sync::oneshot::Receiver<()>,
+        release_guard: ReleaseBlockingOnDrop,
+        shutdown_observed: Arc<AtomicBool>,
+        blocking_finished: Arc<AtomicBool>,
+    }
+
+    fn spawn_owned_blocking_runtime_task(
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> OwnedBlockingRuntimeTask {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
-        let entered_slot = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
-        let release_slot = Arc::new(parking_lot::Mutex::new(Some(release_rx)));
-        let exited_slot = Arc::new(parking_lot::Mutex::new(Some(exited_tx)));
-
-        let router = axum::Router::new().route(
-            "/slow",
-            axum::routing::get({
-                let entered_slot = Arc::clone(&entered_slot);
-                let release_slot = Arc::clone(&release_slot);
-                let exited_slot = Arc::clone(&exited_slot);
-                move || {
-                    let entered_slot = Arc::clone(&entered_slot);
-                    let release_slot = Arc::clone(&release_slot);
-                    let exited_slot = Arc::clone(&exited_slot);
-                    async move {
-                        let entered_tx = entered_slot.lock().take();
-                        if let Some(tx) = entered_tx {
-                            let _ = tx.send(());
-                        }
-                        let release_rx = release_slot.lock().take();
-                        if let Some(rx) = release_rx {
-                            let _ = rx.await;
-                        }
-                        let exited_tx = exited_slot.lock().take();
-                        if let Some(tx) = exited_tx {
-                            let _ = tx.send(());
-                        }
-                        (axum::http::StatusCode::OK, "done")
-                    }
-                }
-            }),
-        );
-
-        let server = StartupRpcServer::start_tcp_with_router("127.0.0.1:0", router).unwrap();
-        let addr = server.local_addr();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let slow_url = format!("http://{addr}/slow");
-        let request_task = tokio::spawn(async move { client.get(slow_url).send().await });
-        (server, entered_rx, release_tx, exited_rx, request_task)
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown_observed = Arc::new(AtomicBool::new(false));
+        let shutdown_observed_task = Arc::clone(&shutdown_observed);
+        let blocking_finished = Arc::new(AtomicBool::new(false));
+        let blocking_finished_task = Arc::clone(&blocking_finished);
+        let task = tokio::spawn(async move {
+            let blocking_handle = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                blocking_finished_task.store(true, Ordering::Release);
+            });
+            if !*shutdown_rx.borrow_and_update() {
+                let _ = shutdown_rx.changed().await;
+            }
+            shutdown_observed_task.store(true, Ordering::Release);
+            blocking_handle.await.unwrap();
+        });
+        OwnedBlockingRuntimeTask {
+            task,
+            entered_rx,
+            release_guard: ReleaseBlockingOnDrop(Some(release_tx)),
+            shutdown_observed,
+            blocking_finished,
+        }
     }
 
     #[tokio::test]
@@ -11357,75 +11358,50 @@ mod worker_startup_main_tests {
     }
 
     #[tokio::test]
-    async fn early_startup_live_handler_blocks_clean_cancellation_and_receipt_while_preserving_fatal_error()
+    async fn early_startup_cleanup_drains_owned_blocking_runtime_task_before_receipt_and_preserves_fatal_error()
      {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
-        let producer = hash_bytes(b"early-startup-live-handler-producer");
-        let genesis_hash = hash_bytes(b"early-startup-live-handler-genesis");
+        let producer = hash_bytes(b"early-startup-drain-producer");
+        let genesis_hash = hash_bytes(b"early-startup-drain-genesis");
         let state = Arc::new(
             StateDB::with_genesis_persistent(&[(producer, 1_000)], &state_dir, genesis_hash)
                 .unwrap(),
         );
+        let wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(false));
 
-        let (server, entered_rx, release_tx, exited_rx, request_task) =
-            spawn_blocking_slow_server();
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
-            .await
-            .expect("slow handler must enter before cancellation")
-            .unwrap();
+        let cancel_server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time: Instant::now(),
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+        )
+        .unwrap();
+        let cancel_addr = cancel_server.local_addr();
 
         let admission = arc_node::native_inference::NativeRequestAdmission::new(false);
         let shutdown_requested = AtomicBool::new(true);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (bg_tx, _bg_rx) = tokio::sync::watch::channel(false);
         let (rt_tx, _rt_rx) = tokio::sync::watch::channel(false);
-        let watcher_joined = Arc::new(AtomicBool::new(false));
-        let watcher_joined_task = Arc::clone(&watcher_joined);
-        let mut runtime_tasks = vec![tokio::spawn(async move {
-            if !*shutdown_rx.borrow_and_update() {
-                let _ = shutdown_rx.changed().await;
-            }
-            watcher_joined_task.store(true, Ordering::Release);
-        })];
-        let cancel_receipt = std::sync::Mutex::new(Some(arm_test_desktop_shutdown_receipt(
-            &temp.path().join("receipt-cancel"),
-        )));
-
-        let cancel_err = complete_early_startup_cancellation(
-            Some(server),
-            state.as_ref(),
-            &admission,
-            &shutdown_requested,
-            &shutdown_tx,
-            &bg_tx,
-            &rt_tx,
-            &mut runtime_tasks,
-            &cancel_receipt,
-            std::time::Duration::from_millis(50),
-        )
-        .await
-        .expect_err("remaining live handler must block clean early-startup cancellation");
-        assert!(cancel_err.to_string().contains("did not drain cleanly"));
-        assert!(cancel_err.to_string().contains("1 live handlers remaining"));
-        assert!(watcher_joined.load(Ordering::Acquire));
-        assert!(runtime_tasks.is_empty());
-        assert!(admission.worker_execution_gate().try_enter().is_none());
-        assert!(
-            cancel_receipt.lock().unwrap().is_some(),
-            "incomplete early-startup drain must never acknowledge a clean desktop shutdown receipt"
-        );
-
-        let _ = release_tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(2), exited_rx)
+        let mut owned = spawn_owned_blocking_runtime_task(shutdown_rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), owned.entered_rx)
             .await
-            .expect("released handler must exit")
+            .expect("owned blocking runtime task must enter spawn_blocking")
             .unwrap();
-        let _ = request_task.await;
+        let mut runtime_tasks = vec![owned.task];
 
-        assert!(
-            complete_early_startup_cancellation(
-                None,
+        let cancel_receipt_id =
+            arm_test_desktop_shutdown_receipt(&temp.path().join("receipt-cancel"));
+        let cancel_receipt_check = cancel_receipt_id.clone();
+        let cancel_receipt = std::sync::Mutex::new(Some(cancel_receipt_id));
+
+        let cancel_completed = {
+            let cancel_fut = complete_early_startup_cancellation(
+                Some(cancel_server),
                 state.as_ref(),
                 &admission,
                 &shutdown_requested,
@@ -11434,47 +11410,170 @@ mod worker_startup_main_tests {
                 &rt_tx,
                 &mut runtime_tasks,
                 &cancel_receipt,
-                std::time::Duration::from_millis(50),
-            )
-            .await
-            .unwrap()
-        );
+                arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+            );
+            tokio::pin!(cancel_fut);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut cancel_fut)
+                    .await
+                    .is_err(),
+                "early-startup cancellation must remain pending while owned blocking task runs"
+            );
+            assert!(owned.shutdown_observed.load(Ordering::Acquire));
+            assert!(!owned.blocking_finished.load(Ordering::Acquire));
+            assert!(admission.worker_execution_gate().try_enter().is_none());
+            assert!(tokio::net::TcpStream::connect(cancel_addr).await.is_err());
+            assert!(
+                cancel_receipt.lock().unwrap().is_some(),
+                "receipt must remain armed while owned blocking runtime task is still running"
+            );
+            assert_eq!(
+                arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+                    &cancel_receipt_check.data_dir,
+                    &cancel_receipt_check.expected_token,
+                    &cancel_receipt_check.executable,
+                    &cancel_receipt_check.genesis,
+                )
+                .unwrap(),
+                Some(cancel_receipt_check.nonce)
+            );
+
+            owned.release_guard.release();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut cancel_fut)
+                .await
+                .expect("early-startup cancellation must complete after blocking task drains")
+                .unwrap()
+        };
+        assert!(cancel_completed);
+        assert!(owned.blocking_finished.load(Ordering::Acquire));
+        assert!(runtime_tasks.is_empty());
         assert!(
             cancel_receipt.lock().unwrap().is_none(),
-            "clean cancellation without remaining live handlers must acknowledge the armed receipt"
+            "armed receipt must be acknowledged once owned blocking task joins cleanly"
         );
 
-        let (fatal_server, fatal_entered_rx, fatal_release_tx, fatal_exited_rx, fatal_req_task) =
-            spawn_blocking_slow_server();
-        tokio::time::timeout(std::time::Duration::from_secs(2), fatal_entered_rx)
-            .await
-            .expect("second slow handler must enter before fatal abort")
-            .unwrap();
-
+        let fatal_server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time: Instant::now(),
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+        )
+        .unwrap();
+        let fatal_addr = fatal_server.local_addr();
         let fatal_admission = arc_node::native_inference::NativeRequestAdmission::new(false);
-        let (fatal_shutdown_tx, mut fatal_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (fatal_shutdown_tx, fatal_shutdown_rx) = tokio::sync::watch::channel(false);
         let (fatal_bg_tx, _fatal_bg_rx) = tokio::sync::watch::channel(false);
         let (fatal_rt_tx, _fatal_rt_rx) = tokio::sync::watch::channel(false);
-        let fatal_watcher_joined = Arc::new(AtomicBool::new(false));
-        let fatal_watcher_joined_task = Arc::clone(&fatal_watcher_joined);
-        let mut fatal_runtime_tasks = vec![tokio::spawn(async move {
-            if !*fatal_shutdown_rx.borrow_and_update() {
-                let _ = fatal_shutdown_rx.changed().await;
-            }
-            fatal_watcher_joined_task.store(true, Ordering::Release);
-        })];
+        let mut fatal_owned = spawn_owned_blocking_runtime_task(fatal_shutdown_rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), fatal_owned.entered_rx)
+            .await
+            .expect("fatal-path owned blocking task must enter spawn_blocking")
+            .unwrap();
+        let mut fatal_runtime_tasks = vec![fatal_owned.task];
 
-        let combined_err = abort_early_startup_with_error(
-            anyhow::anyhow!("corrupt canonical model"),
-            Some(fatal_server),
+        let fatal_err = {
+            let abort_fut = abort_early_startup_with_error(
+                anyhow::anyhow!("corrupt canonical model"),
+                Some(fatal_server),
+                None,
+                state.as_ref(),
+                &fatal_admission,
+                &fatal_shutdown_tx,
+                &fatal_bg_tx,
+                &fatal_rt_tx,
+                &mut fatal_runtime_tasks,
+                arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+            );
+            tokio::pin!(abort_fut);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut abort_fut)
+                    .await
+                    .is_err(),
+                "fatal early-startup abort must drain owned blocking runtime task before returning"
+            );
+            assert!(fatal_owned.shutdown_observed.load(Ordering::Acquire));
+            assert!(!fatal_owned.blocking_finished.load(Ordering::Acquire));
+            assert!(tokio::net::TcpStream::connect(fatal_addr).await.is_err());
+
+            fatal_owned.release_guard.release();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut abort_fut)
+                .await
+                .expect("fatal early-startup abort must finish after blocking task drains")
+        };
+        assert!(fatal_err.to_string().contains("corrupt canonical model"));
+        assert!(fatal_owned.blocking_finished.load(Ordering::Acquire));
+        assert!(fatal_runtime_tasks.is_empty());
+
+        let dirty_admission = arc_node::native_inference::NativeRequestAdmission::new(false);
+        let (dirty_shutdown_tx, mut dirty_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (dirty_bg_tx, _dirty_bg_rx) = tokio::sync::watch::channel(false);
+        let (dirty_rt_tx, _dirty_rt_rx) = tokio::sync::watch::channel(false);
+        let mut dirty_runtime_tasks = vec![tokio::spawn(async move {
+            if !*dirty_shutdown_rx.borrow_and_update() {
+                let _ = dirty_shutdown_rx.changed().await;
+            }
+            panic!("simulated early startup watcher panic");
+        })];
+        let dirty_receipt_id =
+            arm_test_desktop_shutdown_receipt(&temp.path().join("receipt-dirty"));
+        let dirty_receipt_check = dirty_receipt_id.clone();
+        let dirty_receipt = std::sync::Mutex::new(Some(dirty_receipt_id));
+
+        let dirty_cancel_err = complete_early_startup_cancellation(
             None,
             state.as_ref(),
-            &fatal_admission,
-            &fatal_shutdown_tx,
-            &fatal_bg_tx,
-            &fatal_rt_tx,
-            &mut fatal_runtime_tasks,
-            std::time::Duration::from_millis(50),
+            &dirty_admission,
+            &shutdown_requested,
+            &dirty_shutdown_tx,
+            &dirty_bg_tx,
+            &dirty_rt_tx,
+            &mut dirty_runtime_tasks,
+            &dirty_receipt,
+            arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+        )
+        .await
+        .expect_err("panicked owned runtime task must block clean cancellation and receipt");
+        assert!(
+            dirty_cancel_err
+                .to_string()
+                .contains("startup watcher task failed to join")
+        );
+        assert!(dirty_runtime_tasks.is_empty());
+        assert!(dirty_receipt.lock().unwrap().is_some());
+        assert_eq!(
+            arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+                &dirty_receipt_check.data_dir,
+                &dirty_receipt_check.expected_token,
+                &dirty_receipt_check.executable,
+                &dirty_receipt_check.genesis,
+            )
+            .unwrap(),
+            Some(dirty_receipt_check.nonce)
+        );
+
+        let (panic_fatal_tx, mut panic_fatal_rx) = tokio::sync::watch::channel(false);
+        let (panic_bg_tx, _panic_bg_rx) = tokio::sync::watch::channel(false);
+        let (panic_rt_tx, _panic_rt_rx) = tokio::sync::watch::channel(false);
+        let mut panic_fatal_tasks = vec![tokio::spawn(async move {
+            if !*panic_fatal_rx.borrow_and_update() {
+                let _ = panic_fatal_rx.changed().await;
+            }
+            panic!("simulated fatal abort watcher panic");
+        })];
+        let combined_err = abort_early_startup_with_error(
+            anyhow::anyhow!("corrupt canonical model"),
+            None,
+            None,
+            state.as_ref(),
+            &dirty_admission,
+            &panic_fatal_tx,
+            &panic_bg_tx,
+            &panic_rt_tx,
+            &mut panic_fatal_tasks,
+            arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
         )
         .await;
         assert!(combined_err.to_string().contains("corrupt canonical model"));
@@ -11486,17 +11585,9 @@ mod worker_startup_main_tests {
         assert!(
             combined_err
                 .to_string()
-                .contains("1 live handlers remaining")
+                .contains("startup watcher task failed to join")
         );
-        assert!(fatal_watcher_joined.load(Ordering::Acquire));
-        assert!(fatal_runtime_tasks.is_empty());
-
-        let _ = fatal_release_tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(2), fatal_exited_rx)
-            .await
-            .expect("released fatal-path handler must exit")
-            .unwrap();
-        let _ = fatal_req_task.await;
+        assert!(panic_fatal_tasks.is_empty());
     }
 }
 
