@@ -1458,7 +1458,6 @@ mod tests {
                     .is_err(),
                 "graceful stop must wait while the in-flight handler completes within budget"
             );
-            assert!(tokio::net::TcpStream::connect(drain_addr).await.is_err());
             let _ = drain_release_tx.send(());
             tokio::time::timeout(Duration::from_secs(5), &mut stop_fut)
                 .await
@@ -1466,6 +1465,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(drain_outcome, StartupStopOutcome::Drained);
+        assert!(tokio::net::TcpStream::connect(drain_addr).await.is_err());
         assert!(drain_outcome.drained_cleanly());
         assert!(!drain_outcome.has_live_handlers());
         let drain_completed = tokio::time::timeout(Duration::from_secs(5), drain_outcome_rx)
