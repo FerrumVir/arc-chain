@@ -52,6 +52,48 @@ wait_health() {
 
 main_pid() { systemctl show -p MainPID --value arc-node; }
 
+argv_value_in() {
+    local file="$1" flag="$2"
+    awk -v flag="$flag" 'found { print; exit } $0 == flag { found = 1 }' "$file"
+}
+
+assert_wal_prefix_preserved() {
+    local before_wal="$1" current_wal="$2" context="$3"
+    [ -s "$current_wal" ] || fail "$context: missing or empty state WAL at $current_wal"
+    [ "$(stat -c %s "$current_wal")" -le 8388608 ] || fail "$context: isolated WAL exceeds 8 MiB"
+    python3 - "$before_wal" "$current_wal" "$context" <<'PY'
+import sys
+from pathlib import Path
+before = Path(sys.argv[1]).read_bytes()
+with Path(sys.argv[2]).open("rb") as stream:
+    after = stream.read(len(before))
+if not before or before != after:
+    raise SystemExit(f"{sys.argv[3]}: discarded or rewrote the persisted WAL prefix")
+PY
+}
+
+assert_running_node() {
+    local expected_tag="$1" expected_version="$2" expected_sha="$3" expected_address="$4" info_out="$5" argv_out="$6"
+    local pid exe
+    pid="$(main_pid)"
+    if [ -z "$pid" ] || [ "$pid" = 0 ]; then
+        fail "arc-node has no active systemd MainPID"
+    fi
+    exe="$(readlink "/proc/$pid/exe")"
+    [ "$exe" = "$arc_dir/legacy-bridge/releases/$expected_tag/$asset" ] \
+        || fail "unexpected running node executable $exe (expected $expected_tag)"
+    [ "$(sha "$exe")" = "$expected_sha" ] \
+        || fail "running node binary digest does not match $expected_tag"
+    tr '\0' '\n' < "/proc/$pid/cmdline" > "$argv_out"
+    [ "$(argv_value_in "$argv_out" --rpc)" = "127.0.0.1:9944" ] \
+        || fail "running node RPC is not bound to 127.0.0.1:9944"
+    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$info_out"
+    jq -e --arg address "$expected_address" --arg version "$expected_version" \
+        '.stake == 0 and .version == $version and (.validator | ltrimstr("0x")) == $address' \
+        "$info_out" >/dev/null \
+        || fail "running node /node/info did not match version $expected_version, stake 0, and identity $expected_address"
+}
+
 publish_latest() {
     local tag="$1"
     python3 - "$evidence/real-releases-latest.json" "$tag" "$state/api/releases-latest.json" <<'PY'
@@ -118,16 +160,17 @@ git -C "$repo_root" show "$legacy_tag:testnet-seeds.txt" > "$state/raw/main/test
 git -C "$repo_root" show "$legacy_tag:genesis.toml" > "$state/raw/main/genesis.toml"
 git -C "$repo_root" rev-parse "$legacy_tag" > "$legacy/tag-commit.txt"
 mkdir -p "$state/releases/$legacy_node_tag" "$state/releases/$bridge_tag"
+python3 "$here/fetch_release_metadata.py" --out "$evidence/real-releases-latest.json"
+unset GH_TOKEN GITHUB_TOKEN
+printf 'live GitHub Latest today: %s\n' "$(jq -r .tag_name "$evidence/real-releases-latest.json")"
 /usr/bin/curl -fsSL --retry 3 -o "$state/releases/$legacy_node_tag/$asset" \
     "https://github.com/FerrumVir/arc-chain/releases/download/$legacy_node_tag/$asset"
 [ "$(sha "$state/releases/$legacy_node_tag/$asset")" = "$legacy_node_sha256" ] \
     || fail "the v0.7.7 binary does not match its pinned digest"
-/usr/bin/curl -fsS --retry 3 -o "$evidence/real-releases-latest.json" \
-    "https://api.github.com/repos/FerrumVir/arc-chain/releases/latest"
-printf 'live GitHub Latest today: %s\n' "$(jq -r .tag_name "$evidence/real-releases-latest.json")"
 cp "$bridge_binary" "$state/releases/$bridge_tag/$asset"
 chmod 0755 "$state/releases/$bridge_tag/$asset"
 bridge_sha="$(sha "$bridge_binary")"
+first_bridge_sha="$bridge_sha"
 
 log "Instrument (never modify) the v0.7 units the installer will write"
 sudo mkdir -p /etc/systemd/system/arc-node.service.d /etc/systemd/system/arc-updater.service.d
@@ -163,29 +206,36 @@ seed="$(cat "$arc_dir/identity.seed")"
 
 if [ "$scenario" = previous-bridge ]; then
     log "Run the immutable previous bridge before qualifying an existing-install update"
-    prior_tag=v0.7.14
-    prior_bridge_sha256=813cc6545dc3dfcc47fd697c8bcc5acfd21e99339f45e8547c31c735a752f29c
+    previous_release="$here/previous-release.json"
+    [ "$(jq -er '.schema' "$previous_release")" = "arc.legacy-bridge.previous-release.v1" ] \
+        || fail "unexpected previous-release fixture schema"
+    prior_tag="$(jq -er '.bridge_tag' "$previous_release")"
+    prior_version="${prior_tag#v}"
+    prior_node_tag="$(jq -er '.node_tag' "$previous_release")"
+    prior_node_version="${prior_node_tag#v}"
+    prior_bridge_sha256="$(jq -er --arg a "$asset" '.assets[$a].sha256' "$previous_release")"
+    prior_bridge_size="$(jq -er --arg a "$asset" '.assets[$a].size' "$previous_release")"
     prior_node_sha256=d4b19c031cf5423a8ca5ce6ddf2f3f3819b08b00032b33d00e94bf7937523f99
     mkdir -p "$state/releases/$prior_tag"
     /usr/bin/curl -fsSL --retry 3 -o "$state/releases/$prior_tag/$asset" \
         "https://github.com/FerrumVir/arc-chain/releases/download/$prior_tag/$asset"
+    [ "$(stat -c %s "$state/releases/$prior_tag/$asset")" = "$prior_bridge_size" ] \
+        || fail "the previous bridge size differs from $previous_release"
     [ "$(sha "$state/releases/$prior_tag/$asset")" = "$prior_bridge_sha256" ] \
-        || fail "the previous bridge differs from the immutable v0.7.14 launcher"
+        || fail "the previous bridge differs from $previous_release"
     chmod 0755 "$state/releases/$prior_tag/$asset"
     publish_latest "$prior_tag"
     sudo systemctl start arc-updater.service
     wait_health http://127.0.0.1:9944 60 || fail "the previous bridge did not start"
-    [ "$(cat "$arc_dir/version.txt")" = 0.7.14 ] || fail "the previous bridge update rolled back"
-    prior_exe="$(readlink "/proc/$(main_pid)/exe")"
-    [ "$prior_exe" = "$arc_dir/legacy-bridge/releases/v0.8.13/$asset" ] \
-        || fail "the fixture did not start the previous pinned node"
-    [ "$(sha "$prior_exe")" = "$prior_node_sha256" ] || fail "the previous pinned node differs"
+    [ "$(cat "$arc_dir/version.txt")" = "$prior_version" ] || fail "the previous bridge update rolled back"
     mapfile -t prior_states < <(find "$arc_dir/legacy-bridge/nodes" -maxdepth 2 -name bridge-state.json -type f)
     [ "${#prior_states[@]}" = 1 ] || fail "the previous bridge must create exactly one context"
     prior_state="${prior_states[0]}"
     prior_data="$(jq -er .node_data_dir "$prior_state")"
     prior_keyfile="$(jq -er .node_keyfile "$prior_state")"
     prior_address="$(jq -er .node_address "$prior_state")"
+    assert_running_node "$prior_node_tag" "$prior_node_version" "$prior_node_sha256" "$prior_address" \
+        "$evidence/node-info.prior-bridge.json" "$evidence/prior-bridge.argv"
     case "$prior_data" in
         "$arc_dir"/legacy-bridge/nodes/headless-*/data) ;;
         *) fail "the previous bridge used an unexpected data directory" ;;
@@ -199,8 +249,9 @@ if [ "$scenario" = previous-bridge ]; then
     cp "$prior_data/state.wal" "$evidence/prior-bridge-state.wal"
     printf 'preserve-existing-bridge-data\n' > "$prior_data/bridge-upgrade-preservation.txt"
     cp "$prior_state" "$evidence/prior-bridge-state.json"
-    updater_from_version=0.7.14
+    updater_from_version="$prior_version"
     previous_executable_sha256="$prior_bridge_sha256"
+    first_bridge_sha="$prior_bridge_sha256"
 fi
 
 log "Publish the bridge as Latest and run the real v0.7 updater"
@@ -282,22 +333,14 @@ if [ "$scenario" = previous-bridge ]; then
     [ "$(sha "$node_data/genesis.network-hash")" = "$prior_genesis_sha256" ] || fail "the update changed the persisted genesis binding"
     [ "$(cat "$node_dir/compute-consent")" = no ] || fail "the update discarded the saved compute opt-out"
     [ "$(cat "$node_data/bridge-upgrade-preservation.txt")" = preserve-existing-bridge-data ] || fail "the update discarded existing data"
-    python3 - "$evidence/prior-bridge-state.wal" "$node_data/state.wal" <<'PY'
-import sys
-from pathlib import Path
-before = Path(sys.argv[1]).read_bytes()
-with Path(sys.argv[2]).open("rb") as stream:
-    after = stream.read(len(before))
-if not before or before != after:
-    raise SystemExit("Existing bridge update discarded or rewrote the persisted WAL prefix")
-PY
+    assert_wal_prefix_preserved "$evidence/prior-bridge-state.wal" "$node_data/state.wal" "existing bridge update"
     cp "$state_json" "$evidence/updated-bridge-state.json"
 fi
 
 log "The v0.7 data is byte-identical to the moment systemd stopped v0.7"
 pre_bridge=""
 for snapshot in "$snapshots"/start-*.json; do
-    if [ "$(jq -r .binary_sha256 "$snapshot")" = "$bridge_sha" ] && [ -z "$pre_bridge" ]; then
+    if [ "$(jq -r .binary_sha256 "$snapshot")" = "$first_bridge_sha" ] && [ -z "$pre_bridge" ]; then
         pre_bridge="$snapshot"
     fi
 done
@@ -331,24 +374,28 @@ if [ "$scenario" = previous-bridge ]; then
     log "The previous bridge reopens the upgraded data and the real updater recovers again"
     sudo systemctl stop arc-node
     install -m 0755 "$state/releases/$prior_tag/$asset" "$arc_dir/bin/arc-node"
-    printf '0.7.14\n' > "$arc_dir/version.txt"
+    printf '%s\n' "$prior_version" > "$arc_dir/version.txt"
     sudo systemctl start arc-node
     wait_health http://127.0.0.1:9944 30 || fail "the previous bridge cannot reopen upgraded data"
-    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.previous-bridge-rollback.json"
-    jq -e --arg address "$prior_address" '.version == "0.8.13" and (.validator | ltrimstr("0x")) == $address' \
-        "$evidence/node-info.previous-bridge-rollback.json" >/dev/null || fail "rollback changed the identity or node version"
+    assert_running_node "$prior_node_tag" "$prior_node_version" "$prior_node_sha256" "$prior_address" \
+        "$evidence/node-info.previous-bridge-rollback.json" "$evidence/previous-bridge-rollback.argv"
     [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "rollback rewrote the private key"
+    [ "$(sha "$node_data/genesis.network-hash")" = "$prior_genesis_sha256" ] \
+        || fail "rollback changed the persisted genesis binding"
+    assert_wal_prefix_preserved "$evidence/prior-bridge-state.wal" "$node_data/state.wal" "previous-bridge downgrade"
     [ "$(cat "$node_dir/compute-consent")" = no ] || fail "rollback discarded the saved compute opt-out"
     [ "$(sha "$arc_dir/legacy-bridge/preserved/arc-node.before-bridge")" = "$legacy_node_sha256" ] \
         || fail "the second-generation bridge replaced the original rollback binary"
     sudo systemctl start arc-updater.service
     wait_health http://127.0.0.1:9944 30 || fail "the updater did not recover after rollback"
     [ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ] || fail "recovery rolled back again"
-    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.after-rollback-recovery.json"
-    jq -e --arg address "$prior_address" --arg version "$node_version" \
-        '.version == $version and (.validator | ltrimstr("0x")) == $address' \
-        "$evidence/node-info.after-rollback-recovery.json" >/dev/null || fail "recovery changed the identity or node version"
+    [ "$(sha "$arc_dir/bin/arc-node")" = "$bridge_sha" ] || fail "recovery did not install the candidate bridge"
+    assert_running_node "$node_tag" "$node_version" "$node_sha256" "$prior_address" \
+        "$evidence/node-info.after-rollback-recovery.json" "$evidence/after-rollback-recovery.argv"
     [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "recovery rewrote the private key"
+    [ "$(sha "$node_data/genesis.network-hash")" = "$prior_genesis_sha256" ] \
+        || fail "recovery changed the persisted genesis binding"
+    assert_wal_prefix_preserved "$evidence/prior-bridge-state.wal" "$node_data/state.wal" "rollback recovery"
     [ "$(cat "$node_data/bridge-upgrade-preservation.txt")" = preserve-existing-bridge-data ] \
         || fail "rollback and recovery discarded existing data"
     cp "$arc_dir/auto-update.log" "$evidence/auto-update.after-rollback-recovery.log"
@@ -419,37 +466,51 @@ fi
 
 if [ "$scenario" = previous-bridge ]; then
     log "An opted-in existing worker must pass the unmodified updater's real health deadline"
+    sudo systemctl stop arc-node
     available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
     [ "$available_kib" -ge 12582912 ] || fail "compute upgrade qualification needs a remote runner with 12 GiB available memory"
     disk_kib="$(df -Pk "$arc_dir" | awk 'END {print $4}')"
     [ "$disk_kib" -ge 10485760 ] || fail "compute upgrade qualification needs 10 GiB free disk"
-    sudo systemctl stop arc-node
     install -m 0755 "$state/releases/$prior_tag/$asset" "$arc_dir/bin/arc-node"
-    printf '0.7.14\n' > "$arc_dir/version.txt"
+    printf '%s\n' "$prior_version" > "$arc_dir/version.txt"
     "$arc_dir/bin/arc-node" --legacy-bridge-compute on --download-model > "$evidence/prior-compute-on.txt" 2>&1
     [ "$(cat "$node_dir/compute-consent")" = yes ] || fail "the fixture did not retain explicit compute opt-in"
     model_choice_sha256="$(sha "$node_dir/compute-model.json")"
+    expected_model_path="$(jq -er '.path' "$node_dir/compute-model.json")"
+    [ -f "$expected_model_path" ] || fail "verified model path missing: $expected_model_path"
     started=$(date +%s)
     sudo systemctl start arc-node
     wait_health http://127.0.0.1:9944 600 || fail "the previous opted-in worker did not become healthy"
     printf '%s\n' "$(( $(date +%s) - started ))" > "$evidence/prior-compute-start-seconds.txt"
-    tr '\0' '\n' < "/proc/$(main_pid)/cmdline" > "$evidence/prior-compute.argv"
+    assert_running_node "$prior_node_tag" "$prior_node_version" "$prior_node_sha256" "$prior_address" \
+        "$evidence/node-info.prior-compute.json" "$evidence/prior-compute.argv"
     grep -qx -- --full-integer-worker "$evidence/prior-compute.argv" || fail "the previous node was not an opted-in worker"
+    [ "$(argv_value_in "$evidence/prior-compute.argv" --model)" = "$expected_model_path" ] \
+        || fail "the previous worker did not receive the verified model path"
+    [ "$node_tag" != "$prior_node_tag" ] || fail "candidate node tag must differ from prior node tag"
+    rm -rf "${arc_dir:?}/legacy-bridge/releases/${node_tag:?}"
+    [ ! -e "$arc_dir/legacy-bridge/releases/$node_tag" ] || fail "failed to clear candidate release cache before compute upgrade"
+    [ -f "$arc_dir/legacy-bridge/releases/$prior_node_tag/$asset" ] || fail "clearing candidate cache removed the prior node payload"
+    [ -f "$expected_model_path" ] || fail "clearing candidate cache removed the verified model"
     started=$(date +%s)
     sudo systemctl start arc-updater.service
     printf '%s\n' "$(( $(date +%s) - started ))" > "$evidence/compute-update-seconds.txt"
     cp "$arc_dir/auto-update.log" "$evidence/auto-update.compute.log"
     [ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ] || fail "the real 30-second updater rolled back the opted-in worker"
-    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.compute.json"
-    jq -e --arg address "$prior_address" --arg version "$node_version" \
-        '.version == $version and (.validator | ltrimstr("0x")) == $address' \
-        "$evidence/node-info.compute.json" >/dev/null || fail "the opted-in update changed identity or version"
-    tr '\0' '\n' < "/proc/$(main_pid)/cmdline" > "$evidence/updated-compute.argv"
+    [ "$(sha "$arc_dir/bin/arc-node")" = "$bridge_sha" ] || fail "bin/arc-node is not the candidate bridge after compute update"
+    assert_running_node "$node_tag" "$node_version" "$node_sha256" "$prior_address" \
+        "$evidence/node-info.compute.json" "$evidence/updated-compute.argv"
     grep -qx -- --full-integer-worker "$evidence/updated-compute.argv" || fail "the update removed the worker role"
-    grep -qx -- --model "$evidence/updated-compute.argv" || fail "the update removed the model"
+    [ "$(argv_value_in "$evidence/updated-compute.argv" --model)" = "$expected_model_path" ] \
+        || fail "the update did not preserve the verified model path"
     [ "$(cat "$node_dir/compute-consent")" = yes ] || fail "the update discarded the compute opt-in"
     [ "$(sha "$node_dir/compute-model.json")" = "$model_choice_sha256" ] || fail "the update changed the chosen model"
     [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "the opted-in update changed the private key"
+    [ "$(sha "$node_data/genesis.network-hash")" = "$prior_genesis_sha256" ] \
+        || fail "the opted-in update changed the persisted genesis binding"
+    assert_wal_prefix_preserved "$evidence/prior-bridge-state.wal" "$node_data/state.wal" "opted-in worker update"
+    [ "$(sha "$arc_dir/legacy-bridge/preserved/arc-node.before-bridge")" = "$legacy_node_sha256" ] \
+        || fail "the opted-in update replaced the original rollback binary"
     sudo systemctl stop arc-node
 fi
 

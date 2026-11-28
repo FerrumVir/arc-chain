@@ -34,6 +34,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Recompute every pin from the release and its owner signature
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/legacy-bridge/pin-release.py --check
 
   build:

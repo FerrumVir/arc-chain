@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -61,6 +62,28 @@ def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "arc-legacy-bridge-pin-release"})
     with urllib.request.urlopen(request, timeout=60) as response:
         return response.read()
+
+
+class RejectMetadataRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def release_metadata(tag: str) -> dict:
+    headers = {"User-Agent": "arc-legacy-bridge-pin-release", "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}",
+        headers=headers,
+    )
+    opener = urllib.request.build_opener(RejectMetadataRedirects())
+    with opener.open(request, timeout=60) as response:
+        payload = response.read(4 * 1024 * 1024 + 1)
+    if len(payload) > 4 * 1024 * 1024:
+        raise ValueError("Release metadata exceeds 4 MiB; inspect the release assets before pinning")
+    return json.loads(payload)
 
 
 def git_show(tag: str, path: str) -> str:
@@ -129,7 +152,7 @@ def model_pin(tag: str, previous: dict | None) -> dict:
 
 
 def build_pins(tag: str, bridge_version: str, previous: dict | None) -> dict:
-    release = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}"))
+    release = release_metadata(tag)
     problems = []
     if release.get("draft") or release.get("prerelease"):
         problems.append("draft or prerelease")

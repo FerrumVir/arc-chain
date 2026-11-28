@@ -243,9 +243,7 @@ fn parse_candidate_version(stdout: &str) -> Option<CandidateBinaryVersion> {
     }
     let (version, target_with_close) = rest.split_once(BRIDGE_VERSION_MARKER)?;
     let target_node = target_with_close.strip_suffix(')')?;
-    if parse_version(version).is_none() {
-        return None;
-    }
+    parse_version(version)?;
     if target_node != "unknown" && parse_version(target_node).is_none() {
         return None;
     }
