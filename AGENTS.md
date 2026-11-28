@@ -540,17 +540,24 @@ headless updaters pull on their existing schedule; v0.7 desktop app updates
 still require their local update check. Neither path supplies remote control
 or proves a count of active operators. Bridge compute consent choices are
 unchanged: absent consent, saved opt-outs and v0.7 desktops remain observers.
-For consenting headless nodes with a verified model, the bridge defaults to
-`auto` worker mode (persisted separately in `compute-worker-mode` so
-`BridgeState` keeps its v0.7.14 schema): when optional `shard_worker` pins
-(derived from the tag's `install.sh` by `pin-release.py`) are present, it
-checks fresh host memory (16 GB nominal floor, 6 GiB available, 4 GiB OS
-reserve, half-visible cap), runs a bounded 10-second
-`community-shard-worker --check-only` preflight requiring at least 6 admitted
-layers, rechecks memory after preflight, and launches `--community-shard-worker`
-(rewards disabled) without whole-model flags; `auto` falls back to
-`--full-integer-worker`, explicit `full` bypasses preflight, and explicit
-`shard` fails closed.
+For consenting headless nodes with a verified regular model file (symlinked
+model paths are rejected before compute activation for every role), the bridge
+defaults to `auto` worker mode (persisted separately in `compute-worker-mode`
+so `BridgeState` keeps its v0.7.14 schema): on Linux and macOS, when optional
+`shard_worker` pins (derived from the tag's `install.sh` by `pin-release.py`)
+are present, it checks fresh host memory (16 GB nominal floor, 6 GiB available,
+4 GiB OS reserve, half-visible cap, clamped on Linux by effective cgroup v1/v2
+limits including ancestors), runs a bounded 10-second unverified
+header-admission check (`community-shard-worker --check-header-only`, requiring
+exact outer fields with `mode="header-admission-only"`, `artifact_verified=false`,
+and at least 6 admitted layers), rechecks memory after preflight, and launches
+`--community-shard-worker` (rewards disabled) without whole-model flags. The
+launched `arc-node` still performs full-file BLAKE3 model verification after
+early `/health` bind before registration or weights (`install.sh` retains full
+`--check-only`); non-Unix platforms fail closed before probing or spawning, and
+the checked-in `v0.8.27` pin lacks `--check-header-only`, so `auto` falls back
+to `--full-integer-worker` until `v0.8.28` is published and repinned. Explicit
+`full` bypasses preflight, and explicit `shard` fails closed.
 Rollback and original-binary preservation classify exact version output and
 reject every bridge executable, including an older bridge version. An existing
 preserved original is never replaced by a later updater's previous binary.

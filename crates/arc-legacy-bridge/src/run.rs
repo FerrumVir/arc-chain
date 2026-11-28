@@ -74,7 +74,7 @@ fresh data directory. Compute stays off until you opt in.
 
 Consenting headless nodes default to --worker-mode auto: when the pinned
 release provides shard pins and this machine passes fresh memory and
---check-only preflight, the node runs as a partial-shard worker (with
+--check-header-only preflight, the node runs as a partial-shard worker (with
 rewards disabled); otherwise auto falls back to the full integer worker.
 Explicit shard mode fails closed if qualification fails; explicit full
 mode skips partial-shard preflight.
@@ -836,12 +836,14 @@ mod tests {
             "--legacy-bridge-compute off",
             "--legacy-bridge-worker-mode",
             "--worker-mode auto|shard|full",
+            "--check-header-only preflight",
             "rewards disabled",
             "--legacy-bridge-verify-archive",
             "--legacy-bridge-rollback",
         ] {
             assert!(help.contains(command), "{command}");
         }
+        assert!(!help.contains("--check-only preflight"));
     }
 
     #[test]

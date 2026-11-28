@@ -11,15 +11,25 @@ how many independent operator machines are currently online.
 This update reaches a legacy headless installation when its existing daily
 updater next runs. It preserves an existing bridge's identity, data and saved
 compute choice. Absent consent, saved compute opt-outs and v0.7 desktop
-installations remain observer-only. For already-consenting headless bridges with
-a verified model, the launcher defaults to `--worker-mode auto`: when the
-compiled pins include `shard_worker` (derived from the pinned release's
-`install.sh` via `pin-release.py --write`) and the host passes fresh memory
-qualification (nominal 16 GB floor, 6 GiB available, 4 GiB OS reserve,
-half-visible cap) and a bounded `community-shard-worker --check-only` preflight
-(at least 6 admitted layers) plus a post-preflight memory recheck, it starts
-the node with `--community-shard-worker` (rewards disabled). Otherwise `auto`
-falls back to `--full-integer-worker`. Operators can persist an explicit
+installations remain observer-only, and symlinked model paths are rejected
+before compute activation for every role. For already-consenting headless
+bridges with a verified regular model file, the launcher defaults to
+`--worker-mode auto`: on Linux and macOS, when the compiled pins include
+`shard_worker` (derived from the pinned release's `install.sh` via
+`pin-release.py --write`) and the host passes fresh memory qualification
+(nominal 16 GB floor, 6 GiB available, 4 GiB OS reserve, half-visible cap,
+clamped on Linux by effective cgroup v1/v2 limits including ancestors) and a
+bounded 10-second unverified header-admission check
+(`community-shard-worker --check-header-only`, requiring exact outer fields
+with `mode="header-admission-only"`, `artifact_verified=false`, and at least
+6 admitted layers) plus a post-preflight memory recheck, it starts the node
+with `--community-shard-worker` (rewards disabled). The launched `arc-node`
+still performs mandatory full-file BLAKE3 model verification after binding
+early `/health` and before worker registration or weight preparation, while
+`install.sh` keeps its full `--check-only` check unchanged. Non-Unix platforms
+fail closed before probing or spawning; the current checked-in `v0.8.27` pin
+lacks `--check-header-only`, so `auto` falls back to `--full-integer-worker`
+until `v0.8.28` is published and repinned. Operators can persist an explicit
 override in `compute-worker-mode` (`--legacy-bridge-worker-mode auto|shard|full`
 or `--legacy-bridge-compute on --worker-mode ...`) without mutating
 `BridgeState`'s v0.7.14 schema or saved compute consent: `full` bypasses

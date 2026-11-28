@@ -3,11 +3,19 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::ExitStatus;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::Instant;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -18,6 +26,7 @@ use crate::exit;
 use crate::layout::Layout;
 use crate::logging::Log;
 use crate::pins::{Pins, SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR, ShardWorkerPin};
+#[cfg(unix)]
 use crate::release;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -29,9 +38,12 @@ pub const MARKETED_RAM_SIZES_GB: &[u64] = &[
 pub const MAX_RESERVED_RAM_PERCENT: u64 = 15;
 pub const SHARD_RESERVE_RAM_BYTES: u64 = 4 * GIB;
 pub const SHARD_MIN_AVAILABLE_BYTES: u64 = 6 * GIB;
-pub const CHECK_ONLY_TIMEOUT: Duration = Duration::from_secs(10);
-pub const CHECK_ONLY_STDOUT_CAP_BYTES: usize = 256 * 1024;
-pub const CHECK_ONLY_STDERR_CAP_BYTES: usize = 16 * 1024;
+pub const HEADER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const HEADER_CHECK_STDOUT_CAP_BYTES: usize = 256 * 1024;
+pub const HEADER_CHECK_STDERR_CAP_BYTES: usize = 16 * 1024;
+const CGROUP_FILE_MAX_BYTES: u64 = 4096;
+const CGROUP_V1_UNBOUNDED_THRESHOLD_BYTES: u64 = 1u64 << 60;
+const HEADER_ADMISSION_REPORT_MODE: &str = "header-admission-only";
 
 #[cfg(target_os = "macos")]
 const SYSTEM_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -141,6 +153,7 @@ pub struct BoundedOutput {
 
 #[derive(Debug)]
 pub enum BoundedCommandError {
+    UnsupportedPlatform,
     Spawn(io::Error),
     Wait(io::Error),
     Timeout(Duration),
@@ -157,6 +170,10 @@ pub enum BoundedCommandError {
 impl fmt::Display for BoundedCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedPlatform => write!(
+                f,
+                "bounded process-group command execution is supported only on Unix"
+            ),
             Self::Spawn(error) => write!(f, "could not spawn child process: {error}"),
             Self::Wait(error) => write!(f, "could not wait for child process: {error}"),
             Self::Timeout(timeout) => write!(f, "timed out after {} ms", timeout.as_millis()),
@@ -345,11 +362,410 @@ fn parse_macos_page_size(header: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("invalid vm_stat page size in {header:?}"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeclaredMemoryCgroup {
+    None,
+    V1(String),
+    V2(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgroupMountKind {
+    V1Memory,
+    V2Unified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CgroupMount {
+    kind: CgroupMountKind,
+    root: String,
+    mount_point: String,
+}
+
+fn validate_absolute_cgroup_path(path: &str, label: &str) -> std::result::Result<(), String> {
+    let has_forbidden_byte = path
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b'\\');
+    if !path.starts_with('/') || has_forbidden_byte {
+        return Err(format!("{label} contains an invalid path {path:?}"));
+    }
+    if path == "/" {
+        return Ok(());
+    }
+    for component in path[1..].split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(format!(
+                "{label} contains an invalid or escaping path component in {path:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unescape_mountinfo_field(raw: &str, label: &str) -> std::result::Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len() {
+                return Err(format!("{label} has a truncated escape sequence {raw:?}"));
+            }
+            let mut value = 0u16;
+            for &digit in &bytes[index + 1..index + 4] {
+                if !(b'0'..=b'7').contains(&digit) {
+                    return Err(format!("{label} has an invalid octal escape in {raw:?}"));
+                }
+                value = value * 8 + u16::from(digit - b'0');
+            }
+            let byte = u8::try_from(value)
+                .map_err(|_| format!("{label} has an out-of-range octal escape in {raw:?}"))?;
+            if byte.is_ascii_control() {
+                return Err(format!("{label} decodes to a control byte in {raw:?}"));
+            }
+            decoded.push(byte);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| format!("{label} is not valid UTF-8"))
+}
+
+fn parse_proc_self_cgroup(text: &str) -> std::result::Result<DeclaredMemoryCgroup, String> {
+    let mut v1_memory: Option<String> = None;
+    let mut v2_unified: Option<String> = None;
+
+    for line in text.lines() {
+        let Some((hierarchy_raw, rest)) = line.split_once(':') else {
+            return Err(format!("malformed line in /proc/self/cgroup: {line:?}"));
+        };
+        let Some((controllers, cgroup_path)) = rest.split_once(':') else {
+            return Err(format!("malformed line in /proc/self/cgroup: {line:?}"));
+        };
+        let hierarchy_id = parse_canonical_u64(hierarchy_raw)
+            .ok_or_else(|| format!("invalid hierarchy id in /proc/self/cgroup: {line:?}"))?;
+        validate_absolute_cgroup_path(cgroup_path, "/proc/self/cgroup path")?;
+        if hierarchy_id == 0 {
+            if !controllers.is_empty() {
+                return Err(format!(
+                    "malformed unified hierarchy entry in /proc/self/cgroup: {line:?}"
+                ));
+            }
+            if v2_unified.is_some() {
+                return Err("duplicate cgroup v2 entry in /proc/self/cgroup".to_string());
+            }
+            v2_unified = Some(cgroup_path.to_string());
+        } else if controllers.split(',').any(|ctrl| ctrl == "memory") {
+            if v1_memory.is_some() {
+                return Err("duplicate cgroup v1 memory entry in /proc/self/cgroup".to_string());
+            }
+            v1_memory = Some(cgroup_path.to_string());
+        }
+    }
+
+    if let Some(path) = v1_memory {
+        Ok(DeclaredMemoryCgroup::V1(path))
+    } else if let Some(path) = v2_unified {
+        Ok(DeclaredMemoryCgroup::V2(path))
+    } else {
+        Ok(DeclaredMemoryCgroup::None)
+    }
+}
+
+fn parse_proc_self_mountinfo(text: &str) -> std::result::Result<Vec<CgroupMount>, String> {
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+            return Err(format!(
+                "malformed entry without separator in /proc/self/mountinfo: {line:?}"
+            ));
+        };
+        if separator < 6 || fields.len() < separator + 4 {
+            return Err(format!("truncated entry in /proc/self/mountinfo: {line:?}"));
+        }
+        let fs_type = fields[separator + 1];
+        let super_options = fields[separator + 3];
+        let kind = if fs_type == "cgroup2" {
+            Some(CgroupMountKind::V2Unified)
+        } else if fs_type == "cgroup" && super_options.split(',').any(|opt| opt == "memory") {
+            Some(CgroupMountKind::V1Memory)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            let root = unescape_mountinfo_field(fields[3], "/proc/self/mountinfo root")?;
+            let mount_point =
+                unescape_mountinfo_field(fields[4], "/proc/self/mountinfo mount point")?;
+            validate_absolute_cgroup_path(&root, "/proc/self/mountinfo root")?;
+            validate_absolute_cgroup_path(&mount_point, "/proc/self/mountinfo mount point")?;
+            mounts.push(CgroupMount {
+                kind,
+                root,
+                mount_point,
+            });
+        }
+    }
+    Ok(mounts)
+}
+
+fn relative_cgroup_path<'a>(mount_root: &str, cgroup_path: &'a str) -> Option<&'a str> {
+    if mount_root == "/" {
+        Some(cgroup_path.trim_start_matches('/'))
+    } else if cgroup_path == mount_root {
+        Some("")
+    } else {
+        cgroup_path
+            .strip_prefix(mount_root)
+            .and_then(|rest| rest.strip_prefix('/'))
+    }
+}
+
+fn select_cgroup_mount<'a, 'b>(
+    mounts: &'a [CgroupMount],
+    wanted: CgroupMountKind,
+    cgroup_path: &'b str,
+) -> Option<(&'a CgroupMount, &'b str)> {
+    let mut best: Option<(&'a CgroupMount, &'b str)> = None;
+    for mount in mounts {
+        if mount.kind != wanted {
+            continue;
+        }
+        if let Some(relative) = relative_cgroup_path(&mount.root, cgroup_path)
+            && best.is_none_or(|(current, _)| mount.root.len() < current.root.len())
+        {
+            best = Some((mount, relative));
+        }
+    }
+    best
+}
+
+fn cgroup_hierarchy_dirs(fs_root: &Path, mount_point: &str, relative: &str) -> Vec<PathBuf> {
+    let mut current = fs_root.to_path_buf();
+    if mount_point != "/" {
+        for component in mount_point[1..].split('/') {
+            current = current.join(component);
+        }
+    }
+    let mut dirs = vec![current.clone()];
+    if !relative.is_empty() {
+        for component in relative.split('/') {
+            current = current.join(component);
+            dirs.push(current.clone());
+        }
+    }
+    dirs
+}
+
+fn ensure_regular_cgroup_dir(dir: &Path) -> std::result::Result<(), String> {
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect cgroup directory {}: {error}", dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!(
+            "cgroup directory {} must be a real non-symlink directory",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_cgroup_file(path: &Path) -> std::result::Result<Option<String>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect cgroup file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "cgroup file {} must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+    let file = fs::File::open(path)
+        .map_err(|error| format!("cannot read cgroup file {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(CGROUP_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read cgroup file {}: {error}", path.display()))?;
+    if bytes.len() as u64 > CGROUP_FILE_MAX_BYTES {
+        return Err(format!(
+            "cgroup file {} exceeds the {CGROUP_FILE_MAX_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("cgroup file {} is not valid UTF-8", path.display()))?;
+    Ok(Some(text))
+}
+
+fn record_finite_cgroup_bound(
+    effective_limit: &mut Option<u64>,
+    effective_headroom: &mut Option<u64>,
+    limit: u64,
+    usage: u64,
+) {
+    *effective_limit = Some(effective_limit.map_or(limit, |current| current.min(limit)));
+    let headroom = limit.saturating_sub(usage);
+    *effective_headroom =
+        Some(effective_headroom.map_or(headroom, |current| current.min(headroom)));
+}
+
+pub fn apply_linux_cgroup_memory_limits(
+    host: HostMemory,
+    proc_cgroup_text: &str,
+    proc_mountinfo_text: &str,
+    fs_root: &Path,
+) -> std::result::Result<HostMemory, String> {
+    let declared = parse_proc_self_cgroup(proc_cgroup_text)?;
+    let mounts = parse_proc_self_mountinfo(proc_mountinfo_text)?;
+    let mut effective_limit: Option<u64> = None;
+    let mut effective_headroom: Option<u64> = None;
+
+    match declared {
+        DeclaredMemoryCgroup::None => return Ok(host),
+        DeclaredMemoryCgroup::V2(cgroup_path) => {
+            let found = select_cgroup_mount(&mounts, CgroupMountKind::V2Unified, &cgroup_path);
+            let Some((mount, relative)) = found else {
+                return Err(format!(
+                    "no matching cgroup2 mount in /proc/self/mountinfo covers {cgroup_path:?}"
+                ));
+            };
+            let dirs = cgroup_hierarchy_dirs(fs_root, &mount.mount_point, relative);
+            for (index, dir) in dirs.iter().enumerate() {
+                ensure_regular_cgroup_dir(dir)?;
+                let is_system_root = index == 0 && mount.root == "/";
+                let max_path = dir.join("memory.max");
+                match read_bounded_cgroup_file(&max_path)? {
+                    Some(raw_max) => {
+                        let trimmed = raw_max.trim();
+                        if trimmed == "max" {
+                            continue;
+                        }
+                        let Some(limit) = parse_canonical_u64(trimmed) else {
+                            return Err(format!(
+                                "malformed cgroup v2 limit in {}",
+                                max_path.display()
+                            ));
+                        };
+                        let current_path = dir.join("memory.current");
+                        let Some(raw_current) = read_bounded_cgroup_file(&current_path)? else {
+                            return Err(format!(
+                                "missing cgroup v2 usage file {}",
+                                current_path.display()
+                            ));
+                        };
+                        let Some(usage) = parse_canonical_u64(raw_current.trim()) else {
+                            return Err(format!(
+                                "malformed cgroup v2 usage in {}",
+                                current_path.display()
+                            ));
+                        };
+                        record_finite_cgroup_bound(
+                            &mut effective_limit,
+                            &mut effective_headroom,
+                            limit,
+                            usage,
+                        );
+                    }
+                    None if is_system_root => {}
+                    None => {
+                        let controllers_path = dir.join("cgroup.controllers");
+                        let controllers = read_bounded_cgroup_file(&controllers_path)?;
+                        let Some(raw_controllers) = controllers else {
+                            return Err(format!(
+                                "missing cgroup v2 control files in {}",
+                                dir.display()
+                            ));
+                        };
+                        if raw_controllers.split_whitespace().any(|c| c == "memory") {
+                            return Err(format!(
+                                "cgroup v2 directory {} declares memory controller without memory.max",
+                                dir.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        DeclaredMemoryCgroup::V1(cgroup_path) => {
+            let found = select_cgroup_mount(&mounts, CgroupMountKind::V1Memory, &cgroup_path);
+            let Some((mount, relative)) = found else {
+                return Err(format!(
+                    "no matching cgroup v1 memory mount in /proc/self/mountinfo covers {cgroup_path:?}"
+                ));
+            };
+            let dirs = cgroup_hierarchy_dirs(fs_root, &mount.mount_point, relative);
+            for dir in &dirs {
+                ensure_regular_cgroup_dir(dir)?;
+                let limit_path = dir.join("memory.limit_in_bytes");
+                let usage_path = dir.join("memory.usage_in_bytes");
+                let Some(raw_limit) = read_bounded_cgroup_file(&limit_path)? else {
+                    return Err(format!(
+                        "missing cgroup v1 limit file {}",
+                        limit_path.display()
+                    ));
+                };
+                let Some(limit) = parse_canonical_u64(raw_limit.trim()) else {
+                    return Err(format!(
+                        "malformed cgroup v1 limit in {}",
+                        limit_path.display()
+                    ));
+                };
+                let Some(raw_usage) = read_bounded_cgroup_file(&usage_path)? else {
+                    return Err(format!(
+                        "missing cgroup v1 usage file {}",
+                        usage_path.display()
+                    ));
+                };
+                let Some(usage) = parse_canonical_u64(raw_usage.trim()) else {
+                    return Err(format!(
+                        "malformed cgroup v1 usage in {}",
+                        usage_path.display()
+                    ));
+                };
+                if limit < CGROUP_V1_UNBOUNDED_THRESHOLD_BYTES {
+                    record_finite_cgroup_bound(
+                        &mut effective_limit,
+                        &mut effective_headroom,
+                        limit,
+                        usage,
+                    );
+                }
+            }
+        }
+    }
+
+    let visible_bytes = match effective_limit {
+        Some(limit) => host.visible_bytes.min(limit),
+        None => host.visible_bytes,
+    };
+    let available_bytes = match effective_headroom {
+        Some(headroom) => host.available_bytes.min(headroom).min(visible_bytes),
+        None => host.available_bytes.min(visible_bytes),
+    };
+    Ok(HostMemory {
+        visible_bytes,
+        available_bytes,
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
-    let text = fs::read_to_string("/proc/meminfo")
+    let meminfo_text = fs::read_to_string("/proc/meminfo")
         .map_err(|error| format!("cannot read /proc/meminfo: {error}"))?;
-    parse_linux_meminfo(&text)
+    let host = parse_linux_meminfo(&meminfo_text)?;
+    let cgroup_text = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|error| format!("cannot read /proc/self/cgroup: {error}"))?;
+    let mountinfo_text = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("cannot read /proc/self/mountinfo: {error}"))?;
+    apply_linux_cgroup_memory_limits(host, &cgroup_text, &mountinfo_text, Path::new("/"))
 }
 
 #[cfg(target_os = "macos")]
@@ -359,7 +775,7 @@ pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
         &[OsString::from("-n"), OsString::from("hw.memsize")],
         SYSTEM_PROBE_TIMEOUT,
         SYSTEM_PROBE_OUTPUT_CAP_BYTES,
-        CHECK_ONLY_STDERR_CAP_BYTES,
+        HEADER_CHECK_STDERR_CAP_BYTES,
     )
     .map_err(|error| format!("sysctl hw.memsize failed: {error}"))?;
     if !memsize_output.status.success() {
@@ -379,7 +795,7 @@ pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
         &[],
         SYSTEM_PROBE_TIMEOUT,
         SYSTEM_PROBE_OUTPUT_CAP_BYTES,
-        CHECK_ONLY_STDERR_CAP_BYTES,
+        HEADER_CHECK_STDERR_CAP_BYTES,
     )
     .map_err(|error| format!("vm_stat failed: {error}"))?;
     if !vm_output.status.success() {
@@ -399,12 +815,14 @@ pub fn measure_host_memory() -> std::result::Result<HostMemory, String> {
     Err("headless shard worker is not supported on this platform".to_string())
 }
 
+#[cfg(unix)]
 struct StreamStatus {
     done: AtomicBool,
     overflow: AtomicBool,
     read_error: AtomicBool,
 }
 
+#[cfg(unix)]
 impl StreamStatus {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -415,8 +833,10 @@ impl StreamStatus {
     }
 }
 
+#[cfg(unix)]
 struct StreamDoneGuard(Arc<StreamStatus>);
 
+#[cfg(unix)]
 impl Drop for StreamDoneGuard {
     fn drop(&mut self) {
         if thread::panicking() {
@@ -426,6 +846,7 @@ impl Drop for StreamDoneGuard {
     }
 }
 
+#[cfg(unix)]
 enum BoundedWaitOutcome {
     Exited(ExitStatus),
     Timeout,
@@ -434,6 +855,7 @@ enum BoundedWaitOutcome {
     WaitError(io::Error),
 }
 
+#[cfg(unix)]
 fn read_capped_stream<R: Read>(
     mut reader: R,
     limit: usize,
@@ -462,8 +884,8 @@ fn read_capped_stream<R: Read>(
     }
 }
 
+#[cfg(unix)]
 fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
     if let Some(pgid) = libc::pid_t::try_from(child.id())
         .ok()
         .filter(|pgid| *pgid > 0)
@@ -476,6 +898,18 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[cfg(not(unix))]
+pub fn run_bounded_command(
+    _program: &Path,
+    _args: &[OsString],
+    _timeout: Duration,
+    _stdout_cap: usize,
+    _stderr_cap: usize,
+) -> std::result::Result<BoundedOutput, BoundedCommandError> {
+    Err(BoundedCommandError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
 pub fn run_bounded_command(
     program: &Path,
     args: &[OsString],
@@ -483,17 +917,15 @@ pub fn run_bounded_command(
     stdout_cap: usize,
     stderr_cap: usize,
 ) -> std::result::Result<BoundedOutput, BoundedCommandError> {
+    use std::os::unix::process::CommandExt;
+
     let mut command = release::quiet_command(program);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command.spawn().map_err(BoundedCommandError::Spawn)?;
     let Some(stdout_pipe) = child.stdout.take() else {
         terminate_child(&mut child);
@@ -635,37 +1067,45 @@ pub fn run_bounded_command(
 }
 
 #[derive(Deserialize)]
-struct CheckOnlyAdmissionReport {
+struct HeaderAdmissionEstimateReport {
     admitted_max_resident_layers: usize,
 }
 
 #[derive(Deserialize)]
-struct CheckOnlyReport {
+#[serde(deny_unknown_fields)]
+struct HeaderAdmissionReport {
     mode: String,
+    artifact_verified: bool,
     coordinator_url: String,
     coordinator_id: String,
     transaction_domain: String,
-    model_id: String,
+    expected_model_id: String,
     max_working_set_bytes: u64,
-    admission: CheckOnlyAdmissionReport,
+    admission: HeaderAdmissionEstimateReport,
 }
 
-pub fn parse_and_verify_check_only_report(
+pub fn parse_and_verify_header_admission_report(
     stdout: &[u8],
     pin: &ShardWorkerPin,
     expected_budget: u64,
 ) -> std::result::Result<usize, String> {
     if stdout.is_empty() {
-        return Err("community-shard-worker --check-only produced empty output".to_string());
+        return Err("community-shard-worker --check-header-only produced empty output".to_string());
     }
-    let report: CheckOnlyReport = serde_json::from_slice(stdout).map_err(|error| {
-        format!("community-shard-worker --check-only produced invalid JSON: {error}")
+    let report: HeaderAdmissionReport = serde_json::from_slice(stdout).map_err(|error| {
+        format!("community-shard-worker --check-header-only produced invalid JSON: {error}")
     })?;
-    if report.mode != "check-only" {
+    if report.mode != HEADER_ADMISSION_REPORT_MODE {
         return Err(format!(
-            "community-shard-worker --check-only returned unexpected mode {:?}",
+            "community-shard-worker --check-header-only returned unexpected mode {:?}",
             report.mode
         ));
+    }
+    if report.artifact_verified {
+        return Err(
+            "community-shard-worker --check-header-only must report artifact_verified=false"
+                .to_string(),
+        );
     }
     let normalized_url = report
         .coordinator_url
@@ -673,22 +1113,28 @@ pub fn parse_and_verify_check_only_report(
         .unwrap_or(&report.coordinator_url);
     if normalized_url != pin.coordinator_url {
         return Err(format!(
-            "community-shard-worker --check-only coordinator_url {:?} did not match pinned {}",
+            "community-shard-worker --check-header-only coordinator_url {:?} did not match pinned {}",
             report.coordinator_url, pin.coordinator_url
         ));
     }
     if report.coordinator_id != pin.coordinator_id {
-        return Err("community-shard-worker --check-only coordinator_id mismatch".to_string());
+        return Err(
+            "community-shard-worker --check-header-only coordinator_id mismatch".to_string(),
+        );
     }
     if report.transaction_domain != pin.transaction_domain {
-        return Err("community-shard-worker --check-only transaction_domain mismatch".to_string());
+        return Err(
+            "community-shard-worker --check-header-only transaction_domain mismatch".to_string(),
+        );
     }
-    if report.model_id != pin.expected_model_id {
-        return Err("community-shard-worker --check-only model_id mismatch".to_string());
+    if report.expected_model_id != pin.expected_model_id {
+        return Err(
+            "community-shard-worker --check-header-only expected_model_id mismatch".to_string(),
+        );
     }
     if report.max_working_set_bytes != expected_budget {
         return Err(format!(
-            "community-shard-worker --check-only max_working_set_bytes {} did not match {expected_budget}",
+            "community-shard-worker --check-header-only max_working_set_bytes {} did not match {expected_budget}",
             report.max_working_set_bytes
         ));
     }
@@ -704,7 +1150,7 @@ pub fn parse_and_verify_check_only_report(
     Ok(report.admission.admitted_max_resident_layers)
 }
 
-fn check_only_args(
+fn header_check_args(
     pin: &ShardWorkerPin,
     model: &Path,
     max_working_set_bytes: u64,
@@ -730,7 +1176,7 @@ fn check_only_args(
         OsString::from(required_layers.to_string()),
         OsString::from("--threads"),
         OsString::from("1"),
-        OsString::from("--check-only"),
+        OsString::from("--check-header-only"),
     ]
 }
 
@@ -749,6 +1195,9 @@ fn try_qualify_shard(
     preflight_timeout: Duration,
     mut measure_memory: impl FnMut() -> std::result::Result<HostMemory, String>,
 ) -> std::result::Result<WorkerLaunchRole, String> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err("headless shard worker is not supported on this platform".to_string());
+    }
     let Some(pin) = pins.shard_worker.as_ref() else {
         return Err("the pinned release does not include a shard worker configuration".to_string());
     };
@@ -767,29 +1216,29 @@ fn try_qualify_shard(
     let required_layers = pin
         .required_admitted_layers
         .max(SHARD_REQUIRED_ADMITTED_LAYERS_FLOOR);
-    let args = check_only_args(pin, model, preflight_budget, required_layers);
+    let args = header_check_args(pin, model, preflight_budget, required_layers);
     let output = run_bounded_command(
         node_binary,
         &args,
         preflight_timeout,
-        CHECK_ONLY_STDOUT_CAP_BYTES,
-        CHECK_ONLY_STDERR_CAP_BYTES,
+        HEADER_CHECK_STDOUT_CAP_BYTES,
+        HEADER_CHECK_STDERR_CAP_BYTES,
     )
-    .map_err(|error| format!("community-shard-worker --check-only failed: {error}"))?;
+    .map_err(|error| format!("community-shard-worker --check-header-only failed: {error}"))?;
     if !output.status.success() {
         return Err(match first_stderr_line(&output.stderr) {
             Some(line) => format!(
-                "community-shard-worker --check-only exited with {}: {line}",
+                "community-shard-worker --check-header-only exited with {}: {line}",
                 output.status
             ),
             None => format!(
-                "community-shard-worker --check-only exited with {}",
+                "community-shard-worker --check-header-only exited with {}",
                 output.status
             ),
         });
     }
     let admitted_layers =
-        parse_and_verify_check_only_report(&output.stdout, pin, preflight_budget)?;
+        parse_and_verify_header_admission_report(&output.stdout, pin, preflight_budget)?;
 
     let launch_memory = measure_memory()?;
     let launch_budget = qualify_host_memory(launch_memory)?;
@@ -830,7 +1279,7 @@ pub fn resolve_worker_role(
         node_binary,
         model,
         log,
-        CHECK_ONLY_TIMEOUT,
+        HEADER_CHECK_TIMEOUT,
         measure_host_memory,
     )
 }
@@ -894,20 +1343,36 @@ mod tests {
         pins
     }
 
-    fn valid_report_json(pin: &ShardWorkerPin, budget: u64, layers: usize) -> serde_json::Value {
+    fn valid_header_admission_report_json(
+        pin: &ShardWorkerPin,
+        budget: u64,
+        layers: usize,
+    ) -> serde_json::Value {
         serde_json::json!({
-            "mode": "check-only",
+            "mode": HEADER_ADMISSION_REPORT_MODE,
+            "artifact_verified": false,
             "coordinator_url": pin.coordinator_url,
             "coordinator_id": pin.coordinator_id,
             "transaction_domain": pin.transaction_domain,
-            "model_id": pin.expected_model_id,
+            "expected_model_id": pin.expected_model_id,
             "max_working_set_bytes": budget,
-            "future_additive_field": "allowed",
             "admission": {
                 "admitted_max_resident_layers": layers,
                 "future_nested_field": 1
             }
         })
+    }
+
+    fn write_fixture_file(root: &Path, relative: &str, content: &str) -> PathBuf {
+        let mut path = root.to_path_buf();
+        for part in relative.split('/') {
+            path = path.join(part);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content.as_bytes()).unwrap();
+        path
     }
 
     #[test]
@@ -1095,67 +1560,533 @@ Pages inactive: 2000.
     }
 
     #[test]
-    fn check_only_report_validation_checks_all_pinned_fields() {
+    fn header_admission_report_validation_checks_all_pinned_fields() {
+        assert_eq!(HEADER_CHECK_TIMEOUT, Duration::from_secs(10));
         let pin = sample_pin();
         let budget = 8 * GIB;
-        let valid = serde_json::to_vec(&valid_report_json(&pin, budget, 6)).unwrap();
+        let valid =
+            serde_json::to_vec(&valid_header_admission_report_json(&pin, budget, 6)).unwrap();
         assert_eq!(
-            parse_and_verify_check_only_report(&valid, &pin, budget).unwrap(),
+            parse_and_verify_header_admission_report(&valid, &pin, budget).unwrap(),
             6
         );
 
-        let mut trailing_slash = valid_report_json(&pin, budget, 8);
+        let mut trailing_slash = valid_header_admission_report_json(&pin, budget, 8);
         trailing_slash["coordinator_url"] = serde_json::json!("https://149.28.153.31/");
         let bytes = serde_json::to_vec(&trailing_slash).unwrap();
         assert_eq!(
-            parse_and_verify_check_only_report(&bytes, &pin, budget).unwrap(),
+            parse_and_verify_header_admission_report(&bytes, &pin, budget).unwrap(),
             8
         );
 
-        assert!(parse_and_verify_check_only_report(b"", &pin, budget).is_err());
-        assert!(parse_and_verify_check_only_report(b"not-json", &pin, budget).is_err());
+        assert!(parse_and_verify_header_admission_report(b"", &pin, budget).is_err());
+        assert!(parse_and_verify_header_admission_report(b"not-json", &pin, budget).is_err());
 
-        let mut bad_mode = valid_report_json(&pin, budget, 6);
-        bad_mode["mode"] = serde_json::json!("run");
-        assert!(
-            parse_and_verify_check_only_report(
-                &serde_json::to_vec(&bad_mode).unwrap(),
-                &pin,
-                budget
-            )
-            .is_err()
-        );
-
-        let mut bad_url = valid_report_json(&pin, budget, 6);
-        bad_url["coordinator_url"] = serde_json::json!("https://149.28.153.31//");
-        assert!(
-            parse_and_verify_check_only_report(
-                &serde_json::to_vec(&bad_url).unwrap(),
-                &pin,
-                budget
-            )
-            .is_err()
-        );
-
-        for field in ["coordinator_id", "transaction_domain", "model_id"] {
-            let mut tampered = valid_report_json(&pin, budget, 6);
-            tampered[field] = serde_json::json!("1".repeat(64));
+        for bad_mode_value in ["check-only", "run"] {
+            let mut bad_mode = valid_header_admission_report_json(&pin, budget, 6);
+            bad_mode["mode"] = serde_json::json!(bad_mode_value);
+            let bytes = serde_json::to_vec(&bad_mode).unwrap();
             assert!(
-                parse_and_verify_check_only_report(
-                    &serde_json::to_vec(&tampered).unwrap(),
-                    &pin,
-                    budget
-                )
-                .is_err(),
+                parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err(),
+                "{bad_mode_value}"
+            );
+        }
+
+        let mut verified_true = valid_header_admission_report_json(&pin, budget, 6);
+        verified_true["artifact_verified"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec(&verified_true).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        let mut missing_verified = valid_header_admission_report_json(&pin, budget, 6);
+        missing_verified
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_verified");
+        let bytes = serde_json::to_vec(&missing_verified).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        let mut legacy_model_key = valid_header_admission_report_json(&pin, budget, 6);
+        let obj = legacy_model_key.as_object_mut().unwrap();
+        obj.remove("expected_model_id");
+        obj.insert(
+            "model_id".to_string(),
+            serde_json::json!(pin.expected_model_id),
+        );
+        let bytes = serde_json::to_vec(&legacy_model_key).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        let mut extra_verified_model_id = valid_header_admission_report_json(&pin, budget, 6);
+        extra_verified_model_id.as_object_mut().unwrap().insert(
+            "model_id".to_string(),
+            serde_json::json!(pin.expected_model_id),
+        );
+        let bytes = serde_json::to_vec(&extra_verified_model_id).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        let mut unknown_outer_field = valid_header_admission_report_json(&pin, budget, 6);
+        unknown_outer_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_outer_field".to_string(), serde_json::json!(true));
+        let bytes = serde_json::to_vec(&unknown_outer_field).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        let mut bad_url = valid_header_admission_report_json(&pin, budget, 6);
+        bad_url["coordinator_url"] = serde_json::json!("https://149.28.153.31//");
+        let bytes = serde_json::to_vec(&bad_url).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err());
+
+        for field in ["coordinator_id", "transaction_domain", "expected_model_id"] {
+            let mut tampered = valid_header_admission_report_json(&pin, budget, 6);
+            tampered[field] = serde_json::json!("1".repeat(64));
+            let bytes = serde_json::to_vec(&tampered).unwrap();
+            assert!(
+                parse_and_verify_header_admission_report(&bytes, &pin, budget).is_err(),
                 "{field}"
             );
         }
 
-        let bad_budget = serde_json::to_vec(&valid_report_json(&pin, budget - 1, 6)).unwrap();
-        assert!(parse_and_verify_check_only_report(&bad_budget, &pin, budget).is_err());
+        let bad_budget =
+            serde_json::to_vec(&valid_header_admission_report_json(&pin, budget - 1, 6)).unwrap();
+        assert!(parse_and_verify_header_admission_report(&bad_budget, &pin, budget).is_err());
 
-        let too_few_layers = serde_json::to_vec(&valid_report_json(&pin, budget, 5)).unwrap();
-        assert!(parse_and_verify_check_only_report(&too_few_layers, &pin, budget).is_err());
+        let too_few_layers =
+            serde_json::to_vec(&valid_header_admission_report_json(&pin, budget, 5)).unwrap();
+        assert!(parse_and_verify_header_admission_report(&too_few_layers, &pin, budget).is_err());
+    }
+
+    #[test]
+    fn linux_cgroup_v2_respects_nested_ancestors_custom_mounts_and_unbounded_max() {
+        use crate::layout::test_support::TempDir;
+
+        let host = HostMemory {
+            visible_bytes: 32 * GIB,
+            available_bytes: 20 * GIB,
+        };
+
+        let nested = TempDir::new("cgroup-v2-nested");
+        fs::create_dir_all(nested.path().join("sys").join("fs").join("cgroup")).unwrap();
+        write_fixture_file(
+            nested.path(),
+            "sys/fs/cgroup/parent/memory.max",
+            &format!("{}\n", 16 * GIB),
+        );
+        write_fixture_file(
+            nested.path(),
+            "sys/fs/cgroup/parent/memory.current",
+            &format!("{}\n", 4 * GIB),
+        );
+        write_fixture_file(
+            nested.path(),
+            "sys/fs/cgroup/parent/child/memory.max",
+            "max\n",
+        );
+        write_fixture_file(nested.path(), "mnt/narrow/memory.max", "max\n");
+
+        let mountinfo_root_only = "28 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        let clamped_ancestor = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/parent/child\n",
+            mountinfo_root_only,
+            nested.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            clamped_ancestor,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 12 * GIB,
+            }
+        );
+
+        let mountinfo_with_narrow_bind = "\
+40 28 0:26 /parent/child /mnt/narrow rw - cgroup2 cgroup2 rw
+28 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw
+";
+        let clamped_prefers_shallow = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/parent/child\n",
+            mountinfo_with_narrow_bind,
+            nested.path(),
+        )
+        .unwrap();
+        assert_eq!(clamped_prefers_shallow, clamped_ancestor);
+
+        write_fixture_file(
+            nested.path(),
+            "sys/fs/cgroup/parent/child/memory.max",
+            &format!("{}\n", 10 * GIB),
+        );
+        write_fixture_file(
+            nested.path(),
+            "sys/fs/cgroup/parent/child/memory.current",
+            &format!("{}\n", 2 * GIB),
+        );
+        let clamped_leaf = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/parent/child\n",
+            mountinfo_root_only,
+            nested.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            clamped_leaf,
+            HostMemory {
+                visible_bytes: 10 * GIB,
+                available_bytes: 8 * GIB,
+            }
+        );
+
+        let custom = TempDir::new("cgroup-v2-custom");
+        write_fixture_file(
+            custom.path(),
+            "mnt/custom-cgroup2/memory.max",
+            &format!("{}\n", 18 * GIB),
+        );
+        write_fixture_file(
+            custom.path(),
+            "mnt/custom-cgroup2/memory.current",
+            &format!("{}\n", 2 * GIB),
+        );
+        write_fixture_file(
+            custom.path(),
+            "mnt/custom-cgroup2/worker/memory.max",
+            "max\n",
+        );
+        let custom_mountinfo =
+            "42 20 0:26 /docker/abc /mnt/custom-cgroup2 ro - cgroup2 cgroup2 rw\n";
+        let clamped_custom = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/docker/abc/worker\n",
+            custom_mountinfo,
+            custom.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            clamped_custom,
+            HostMemory {
+                visible_bytes: 18 * GIB,
+                available_bytes: 16 * GIB,
+            }
+        );
+
+        let private_ns = TempDir::new("cgroup-v2-private-ns");
+        write_fixture_file(
+            private_ns.path(),
+            "mnt/ns-cgroup2/memory.max",
+            &format!("{}\n", 12 * GIB),
+        );
+        write_fixture_file(
+            private_ns.path(),
+            "mnt/ns-cgroup2/memory.current",
+            &format!("{}\n", 2 * GIB),
+        );
+        let private_mountinfo = "28 24 0:26 / /mnt/ns-cgroup2 rw - cgroup2 cgroup2 rw\n";
+        let clamped_private =
+            apply_linux_cgroup_memory_limits(host, "0::/\n", private_mountinfo, private_ns.path())
+                .unwrap();
+        assert_eq!(
+            clamped_private,
+            HostMemory {
+                visible_bytes: 12 * GIB,
+                available_bytes: 10 * GIB,
+            }
+        );
+
+        let unbounded = TempDir::new("cgroup-v2-unbounded");
+        fs::create_dir_all(unbounded.path().join("mnt").join("cg2")).unwrap();
+        write_fixture_file(unbounded.path(), "mnt/cg2/parent/memory.max", "max\n");
+        write_fixture_file(unbounded.path(), "mnt/cg2/parent/child/memory.max", "max\n");
+        let unbounded_mountinfo = "28 24 0:26 / /mnt/cg2 rw - cgroup2 cgroup2 rw\n";
+        let unchanged = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/parent/child\n",
+            unbounded_mountinfo,
+            unbounded.path(),
+        )
+        .unwrap();
+        assert_eq!(unchanged, host);
+    }
+
+    #[test]
+    fn linux_cgroup_v1_respects_nested_ancestors_hybrid_and_unbounded_sentinel() {
+        use crate::layout::test_support::TempDir;
+
+        let host = HostMemory {
+            visible_bytes: 32 * GIB,
+            available_bytes: 20 * GIB,
+        };
+        let temp = TempDir::new("cgroup-v1-nested");
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/memory.limit_in_bytes",
+            "9223372036854771712\n",
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/memory.usage_in_bytes",
+            &format!("{GIB}\n"),
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/slice/memory.limit_in_bytes",
+            &format!("{}\n", 16 * GIB),
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/slice/memory.usage_in_bytes",
+            &format!("{}\n", 6 * GIB),
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/slice/app/memory.limit_in_bytes",
+            "9223372036854771712\n",
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/cg1/memory/slice/app/memory.usage_in_bytes",
+            &format!("{}\n", 2 * GIB),
+        );
+
+        let proc_cgroup = "8:memory:/slice/app\n0::/slice/app\n";
+        let proc_mountinfo = "\
+30 24 0:28 / /mnt/cg1/memory rw,nosuid - cgroup cgroup rw,memory
+31 24 0:29 / /mnt/cg2 rw - cgroup2 cgroup2 rw
+";
+        let clamped =
+            apply_linux_cgroup_memory_limits(host, proc_cgroup, proc_mountinfo, temp.path())
+                .unwrap();
+        assert_eq!(
+            clamped,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 10 * GIB,
+            }
+        );
+    }
+
+    #[test]
+    fn linux_cgroup_handles_absent_controller_and_limit_below_usage() {
+        use crate::layout::test_support::TempDir;
+
+        let host = HostMemory {
+            visible_bytes: 32 * GIB,
+            available_bytes: 20 * GIB,
+        };
+        let temp = TempDir::new("cgroup-absent-and-over");
+
+        let no_memory_ctrl = apply_linux_cgroup_memory_limits(
+            host,
+            "2:cpu,cpuacct:/app\n",
+            "28 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(no_memory_ctrl, host);
+
+        fs::create_dir_all(temp.path().join("mnt").join("no-mem")).unwrap();
+        write_fixture_file(
+            temp.path(),
+            "mnt/no-mem/app/cgroup.controllers",
+            "cpu pids\n",
+        );
+        let disabled_v2 = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/app\n",
+            "28 24 0:26 / /mnt/no-mem rw - cgroup2 cgroup2 rw\n",
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(disabled_v2, host);
+
+        fs::create_dir_all(temp.path().join("mnt").join("over-v2")).unwrap();
+        write_fixture_file(
+            temp.path(),
+            "mnt/over-v2/app/memory.max",
+            &format!("{}\n", 16 * GIB),
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/over-v2/app/memory.current",
+            &format!("{}\n", 18 * GIB),
+        );
+        let over_v2 = apply_linux_cgroup_memory_limits(
+            host,
+            "0::/app\n",
+            "28 24 0:26 / /mnt/over-v2 rw - cgroup2 cgroup2 rw\n",
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            over_v2,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 0,
+            }
+        );
+        assert!(qualify_host_memory(over_v2).is_err());
+
+        write_fixture_file(
+            temp.path(),
+            "mnt/over-v1/memory.limit_in_bytes",
+            "9223372036854771712\n",
+        );
+        write_fixture_file(temp.path(), "mnt/over-v1/memory.usage_in_bytes", "0\n");
+        write_fixture_file(
+            temp.path(),
+            "mnt/over-v1/app/memory.limit_in_bytes",
+            &format!("{}\n", 16 * GIB),
+        );
+        write_fixture_file(
+            temp.path(),
+            "mnt/over-v1/app/memory.usage_in_bytes",
+            &format!("{}\n", 18 * GIB),
+        );
+        let over_v1 = apply_linux_cgroup_memory_limits(
+            host,
+            "8:memory:/app\n",
+            "30 24 0:28 / /mnt/over-v1 rw - cgroup cgroup rw,memory\n",
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            over_v1,
+            HostMemory {
+                visible_bytes: 16 * GIB,
+                available_bytes: 0,
+            }
+        );
+        assert!(qualify_host_memory(over_v1).is_err());
+    }
+
+    #[test]
+    fn linux_cgroup_fails_closed_on_path_escapes_and_malformed_controllers() {
+        use crate::layout::test_support::TempDir;
+
+        let host = HostMemory {
+            visible_bytes: 32 * GIB,
+            available_bytes: 20 * GIB,
+        };
+        let temp = TempDir::new("cgroup-bad");
+        let valid_v2_mount = "28 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+
+        for bad_cgroup in [
+            "0::/../../etc\n",
+            "8:memory:/a/../b\n",
+            "0::/a/./b\n",
+            "0::relative/path\n",
+            "0:memory:/app\n",
+            "not-a-valid-line\n",
+            "0::/a\n0::/b\n",
+            "8:memory:/a\n9:memory:/b\n",
+        ] {
+            assert!(
+                apply_linux_cgroup_memory_limits(host, bad_cgroup, valid_v2_mount, temp.path())
+                    .is_err(),
+                "{bad_cgroup:?}"
+            );
+        }
+
+        for bad_mountinfo in [
+            "malformed without dash separator\n",
+            "28 24 0:26 /../escape /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            "28 24 0:26 / /sys/fs/../cgroup rw - cgroup2 cgroup2 rw\n",
+            "28 24 0:26 / /sys/fs/\\0 rw - cgroup2 cgroup2 rw\n",
+            "28 24 0:26 /other /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+        ] {
+            assert!(
+                apply_linux_cgroup_memory_limits(host, "0::/app\n", bad_mountinfo, temp.path())
+                    .is_err(),
+                "{bad_mountinfo:?}"
+            );
+        }
+
+        fs::create_dir_all(temp.path().join("bad-max")).unwrap();
+        write_fixture_file(temp.path(), "bad-max/app/memory.max", "not-a-number\n");
+        assert!(
+            apply_linux_cgroup_memory_limits(
+                host,
+                "0::/app\n",
+                "28 24 0:26 / /bad-max rw - cgroup2 cgroup2 rw\n",
+                temp.path(),
+            )
+            .is_err()
+        );
+
+        fs::create_dir_all(temp.path().join("missing-current")).unwrap();
+        write_fixture_file(
+            temp.path(),
+            "missing-current/app/memory.max",
+            &format!("{}\n", 16 * GIB),
+        );
+        assert!(
+            apply_linux_cgroup_memory_limits(
+                host,
+                "0::/app\n",
+                "28 24 0:26 / /missing-current rw - cgroup2 cgroup2 rw\n",
+                temp.path(),
+            )
+            .is_err()
+        );
+
+        fs::create_dir_all(temp.path().join("missing-max")).unwrap();
+        write_fixture_file(
+            temp.path(),
+            "missing-max/app/cgroup.controllers",
+            "cpu memory pids\n",
+        );
+        assert!(
+            apply_linux_cgroup_memory_limits(
+                host,
+                "0::/app\n",
+                "28 24 0:26 / /missing-max rw - cgroup2 cgroup2 rw\n",
+                temp.path(),
+            )
+            .is_err()
+        );
+
+        fs::create_dir_all(temp.path().join("missing-v1").join("app")).unwrap();
+        assert!(
+            apply_linux_cgroup_memory_limits(
+                host,
+                "8:memory:/app\n",
+                "30 24 0:28 / /missing-v1 rw - cgroup cgroup rw,memory\n",
+                temp.path(),
+            )
+            .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let target_file = write_fixture_file(temp.path(), "outside.txt", "max\n");
+            let sym_file_root = temp.path().join("sym-file").join("app");
+            fs::create_dir_all(&sym_file_root).unwrap();
+            std::os::unix::fs::symlink(&target_file, sym_file_root.join("memory.max")).unwrap();
+            assert!(
+                apply_linux_cgroup_memory_limits(
+                    host,
+                    "0::/app\n",
+                    "28 24 0:26 / /sym-file rw - cgroup2 cgroup2 rw\n",
+                    temp.path(),
+                )
+                .is_err()
+            );
+
+            let real_dir = temp.path().join("real-dir");
+            write_fixture_file(&real_dir, "memory.max", "max\n");
+            let sym_dir_root = temp.path().join("sym-dir");
+            fs::create_dir_all(&sym_dir_root).unwrap();
+            std::os::unix::fs::symlink(&real_dir, sym_dir_root.join("app")).unwrap();
+            assert!(
+                apply_linux_cgroup_memory_limits(
+                    host,
+                    "0::/app\n",
+                    "28 24 0:26 / /sym-dir rw - cgroup2 cgroup2 rw\n",
+                    temp.path(),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1280,6 +2211,107 @@ Pages inactive: 2000.
         assert!(measure_host_memory().is_err());
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_bounded_command_and_shard_qualification_fail_closed_without_spawning() {
+        use crate::layout::test_support::TempDir;
+
+        let temp = TempDir::new("non-unix-no-spawn");
+        let model = temp.path().join("model.gguf");
+        fs::write(&model, b"regular-model").unwrap();
+        let sentinel = temp.path().join("spawned.txt");
+
+        let cmd_err = run_bounded_command(
+            Path::new("cmd.exe"),
+            &[
+                OsString::from("/C"),
+                OsString::from(format!("echo bad > {}", sentinel.display())),
+            ],
+            Duration::from_secs(1),
+            HEADER_CHECK_STDOUT_CAP_BYTES,
+            HEADER_CHECK_STDERR_CAP_BYTES,
+        )
+        .unwrap_err();
+        assert!(matches!(cmd_err, BoundedCommandError::UnsupportedPlatform));
+        assert!(!sentinel.exists());
+
+        let pins = pins_with_shard();
+        let mut log = Log::stderr_only();
+        let mut probe_calls = 0usize;
+
+        let full_role = resolve_worker_role_with(
+            WorkerModePreference::Full,
+            &pins,
+            Path::new("cmd.exe"),
+            &model,
+            &mut log,
+            Duration::from_secs(1),
+            || {
+                probe_calls += 1;
+                Ok(HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(probe_calls, 0);
+        assert_eq!(
+            full_role,
+            WorkerLaunchRole::FullIntegerWorker {
+                model: model.clone(),
+                fallback_reason: None,
+            }
+        );
+        assert!(!sentinel.exists());
+
+        let auto_role = resolve_worker_role_with(
+            WorkerModePreference::Auto,
+            &pins,
+            Path::new("cmd.exe"),
+            &model,
+            &mut log,
+            Duration::from_secs(1),
+            || {
+                probe_calls += 1;
+                Ok(HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(probe_calls, 0);
+        assert!(matches!(
+            auto_role,
+            WorkerLaunchRole::FullIntegerWorker {
+                fallback_reason: Some(_),
+                ..
+            }
+        ));
+        assert!(!sentinel.exists());
+
+        let shard_err = resolve_worker_role_with(
+            WorkerModePreference::Shard,
+            &pins,
+            Path::new("cmd.exe"),
+            &model,
+            &mut log,
+            Duration::from_secs(1),
+            || {
+                probe_calls += 1;
+                Ok(HostMemory {
+                    visible_bytes: 16 * GIB,
+                    available_bytes: 8 * GIB,
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(probe_calls, 0);
+        assert_eq!(exit::code_for(&shard_err), exit::EX_CONFIG);
+        assert!(!sentinel.exists());
+    }
+
     #[cfg(unix)]
     mod unix_preflight_tests {
         use super::*;
@@ -1308,13 +2340,15 @@ Pages inactive: 2000.
         }
 
         #[test]
-        fn valid_preflight_qualifies_and_rechecks_memory_after_check_only() {
+        fn valid_preflight_qualifies_and_rechecks_memory_after_header_check() {
             let temp = TempDir::new("shard-preflight-ok");
             let model = temp.path().join("model.gguf");
             fs::write(&model, b"regular-model").unwrap();
             let pins = pins_with_shard();
             let pin = pins.shard_worker.as_ref().unwrap();
-            let report = serde_json::to_string(&valid_report_json(pin, 8 * GIB, 6)).unwrap();
+            let report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 6))
+                    .unwrap();
             let args_log = temp.path().join("args.txt");
             let script = temp.path().join("fake-node");
             write_script(
@@ -1361,7 +2395,8 @@ Pages inactive: 2000.
             let captured_args = fs::read_to_string(&args_log).unwrap();
             let lines: Vec<&str> = captured_args.lines().collect();
             assert_eq!(lines[0], "community-shard-worker");
-            assert!(lines.contains(&"--check-only"));
+            assert!(lines.contains(&"--check-header-only"));
+            assert!(!lines.contains(&"--check-only"));
             assert!(lines.contains(&"--max-working-set-bytes"));
             assert!(lines.contains(&"--max-resident-layers"));
             assert!(lines.contains(&"6"));
@@ -1374,7 +2409,9 @@ Pages inactive: 2000.
             fs::write(&model, b"regular-model").unwrap();
             let pins = pins_with_shard();
             let pin = pins.shard_worker.as_ref().unwrap();
-            let report = serde_json::to_string(&valid_report_json(pin, 8 * GIB, 6)).unwrap();
+            let report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 6))
+                    .unwrap();
             let script = temp.path().join("fake-node");
             write_script(&script, &format!("#!/bin/sh\nprintf '%s\\n' '{report}'\n"));
 
@@ -1433,7 +2470,7 @@ Pages inactive: 2000.
         }
 
         #[test]
-        fn symlinked_model_is_rejected_before_spawning_check_only() {
+        fn symlinked_model_is_rejected_before_spawning_header_check() {
             let temp = TempDir::new("shard-symlink-model");
             let real_model = temp.path().join("real.gguf");
             fs::write(&real_model, b"regular-model").unwrap();
@@ -1481,8 +2518,8 @@ Pages inactive: 2000.
                 &sleeper,
                 &[],
                 Duration::from_millis(150),
-                CHECK_ONLY_STDOUT_CAP_BYTES,
-                CHECK_ONLY_STDERR_CAP_BYTES,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
             )
             .unwrap_err();
             assert!(matches!(timeout_err, BoundedCommandError::Timeout(_)));
@@ -1500,15 +2537,15 @@ Pages inactive: 2000.
                 &loud_stdout,
                 &[],
                 Duration::from_secs(5),
-                CHECK_ONLY_STDOUT_CAP_BYTES,
-                CHECK_ONLY_STDERR_CAP_BYTES,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
             )
             .unwrap_err();
             assert!(matches!(
                 stdout_err,
                 BoundedCommandError::OutputLimitExceeded {
                     stream: "stdout",
-                    limit: CHECK_ONLY_STDOUT_CAP_BYTES
+                    limit: HEADER_CHECK_STDOUT_CAP_BYTES
                 }
             ));
 
@@ -1521,15 +2558,15 @@ Pages inactive: 2000.
                 &loud_stderr,
                 &[],
                 Duration::from_secs(5),
-                CHECK_ONLY_STDOUT_CAP_BYTES,
-                CHECK_ONLY_STDERR_CAP_BYTES,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
             )
             .unwrap_err();
             assert!(matches!(
                 stderr_err,
                 BoundedCommandError::OutputLimitExceeded {
                     stream: "stderr",
-                    limit: CHECK_ONLY_STDERR_CAP_BYTES
+                    limit: HEADER_CHECK_STDERR_CAP_BYTES
                 }
             ));
 
@@ -1542,13 +2579,13 @@ Pages inactive: 2000.
                 &dual_pipes,
                 &[],
                 Duration::from_secs(5),
-                CHECK_ONLY_STDOUT_CAP_BYTES,
-                CHECK_ONLY_STDERR_CAP_BYTES,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
             )
             .unwrap();
             assert!(output.status.success());
             assert_eq!(output.stdout.len(), 128 * 1024);
-            assert_eq!(output.stderr.len(), CHECK_ONLY_STDERR_CAP_BYTES);
+            assert_eq!(output.stderr.len(), HEADER_CHECK_STDERR_CAP_BYTES);
         }
 
         #[test]
@@ -1569,8 +2606,8 @@ Pages inactive: 2000.
                 &script,
                 &[],
                 Duration::from_millis(200),
-                CHECK_ONLY_STDOUT_CAP_BYTES,
-                CHECK_ONLY_STDERR_CAP_BYTES,
+                HEADER_CHECK_STDOUT_CAP_BYTES,
+                HEADER_CHECK_STDERR_CAP_BYTES,
             )
             .unwrap_err();
             assert!(matches!(err, BoundedCommandError::Timeout(_)));
@@ -1668,7 +2705,7 @@ Pages inactive: 2000.
         }
 
         #[test]
-        fn tampered_or_failing_check_only_falls_back_in_auto_and_refuses_in_shard() {
+        fn tampered_or_failing_header_check_falls_back_in_auto_and_refuses_in_shard() {
             let temp = TempDir::new("shard-preflight-fail");
             let model = temp.path().join("model.gguf");
             fs::write(&model, b"regular-model").unwrap();
@@ -1676,7 +2713,9 @@ Pages inactive: 2000.
             let pin = pins.shard_worker.as_ref().unwrap();
 
             let bad_script = temp.path().join("tampered-node");
-            let bad_report = serde_json::to_string(&valid_report_json(pin, 8 * GIB, 5)).unwrap();
+            let bad_report =
+                serde_json::to_string(&valid_header_admission_report_json(pin, 8 * GIB, 5))
+                    .unwrap();
             write_script(
                 &bad_script,
                 &format!("#!/bin/sh\nprintf '%s\\n' '{bad_report}'\n"),
@@ -1685,7 +2724,31 @@ Pages inactive: 2000.
             let failing_script = temp.path().join("failing-node");
             write_script(
                 &failing_script,
-                "#!/bin/sh\nprintf 'model hash mismatch\\n' >&2\nexit 1\n",
+                "#!/bin/sh\nprintf 'header admission failed\\n' >&2\nexit 1\n",
+            );
+
+            let legacy_flag_script = temp.path().join("legacy-v0827-node");
+            write_script(
+                &legacy_flag_script,
+                "#!/bin/sh\nprintf \"error: unexpected argument '--check-header-only' found\\n\" >&2\nexit 2\n",
+            );
+
+            let legacy_mode_script = temp.path().join("legacy-mode-node");
+            let legacy_report = serde_json::json!({
+                "mode": "check-only",
+                "coordinator_url": pin.coordinator_url,
+                "coordinator_id": pin.coordinator_id,
+                "transaction_domain": pin.transaction_domain,
+                "model_id": pin.expected_model_id,
+                "max_working_set_bytes": 8 * GIB,
+                "admission": {
+                    "admitted_max_resident_layers": 6
+                }
+            })
+            .to_string();
+            write_script(
+                &legacy_mode_script,
+                &format!("#!/bin/sh\nprintf '%s\\n' '{legacy_report}'\n"),
             );
 
             let ok_memory = || {
@@ -1696,7 +2759,12 @@ Pages inactive: 2000.
             };
             let mut log = Log::stderr_only();
 
-            for script in [bad_script.as_path(), failing_script.as_path()] {
+            for script in [
+                bad_script.as_path(),
+                failing_script.as_path(),
+                legacy_flag_script.as_path(),
+                legacy_mode_script.as_path(),
+            ] {
                 let auto_role = resolve_worker_role_with(
                     WorkerModePreference::Auto,
                     &pins,

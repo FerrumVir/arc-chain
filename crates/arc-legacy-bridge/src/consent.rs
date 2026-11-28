@@ -151,10 +151,11 @@ pub fn verified_model(layout: &Layout, pins: &Pins) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let model = PathBuf::from(&record.path);
-    let Ok(metadata) = fs::metadata(&model) else {
+    let Ok(metadata) = fs::symlink_metadata(&model) else {
         return Ok(None);
     };
-    if !metadata.is_file()
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
         || metadata.len() != record.size
         || modified_nanos(&metadata) != record.modified_unix_nanos
     {
@@ -171,8 +172,11 @@ pub fn verify_and_record_model(
 ) -> Result<()> {
     let model = crate::layout::canonical_or_lexical(model);
     let metadata =
-        fs::metadata(&model).with_context(|| format!("cannot read {}", model.display()))?;
-    if !metadata.is_file() || metadata.len() != pins.model.size {
+        fs::symlink_metadata(&model).with_context(|| format!("cannot read {}", model.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != pins.model.size
+    {
         return Err(exit::refused(format!(
             "{} is not the {} ({} bytes) the network runs",
             model.display(),
@@ -561,6 +565,56 @@ mod tests {
             std::os::unix::fs::symlink(&target, layout.worker_mode_file()).unwrap();
             let symlink_error = read_worker_mode(&layout).unwrap_err();
             assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_recorded_model_is_rejected_for_auto_full_and_shard_roles() {
+        let temp = TempDir::new("consent-symlink-model");
+        let model_body = b"exact pinned model bytes for symlink test".to_vec();
+        let recorded = temp.path().join("recorded.gguf");
+        let target = temp.path().join("target.gguf");
+        fs::write(&recorded, &model_body).unwrap();
+        let (layout, invocation) = headless(&temp, Some(recorded.clone()));
+        let pins = privacy_safe_pins(&model_body);
+
+        write_consent(&layout, true).unwrap();
+        verify_and_record_model(&layout, &pins, &recorded, |_| {}).unwrap();
+        assert_eq!(
+            decide(&layout, &invocation, &pins).unwrap(),
+            Compute::On(crate::layout::canonical_or_lexical(&recorded))
+        );
+
+        fs::rename(&recorded, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &recorded).unwrap();
+
+        assert_eq!(verified_model(&layout, &pins).unwrap(), None);
+        let compute = decide(&layout, &invocation, &pins).unwrap();
+        assert!(
+            !compute.is_on(),
+            "symlinked recorded model must never return Compute::On"
+        );
+
+        let mut log = crate::logging::Log::stderr_only();
+        for mode in [
+            WorkerModePreference::Auto,
+            WorkerModePreference::Full,
+            WorkerModePreference::Shard,
+        ] {
+            write_worker_mode(&layout, mode).unwrap();
+            let role = crate::shard_policy::resolve_worker_role(
+                &layout,
+                &pins,
+                Path::new("/nonexistent/arc-node"),
+                &compute,
+                &mut log,
+            )
+            .unwrap();
+            assert!(
+                matches!(role, crate::shard_policy::WorkerLaunchRole::Observer(_)),
+                "mode {mode:?} must stay observer when verified_model rejects symlink"
+            );
         }
     }
 }
