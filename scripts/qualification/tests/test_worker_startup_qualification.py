@@ -189,6 +189,33 @@ def send_raw_http(port: int, payload: bytes, timeout_secs: float = 2.0) -> bytes
 
 
 class WorkerStartupQualificationTests(unittest.TestCase):
+    def test_log_head_and_tail_are_independent_of_read_chunk_boundaries(self) -> None:
+        payload = b"HEAD-LINE\n" + bytes(range(256)) * 8 + b"\nTAIL-LINE\n"
+        budget = 256 - len(QUALIFY.TRUNCATION_MARKER)
+        head_bytes = budget // 2
+        expected = payload[:head_bytes] + QUALIFY.TRUNCATION_MARKER + payload[-(budget - head_bytes):]
+        for chunk_bytes in (1, 127, 256, 257, 1024, len(payload)):
+            with self.subTest(chunk_bytes=chunk_bytes):
+                reader, writer = os.pipe()
+                capture = QUALIFY.BoundedPipeLogCapture(
+                    os.fdopen(reader, "rb", buffering=0),
+                    phase_name="chunk-invariant",
+                    max_retained_bytes=256,
+                    max_total_bytes=8192,
+                )
+                try:
+                    with capture._lock:
+                        for start in range(0, len(payload), chunk_bytes):
+                            capture._ingest_chunk_locked(payload[start:start + chunk_bytes])
+                    capture.close(join_timeout_secs=2.0)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        output = Path(tmp) / "retained.log"
+                        capture.write_retained_log(output)
+                        self.assertEqual(output.read_bytes(), expected)
+                finally:
+                    os.close(writer)
+                    capture.close(join_timeout_secs=2.0)
+
     def test_broad_exception_catch_is_confined_to_main_failure_reporting(self) -> None:
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")

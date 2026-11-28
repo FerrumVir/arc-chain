@@ -821,12 +821,9 @@ class BoundedPipeLogCapture:
                 self._head.extend(chunk)
                 return
             self._truncated = True
-            overflow_tail = bytes(self._head[self._head_limit :]) + chunk
-            del self._head[self._head_limit :]
-            if len(overflow_tail) > self._tail_limit:
-                self._tail = bytearray(overflow_tail[-self._tail_limit :])
-            else:
-                self._tail = bytearray(overflow_tail)
+            retained = bytes(self._head) + chunk
+            self._head = bytearray(retained[: self._head_limit])
+            self._tail = bytearray(retained[-self._tail_limit :])
             return
         if len(chunk) >= self._tail_limit:
             self._tail = bytearray(chunk[-self._tail_limit :])
@@ -1158,9 +1155,12 @@ class LoopbackCommunityCoordinator:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
                 self.send_header("Connection", "close")
-                self.end_headers()
-                if self.command != "HEAD":
-                    self.wfile.write(encoded)
+                try:
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(encoded)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
             def _read_strict_bounded_body(
                 self,
