@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Which shipped binary links which networking stack. Checked by scripts/ci/desktop_dependency_boundary.py.",
+    "The desktop app is two binaries: the Tauri app (arc-desktop) and the arc-node sidecar it downloads and runs.",
+    "A crate absent from arc-desktop is NOT absent from the installed product when arc-node links it: both are pinned here.",
+    "Targets mirror .github/workflows/release-signing-preflight.yml (desktop: rust-target; sidecar: headless target).",
+    "Edges are 'normal' (code linked into the binary); build and dev dependencies are not shipped.",
+    "Changing a list here is a decision: update any public statement about the dependency in the same PR."
+  ],
+  "graphs": [
+    {
+      "role": "desktop app (arc-desktop, Tauri)",
+      "id": "desktop",
+      "manifest": "desktop/src-tauri/Cargo.toml",
+      "package": "arc-desktop",
+      "features": "default features (custom-protocol), as tauri build ships them",
+      "cargo_args": [],
+      "targets": ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"],
+      "must_not_contain": ["quinn", "quinn-proto", "quinn-udp", "h3", "h3-quinn"],
+      "must_contain": []
+    },
+    {
+      "role": "arc-node sidecar (run by the desktop app and by headless installs)",
+      "id": "sidecar",
+      "manifest": "Cargo.toml",
+      "package": "arc-node",
+      "features": "--features candle, as the release builds it",
+      "cargo_args": ["--features", "candle"],
+      "targets": ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"],
+      "must_not_contain": [],
+      "must_contain": ["quinn-proto"]
+    }
+  ]
+}
