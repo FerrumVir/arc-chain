@@ -59,7 +59,7 @@ file_sha256() {
 
 new_sandbox() {
     local sandbox sandbox_root mock_bin command_name
-    sandbox_root="${ARC_INSTALLER_TEST_TMPDIR:-${TMPDIR:-/tmp}}"
+    sandbox_root="${ARC_INSTALLER_TEST_TMPDIR:-$HOME}"
     sandbox="$(mktemp -d "$sandbox_root/arc-shard-installer.XXXXXX")"
     sandbox="$(CDPATH='' cd -- "$sandbox" && pwd -P)"
     ACTIVE_SANDBOXES="$ACTIVE_SANDBOXES $sandbox"
