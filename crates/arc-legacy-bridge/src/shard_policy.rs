@@ -1515,7 +1515,7 @@ Pages inactive: 2000.
             let loud_stderr = temp.path().join("loud-stderr");
             write_script(
                 &loud_stderr,
-                "#!/bin/sh\ndd if=/dev/zero bs=1024 count=24 2>/dev/null >&2\n",
+                "#!/bin/sh\ndd if=/dev/zero bs=1024 count=24 >&2 2>/dev/null\n",
             );
             let stderr_err = run_bounded_command(
                 &loud_stderr,
@@ -1536,7 +1536,7 @@ Pages inactive: 2000.
             let dual_pipes = temp.path().join("dual-pipes");
             write_script(
                 &dual_pipes,
-                "#!/bin/sh\ndd if=/dev/zero bs=4096 count=32 2>/dev/null\ndd if=/dev/zero bs=1024 count=16 2>/dev/null >&2\n",
+                "#!/bin/sh\ndd if=/dev/zero bs=4096 count=32 2>/dev/null\ndd if=/dev/zero bs=1024 count=16 >&2 2>/dev/null\n",
             );
             let output = run_bounded_command(
                 &dual_pipes,
@@ -1602,7 +1602,7 @@ Pages inactive: 2000.
             let exact_caps = temp.path().join("exact-caps");
             write_script(
                 &exact_caps,
-                "#!/bin/sh\ndd if=/dev/zero bs=1024 count=1 2>/dev/null\ndd if=/dev/zero bs=256 count=1 2>/dev/null >&2\n",
+                "#!/bin/sh\ndd if=/dev/zero bs=1024 count=1 2>/dev/null\ndd if=/dev/zero bs=256 count=1 >&2 2>/dev/null\n",
             );
             let exact = run_bounded_command(&exact_caps, &[], timeout, 1024, 256).unwrap();
             assert!(exact.status.success());
@@ -1627,7 +1627,7 @@ Pages inactive: 2000.
             let fast_stderr = temp.path().join("fast-stderr-overflow");
             write_script(
                 &fast_stderr,
-                "#!/bin/sh\ndd if=/dev/zero bs=257 count=1 2>/dev/null >&2\nexit 0\n",
+                "#!/bin/sh\ndd if=/dev/zero bs=257 count=1 >&2 2>/dev/null\nexit 0\n",
             );
             let stderr_err =
                 run_bounded_command(&fast_stderr, &[], timeout, 1024, 256).unwrap_err();
