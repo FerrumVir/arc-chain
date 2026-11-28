@@ -336,6 +336,16 @@ v0.7 desktop trusts, so their Check for updates would install it.
 
 ### Stage 1: canary as a non-latest tagged release
 
+Before the first tag step below, the release owner must complete and sign off
+the [single user-facing explanation review checklist](VALIDATOR-FLEET-ROLLOUT.md#user-facing-explanation-review--every-tagged-release)
+for the exact candidate and handoff, and link the record from the release PR
+or internal release record. Include the handoff's `RELEASE-NOTES.md`, generated
+by [legacy-bridge-release-assets.yml](../.github/workflows/legacy-bridge-release-assets.yml),
+as a review surface, with its rendered wording and pinned source/code revisions.
+Without that signed-off record, do not tag or publish the bridge release.
+Existing release approvals and handoff checks remain required; this pointer
+does not authorize release execution or impose cutover-only operations.
+
 1. Create the protected tag on the merge commit that produced the handoff:
    `git tag v0.7.14 <commit> && git push origin v0.7.14`. The push also starts
    `release.yml`, which stops at its first step because the workspace version
