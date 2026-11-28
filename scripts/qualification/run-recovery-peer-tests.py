@@ -7,6 +7,7 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    'community_shard_cli::tests::integrated_worker_config_wires_execution_gate_while_standalone_leaves_it_none',
     'community_shard_cli::tests::integrated_shard_worker_shared_prepare_cancels_when_shutdown_flag_set',
     'community_shard_cli::tests::integrated_shard_worker_shared_prepare_rejects_unpinned_model_before_metadata_parse',
     'community_shard_cli::tests::integrated_shard_worker_runtime_task_drains_before_join_returns',
@@ -42,6 +43,14 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'community_shard_worker::tests::duplicate_prior_lease_after_dropped_release_triggers_release_and_advances',
+    'community_shard_worker::tests::duplicate_lease_mismatched_fields_regressed_seq_or_fenced_boot_fail_closed',
+    'community_shard_worker::tests::auto_reconnect_recovers_reacquire_and_reregister_limits_and_cancels',
+    'community_shard_worker::tests::execution_gate_holds_claim_execute_submit_retries_then_quiesces_with_heartbeats',
+    'community_shard_worker::tests::execution_gate_drops_permit_on_rebalance_and_quiesced_shutdown_stops_promptly',
+    'community_shard_worker::tests::duplicate_prior_lease_release_error_classification_and_recovery',
+    'community_shard_worker::tests::paused_execution_gate_applies_heartbeat_cancellations_without_claiming',
+    'community_shard_worker::tests::blocking_compute_wrapper_retains_permit_on_cancel_and_handoff',
     'rpc::community_shard_dispatch::tests::compute_only_readiness_binds_identity_and_is_read_only_over_http',
     'rpc::community_shard_dispatch::inference_run_adapter_tests::community_sharded_request_serde_defaults_chat_template_false_and_rejects_unknown_fields',
     'rpc::community_shard_dispatch::inference_run_adapter_tests::chat_template_formatting_matches_inference_run_and_preserves_1000_byte_dispatched_cap',

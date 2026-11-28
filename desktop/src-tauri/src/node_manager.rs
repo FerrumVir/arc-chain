@@ -2836,6 +2836,7 @@ impl NodeManager {
                 0,
             ));
         };
+        validate_configured_directory_ancestry_no_link(&data_dir)?;
         if data_dir_held(&data_dir)? {
             return Ok(PrepareResult::busy(
                 "Another node still holds the managed data directory",
@@ -6731,6 +6732,46 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn idle_auto_update_rejects_linked_data_before_repairing_a_held_external_lock() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = resource_test_dir("auto-update-linked-data-no-mutation");
+        let outside = root.join("outside");
+        arc_crypto::secret_file::secure_private_directory_tree(&outside).unwrap();
+        let linked_data = root.join("data-v3");
+        let mut manager = NodeManager::new();
+        manager
+            .configure_managed_data_dir(&linked_data.to_string_lossy())
+            .unwrap();
+        let lock_path = outside.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(&lock_path, b"operator lock").unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&outside, &linked_data).unwrap();
+
+        let error = manager.prepare_auto_update_relaunch().await.unwrap_err();
+        assert!(
+            error.to_string().contains("linked/non-directory"),
+            "{error}"
+        );
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!manager.update_fenced);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"operator lock");
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "reject linked ancestry before a repairing open changes the target permissions"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn idle_auto_update_never_signals_a_detached_process_and_defers_for_unreaped_child() {
         struct KillOnDrop(std::process::Child);
         impl Drop for KillOnDrop {
@@ -6756,7 +6797,7 @@ mod tests {
         let mut detached = KillOnDrop(
             std::process::Command::new("/bin/bash")
                 .arg("-c")
-                .arg("sleep 30")
+                .arg("read -t 30 _ || true; exit 0")
                 .arg("arc-node")
                 .arg("--data-dir")
                 .arg(&data)
@@ -6764,9 +6805,24 @@ mod tests {
                 .arg(&control.token_file)
                 .arg("--genesis")
                 .arg(&genesis)
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn disposable detached stand-in"),
         );
+
+        let mut system = sysinfo::System::new();
+        refresh_process_command_metadata(&mut system);
+        let process = system
+            .process(sysinfo::Pid::from_u32(detached.0.id()))
+            .expect("detached stand-in must be observable before testing update isolation");
+        let observed_control = desktop_shutdown_control_from_command(process.cmd())
+            .expect("detached stand-in shutdown arguments must be valid")
+            .expect("detached stand-in must retain the shutdown arguments used by discovery");
+        assert_eq!(observed_control.data_dir, data);
+        assert!(process
+            .cmd()
+            .windows(2)
+            .any(|pair| { pair[0] == "--genesis" && pair[1] == genesis.as_os_str() }));
 
         let mut manager = NodeManager::new();
         manager.configure_managed_data_dir(&configured).unwrap();
