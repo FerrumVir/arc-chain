@@ -58,6 +58,40 @@ first_literal_line() {
     grep -nF -- "$literal" "$file" | head -n 1 | cut -d: -f1
 }
 
+contains_hardware_evidence_boundary() {
+    tr -s '[:space:]' ' ' \
+        | grep -E 'no validated minimum-RAM claim|not established a minimum-RAM figure|does not establish a minimum-RAM' \
+            >/dev/null
+}
+
+hardware_evidence_boundary_accepts_wrapped_prose() {
+    local text
+    for text in \
+        'There is no validated\n  minimum-RAM claim.' \
+        'The release has not established a minimum-RAM\n  figure.' \
+        'This release does not establish\n  a minimum-RAM threshold.'
+    do
+        printf '%b\n' "$text" | contains_hardware_evidence_boundary || {
+            printf 'Normalize prose whitespace before checking the hardware evidence boundary.\n'
+            return 1
+        }
+    done
+}
+
+hardware_evidence_boundary_rejects_unsupported_claims() {
+    local text
+    for text in \
+        'The release has established a minimum-RAM figure.' \
+        'The minimum-RAM requirement is 16 GB.' \
+        ''
+    do
+        if printf '%s\n' "$text" | contains_hardware_evidence_boundary; then
+            printf 'Require an explicit unvalidated hardware boundary; do not accept a positive minimum-RAM claim.\n'
+            return 1
+        fi
+    done
+}
+
 candidate_version_is_consistent() {
     local workspace_version desktop_cargo_version desktop_tauri_version
     local desktop_npm_version desktop_npm_lock_version desktop_npm_lock_root_version
@@ -750,8 +784,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
         "$GETTING_STARTED" \
         "$REPO_ROOT/docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md"
     do
-        grep -Eq 'no validated minimum-RAM claim|not established a minimum-RAM figure|does not establish a minimum-RAM' \
-            "$file" || {
+        contains_hardware_evidence_boundary < "$file" || {
             printf 'hardware guide does not state the evidence boundary: %s\n' "$file"
             return 1
         }
@@ -2487,6 +2520,8 @@ run_test 'activation copy fails closed and archived guides carry recovery warnin
 run_test 'operator docs require fresh v3 state, loopback RPC, and full transaction rollback' persistence_rpc_and_transaction_copy_match_the_installer
 run_test 'README counts and desktop secret/payment copy match the current tree' readme_counts_and_desktop_secret_copy_match_the_tree
 run_test 'community support, permissions, and block-history answers stay actionable' community_support_and_history_copy_is_actionable
+run_test 'hardware evidence boundaries accept ordinary prose wrapping' hardware_evidence_boundary_accepts_wrapped_prose
+run_test 'hardware evidence boundaries reject unsupported minimum-RAM claims' hardware_evidence_boundary_rejects_unsupported_claims
 run_test 'candidate facts remain source-bound and dated without unsupported floors' factual_candidate_copy_matches_source_and_release_gates
 run_test 'hardened canary and vault runbooks match their current command parsers' hardened_canary_and_vault_commands_match_current_parsers
 run_test 'recovery archive commands pin tools, external intent, and exact rollout journals' recovery_archive_commands_are_exact_and_resumable
