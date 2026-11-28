@@ -1525,11 +1525,71 @@ mod gguf_preparation {
         };
         assert!(err.to_string().contains("token_embd.weight"), "{err}");
     }
+
+    #[test]
+    fn canonical_i8_cancellable_loader_matches_weights_and_aborts_when_cancelled() {
+        use crate::cached_integer_model::{
+            CanonicalModelLoadError, load_cached_model_canonical_i8_cancellable,
+            load_cached_model_canonical_i8_cancellable_with_layer_hook,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let recipe = shard_recipe(4);
+        let file = TempGguf(write_gguf_filtered(&recipe, "cancellable_4l", |_| true));
+        let path = file.0.to_str().unwrap();
+
+        let baseline = load_cached_model_canonical_i8(path).expect("ordinary canonical load");
+        let uncancelled = AtomicBool::new(false);
+        let loaded = load_cached_model_canonical_i8_cancellable(path, &uncancelled)
+            .expect("cancellable canonical load");
+        assert_canonical_no_optional_quants(&loaded);
+        assert_eq!(prepared_digest(&loaded), prepared_digest(&baseline));
+        let seq = [1u32, 3, 5, 7];
+        assert_eq!(
+            run_whole_model(&loaded, &seq),
+            run_whole_model(&baseline, &seq)
+        );
+        assert_eq!(
+            loaded
+                .try_generate(&[1u32, 3, 5], 3, &loaded.config.eos_tokens)
+                .unwrap(),
+            baseline
+                .try_generate(&[1u32, 3, 5], 3, &baseline.config.eos_tokens)
+                .unwrap()
+        );
+
+        let preset_cancel = AtomicBool::new(true);
+        let missing = file.0.with_extension("missing");
+        let preset_err =
+            load_cached_model_canonical_i8_cancellable(missing.to_str().unwrap(), &preset_cancel)
+                .err()
+                .expect("preset cancellation must abort before open");
+        assert!(preset_err.is_cancelled());
+
+        let mid_cancel = AtomicBool::new(false);
+        let mut loaded_layers = Vec::new();
+        let mid_err = load_cached_model_canonical_i8_cancellable_with_layer_hook(
+            path,
+            &mid_cancel,
+            |layer| {
+                loaded_layers.push(layer);
+                if layer == 1 {
+                    mid_cancel.store(true, Ordering::Release);
+                }
+            },
+        )
+        .err()
+        .expect("mid-load cancellation must abort between layers");
+        assert!(matches!(mid_err, CanonicalModelLoadError::Cancelled));
+        assert_eq!(loaded_layers, vec![0, 1]);
+    }
 }
 
 #[cfg(not(feature = "candle"))]
 #[test]
 fn canonical_i8_shard_loader_reports_missing_candle_feature() {
+    use std::sync::atomic::AtomicBool;
+
     let Err(err) =
         crate::cached_integer_model::load_cached_model_shard_canonical_i8("x.gguf", 0, 1)
     else {
@@ -1539,4 +1599,29 @@ fn canonical_i8_shard_loader_reports_missing_candle_feature() {
         err.to_string().contains("candle feature not enabled"),
         "{err}"
     );
+
+    let uncancelled = AtomicBool::new(false);
+    let Err(cancellable_err) =
+        crate::cached_integer_model::load_cached_model_canonical_i8_cancellable(
+            "x.gguf",
+            &uncancelled,
+        )
+    else {
+        panic!("non-candle cancellable loader must return error");
+    };
+    assert!(!cancellable_err.is_cancelled());
+    assert!(
+        cancellable_err
+            .to_string()
+            .contains("candle feature not enabled"),
+        "{cancellable_err}"
+    );
+
+    let cancelled = AtomicBool::new(true);
+    let Err(cancel_err) = crate::cached_integer_model::load_cached_model_canonical_i8_cancellable(
+        "x.gguf", &cancelled,
+    ) else {
+        panic!("non-candle cancellable loader must honor preset cancel");
+    };
+    assert!(cancel_err.is_cancelled());
 }

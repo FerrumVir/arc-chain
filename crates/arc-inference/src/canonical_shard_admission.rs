@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_crypto::Hash256;
 
 use crate::cached_integer_model::{CachedIntegerModel, CachedLayer};
 use crate::gguf_meta::MetaError;
-use crate::model_artifact::ModelArtifactCommitment;
+use crate::model_artifact::{ModelArtifactCommitment, ModelArtifactLoadError};
 
 #[cfg(feature = "candle")]
 use std::collections::BTreeMap;
@@ -41,9 +42,13 @@ pub const ROPE_ENTRY_BYTES: u64 = 8;
 pub const EXECUTION_SCRATCH_SCALAR_BYTES: u64 = 8;
 pub const MAX_TENSOR_LOAD_BYTES_PER_ELEMENT: u64 = 24;
 pub const FIXED_OVERHEAD_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardAdmissionError {
+    #[error("canonical shard metadata verification cancelled")]
+    Cancelled,
+
     #[error("candle feature not enabled: canonical shard GGUF inspection requires candle")]
     CandleFeatureDisabled,
 
@@ -118,6 +123,12 @@ pub enum ShardAdmissionError {
         shortfall_bytes: u64,
         role_note: &'static str,
     },
+}
+
+impl ShardAdmissionError {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,15 +233,47 @@ impl CanonicalShardMetadata {
     }
 
     #[cfg(feature = "candle")]
+    fn from_path_cancellable(
+        path: impl AsRef<Path>,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ShardAdmissionError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ShardAdmissionError::Cancelled);
+        }
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|source| ShardAdmissionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_reader_with_limit_cancellable(
+            BufReader::new(file),
+            MAX_GGUF_HEADER_BYTES,
+            Some(cancel),
+        )
+    }
+
+    #[cfg(feature = "candle")]
     fn from_reader_with_limit<R: Read>(
         reader: R,
         max_header_bytes: u64,
     ) -> Result<Self, ShardAdmissionError> {
+        Self::from_reader_with_limit_cancellable(reader, max_header_bytes, None)
+    }
+
+    #[cfg(feature = "candle")]
+    fn from_reader_with_limit_cancellable<R: Read>(
+        reader: R,
+        max_header_bytes: u64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self, ShardAdmissionError> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(ShardAdmissionError::Cancelled);
+        }
         let ParsedGgufHeader {
             metadata: meta,
             tensors,
             captured_header,
-        } = read_bounded_header_with_limit(reader, max_header_bytes)?;
+        } = read_bounded_header_with_limit_cancellable(reader, max_header_bytes, cancel)?;
         let header_bytes = captured_header.len_u64()?;
         let header = validate_header_metadata_and_tensors(&meta, &tensors)?;
         let header_inventory_digest = inventory_digest(&tensors);
@@ -321,13 +364,51 @@ impl CanonicalShardMetadata {
         Err(ShardAdmissionError::CandleFeatureDisabled)
     }
 
+    #[cfg(not(feature = "candle"))]
+    fn from_path_cancellable(
+        _path: impl AsRef<Path>,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ShardAdmissionError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ShardAdmissionError::Cancelled);
+        }
+        Err(ShardAdmissionError::CandleFeatureDisabled)
+    }
+
     pub fn from_committed_artifact(
         commitment: &ModelArtifactCommitment,
     ) -> Result<Self, ShardAdmissionError> {
-        let mut metadata = Self::from_path(commitment.path())?;
+        Self::from_committed_artifact_cancellable(commitment, &NEVER_CANCELLED)
+    }
+
+    pub fn from_committed_artifact_cancellable(
+        commitment: &ModelArtifactCommitment,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ShardAdmissionError> {
+        Self::from_committed_artifact_cancellable_with_hook(commitment, cancel, || {})
+    }
+
+    fn from_committed_artifact_cancellable_with_hook(
+        commitment: &ModelArtifactCommitment,
+        cancel: &AtomicBool,
+        after_header: impl FnOnce(),
+    ) -> Result<Self, ShardAdmissionError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ShardAdmissionError::Cancelled);
+        }
+        let mut metadata = Self::from_path_cancellable(commitment.path(), cancel)?;
+        after_header();
         commitment
-            .verify_unchanged()
-            .map_err(|error| ShardAdmissionError::ArtifactVerification(error.to_string()))?;
+            .verify_unchanged_cancellable(cancel)
+            .map_err(|error| match error {
+                ModelArtifactLoadError::Cancelled => ShardAdmissionError::Cancelled,
+                ModelArtifactLoadError::Inference(error) => {
+                    ShardAdmissionError::ArtifactVerification(error.to_string())
+                }
+            })?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(ShardAdmissionError::Cancelled);
+        }
         metadata.trust_boundary = ArtifactTrustBoundary::VerifiedBlake3Commitment {
             model_id: commitment.model_id(),
             size_bytes: commitment.size_bytes(),
@@ -806,21 +887,25 @@ impl CapturedGgufHeader {
 }
 
 #[cfg(feature = "candle")]
-struct BoundedHeaderRecorder<R> {
+struct BoundedHeaderRecorder<'a, R> {
     inner: R,
     captured: Vec<u8>,
     limit_bytes: u64,
     limit_exceeded: bool,
+    cancel: Option<&'a AtomicBool>,
+    cancelled: bool,
 }
 
 #[cfg(feature = "candle")]
-impl<R: Read> BoundedHeaderRecorder<R> {
-    fn new(inner: R, limit_bytes: u64) -> Self {
+impl<'a, R: Read> BoundedHeaderRecorder<'a, R> {
+    fn new(inner: R, limit_bytes: u64, cancel: Option<&'a AtomicBool>) -> Self {
         Self {
             inner,
             captured: Vec::new(),
             limit_bytes,
             limit_exceeded: false,
+            cancel,
+            cancelled: false,
         }
     }
 
@@ -835,8 +920,14 @@ impl<R: Read> BoundedHeaderRecorder<R> {
 }
 
 #[cfg(feature = "candle")]
-impl<R: Read> Read for BoundedHeaderRecorder<R> {
+impl<R: Read> Read for BoundedHeaderRecorder<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            self.cancelled = true;
+            return Err(std::io::Error::other(
+                "canonical shard header inspection cancelled",
+            ));
+        }
         let remaining = self.limit_bytes.saturating_sub(self.captured.len() as u64);
         if remaining == 0 {
             if buf.is_empty() {
@@ -853,6 +944,12 @@ impl<R: Read> Read for BoundedHeaderRecorder<R> {
             .unwrap_or(usize::MAX)
             .min(buf.len());
         let n = self.inner.read(&mut buf[..max_read])?;
+        if self.cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            self.cancelled = true;
+            return Err(std::io::Error::other(
+                "canonical shard header inspection cancelled",
+            ));
+        }
         self.captured.extend_from_slice(&buf[..n]);
         Ok(n)
     }
@@ -865,15 +962,30 @@ struct ParsedGgufHeader {
     captured_header: CapturedGgufHeader,
 }
 
-#[cfg(feature = "candle")]
+#[cfg(all(test, feature = "candle"))]
 fn read_bounded_header_with_limit<R: Read>(
     reader: R,
     max_header_bytes: u64,
 ) -> Result<ParsedGgufHeader, ShardAdmissionError> {
-    let mut recorder = BoundedHeaderRecorder::new(reader, max_header_bytes);
+    read_bounded_header_with_limit_cancellable(reader, max_header_bytes, None)
+}
+
+#[cfg(feature = "candle")]
+fn read_bounded_header_with_limit_cancellable<R: Read>(
+    reader: R,
+    max_header_bytes: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<ParsedGgufHeader, ShardAdmissionError> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(ShardAdmissionError::Cancelled);
+    }
+    let mut recorder = BoundedHeaderRecorder::new(reader, max_header_bytes, cancel);
     let (meta, tensors) = match read_header(&mut recorder) {
         Ok(parsed) => parsed,
         Err(source) => {
+            if recorder.cancelled {
+                return Err(ShardAdmissionError::Cancelled);
+            }
             if recorder.limit_exceeded {
                 return Err(ShardAdmissionError::HeaderTooLarge {
                     limit_bytes: max_header_bytes,
@@ -883,6 +995,9 @@ fn read_bounded_header_with_limit<R: Read>(
         }
     };
     let (captured, _) = recorder.into_parts();
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(ShardAdmissionError::Cancelled);
+    }
     if captured.len_u64()? > max_header_bytes {
         return Err(ShardAdmissionError::HeaderTooLarge {
             limit_bytes: max_header_bytes,
@@ -1504,7 +1619,7 @@ fn validate_config_matches_header(
 #[cfg(all(test, feature = "candle"))]
 mod candle_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
     use candle_core::{Device, Tensor};
@@ -2374,11 +2489,122 @@ mod candle_tests {
             .expect("positive kv and working-set budget admits");
         assert_eq!(admitted.reserved_kv_cache_bytes, 1);
     }
+
+    struct CancelAfterFirstReadReader<'a> {
+        inner: Cursor<Vec<u8>>,
+        cancel: &'a AtomicBool,
+        reads: usize,
+    }
+
+    impl Read for CancelAfterFirstReadReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            if n > 0 {
+                self.reads += 1;
+                if self.reads == 1 {
+                    self.cancel.store(true, Ordering::Release);
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn committed_artifact_cancellable_matches_noncancellable_and_aborts_mid_verification() {
+        let mut bytes = HeaderFixture::llama(4, 16, 4, 2, 28, 24, true).to_bytes();
+        let header_len = bytes.len();
+        bytes.resize(header_len + 2 * 1024 * 1024 + 37, 0x5Au8);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let file = TempGguf(std::env::temp_dir().join(format!(
+            "arc-shard-adm-{}-{id}-cancellable-commit.gguf",
+            std::process::id()
+        )));
+        std::fs::write(&file.0, &bytes).expect("write fixture");
+
+        let commitment = ModelArtifactCommitment::from_path(&file.0).expect("commit fixture");
+        let uncancelled = AtomicBool::new(false);
+        let baseline =
+            CanonicalShardMetadata::from_committed_artifact(&commitment).expect("baseline commit");
+        let cancellable =
+            CanonicalShardMetadata::from_committed_artifact_cancellable(&commitment, &uncancelled)
+                .expect("cancellable commit");
+        assert_eq!(cancellable, baseline);
+        assert_eq!(
+            cancellable.trust_boundary(),
+            ArtifactTrustBoundary::VerifiedBlake3Commitment {
+                model_id: commitment.model_id(),
+                size_bytes: commitment.size_bytes(),
+            }
+        );
+
+        let mut tampered = bytes.clone();
+        tampered[header_len + 1024 * 1024 + 13] ^= 0x01;
+        std::fs::write(&file.0, &tampered).expect("write tampered fixture");
+        let tamper_err =
+            CanonicalShardMetadata::from_committed_artifact_cancellable(&commitment, &uncancelled)
+                .expect_err("tampered payload must still fail verification");
+        assert!(matches!(
+            tamper_err,
+            ShardAdmissionError::ArtifactVerification(_)
+        ));
+        assert!(!tamper_err.is_cancelled());
+        std::fs::write(&file.0, &bytes).expect("restore fixture");
+
+        let preset_cancel = AtomicBool::new(true);
+        let preset_err = CanonicalShardMetadata::from_committed_artifact_cancellable(
+            &commitment,
+            &preset_cancel,
+        )
+        .expect_err("preset cancel must abort");
+        assert!(preset_err.is_cancelled());
+        assert!(matches!(preset_err, ShardAdmissionError::Cancelled));
+
+        let header_cancel = AtomicBool::new(false);
+        let mut header_reader = CancelAfterFirstReadReader {
+            inner: Cursor::new(bytes),
+            cancel: &header_cancel,
+            reads: 0,
+        };
+        let header_err = CanonicalShardMetadata::from_reader_with_limit_cancellable(
+            &mut header_reader,
+            MAX_GGUF_HEADER_BYTES,
+            Some(&header_cancel),
+        )
+        .expect_err("mid-header cancel must abort");
+        assert!(header_err.is_cancelled());
+        assert_eq!(header_reader.reads, 1);
+
+        let verify_cancel = AtomicBool::new(false);
+        let mut header_parsed = false;
+        let verify_err = CanonicalShardMetadata::from_committed_artifact_cancellable_with_hook(
+            &commitment,
+            &verify_cancel,
+            || {
+                header_parsed = true;
+                verify_cancel.store(true, Ordering::Release);
+            },
+        )
+        .expect_err("cancel before second verification pass must abort");
+        assert!(header_parsed);
+        assert!(verify_err.is_cancelled());
+        assert!(matches!(verify_err, ShardAdmissionError::Cancelled));
+    }
 }
 
 #[cfg(all(test, not(feature = "candle")))]
 mod non_candle_tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static NON_CANDLE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct NonCandleTempFile(PathBuf);
+
+    impl Drop for NonCandleTempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn non_candle_build_refuses_canonical_shard_metadata_inspection() {
@@ -2387,5 +2613,28 @@ mod non_candle_tests {
         };
         assert!(matches!(err, ShardAdmissionError::CandleFeatureDisabled));
         assert!(err.to_string().contains("candle feature not enabled"));
+
+        let seq = NON_CANDLE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file = NonCandleTempFile(std::env::temp_dir().join(format!(
+            "arc-shard-adm-non-candle-{}-{seq}.gguf",
+            std::process::id()
+        )));
+        std::fs::write(&file.0, b"non-candle-stub").expect("write stub");
+        let commitment = ModelArtifactCommitment::from_path(&file.0).expect("commit stub");
+
+        let cancelled = AtomicBool::new(true);
+        let cancel_err =
+            CanonicalShardMetadata::from_committed_artifact_cancellable(&commitment, &cancelled)
+                .expect_err("preset cancel must abort even without candle");
+        assert!(cancel_err.is_cancelled());
+
+        let uncancelled = AtomicBool::new(false);
+        let disabled_err =
+            CanonicalShardMetadata::from_committed_artifact_cancellable(&commitment, &uncancelled)
+                .expect_err("non-candle build must refuse committed inspection");
+        assert!(matches!(
+            disabled_err,
+            ShardAdmissionError::CandleFeatureDisabled
+        ));
     }
 }

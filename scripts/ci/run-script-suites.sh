@@ -43,6 +43,7 @@ run_unittest "benchmarks: native request latency (M8)"      scripts/benchmarks/t
 run_unittest "benchmarks: inference cost projection (M9)"   scripts/benchmarks/tests/test_project_inference_cost.py
 run_unittest "ci: no-comments checker"                     scripts/ci/test_no_comments.py
 run_unittest "qualification: mandatory recovery selectors" scripts/qualification/tests/test_recovery_peer_selectors.py
+run_unittest "qualification: real-model worker startup guards" scripts/qualification/tests/test_worker_startup_qualification.py
 PYTHONPATH="$REPO_ROOT/scripts/qualification:$REPO_ROOT/scripts/qualification/tests" run_unittest "qualification: bounded shard evidence" discover -s scripts/qualification/scaling_tests -p 'test*.py'
 
 exit "$failed"

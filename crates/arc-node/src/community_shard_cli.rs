@@ -6,7 +6,7 @@ use arc_inference::cached_integer_model::{
 use arc_inference::canonical_shard_admission::{
     ArtifactTrustBoundary, CanonicalShardMetadata, ShardAdmissionError, ShardAdmissionEstimate,
 };
-use arc_inference::model_artifact::ModelArtifactCommitment;
+use arc_inference::model_artifact::{ModelArtifactCommitment, ModelArtifactLoadError};
 use arc_node::community_shard_executor::{DEFAULT_MAX_KV_CACHE_BYTES, MAX_KV_CACHE_BYTES_HARD_CAP};
 use arc_node::community_shard_worker::{
     CommunityShardWorkerConfig, CommunityShardWorkerError, PartialModelLoader, WorkerRunSummary,
@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 pub const DEFAULT_WORKER_THREADS: usize = 1;
 pub const MAX_WORKER_THREADS_HARD_CAP: usize = 64;
+const HEADER_ADMISSION_ONLY_MODE: &str = "header-admission-only";
 const ESTIMATE_BASIS_NOTE: &str = "conservative_payload_budget_not_exact_rss";
 const ROLE_PLACEMENT_LIMITATION_NOTE: &str = "conservative_all_roles_required: coordinator protocol does not support role-aware placement; admitted_max_resident_layers must fit first (Q16+I8 embeddings), last (output head + final norm), and interior shard roles within max_working_set_bytes";
 
@@ -52,8 +53,12 @@ pub struct CommunityShardWorkerArgs {
     #[arg(long, value_name = "PATH")]
     pub model_path: PathBuf,
 
-    /// Mode-0600 Ed25519 worker keyfile (required unless --check-only).
-    #[arg(long, value_name = "PATH", required_unless_present = "check_only")]
+    /// Mode-0600 Ed25519 worker keyfile (required unless --check-only or --check-header-only).
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present_any = ["check_only", "check_header_only"]
+    )]
     pub worker_key_file: Option<PathBuf>,
 
     /// Human-readable worker name registered with the coordinator.
@@ -85,8 +90,12 @@ pub struct CommunityShardWorkerArgs {
     pub prevent_sleep_during_jobs: bool,
 
     /// Verify pinned artifact and conservative all-roles admission, print JSON report, and exit without key loading, Rayon init, weights, or network.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "check_header_only")]
     pub check_only: bool,
+
+    /// Validate pins, bounded GGUF header geometry, and conservative all-roles admission without full-file BLAKE3 hashing, key loading, Rayon init, weights, or network.
+    #[arg(long, conflicts_with = "check_only")]
+    pub check_header_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +130,13 @@ impl ShardWorkerLaunchSpec {
             threads: args.threads,
             allow_insecure_for_loopback: args.allow_insecure_for_loopback,
             prevent_sleep_during_jobs: args.prevent_sleep_during_jobs,
-            report_mode: if args.check_only { "check-only" } else { "run" },
+            report_mode: if args.check_header_only {
+                HEADER_ADMISSION_ONLY_MODE
+            } else if args.check_only {
+                "check-only"
+            } else {
+                "run"
+            },
         }
     }
 }
@@ -216,6 +231,18 @@ pub struct AdmissionReport {
     pub header_bytes: u64,
     pub max_working_set_bytes: u64,
     pub max_kv_cache_bytes: usize,
+    pub admission: AllRolesAdmissionReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeaderOnlyAdmissionReport {
+    pub mode: &'static str,
+    pub artifact_verified: bool,
+    pub coordinator_url: String,
+    pub coordinator_id: String,
+    pub transaction_domain: String,
+    pub expected_model_id: String,
+    pub max_working_set_bytes: u64,
     pub admission: AllRolesAdmissionReport,
 }
 
@@ -452,6 +479,10 @@ fn validate_args_with_parallelism(
     available_parallelism: usize,
 ) -> Result<ValidatedInputs> {
     ensure!(
+        !(args.check_only && args.check_header_only),
+        "--check-only and --check-header-only are mutually exclusive"
+    );
+    ensure!(
         args.coordinator_id != Hash256::ZERO,
         "--coordinator-id must be nonzero"
     );
@@ -464,14 +495,14 @@ fn validate_args_with_parallelism(
         "--expected-model-id must be nonzero"
     );
     ensure!(
-        args.check_only || args.worker_key_file.is_some(),
-        "--worker-key-file is required unless --check-only is set"
+        args.check_only || args.check_header_only || args.worker_key_file.is_some(),
+        "--worker-key-file is required unless --check-only or --check-header-only is set"
     );
     let spec = ShardWorkerLaunchSpec::from_cli_args(args);
     validate_launch_spec_with_parallelism(&spec, available_parallelism)
 }
 
-fn ensure_regular_model_file(path: &Path) -> Result<()> {
+pub(crate) fn ensure_regular_model_file(path: &Path) -> Result<()> {
     ensure!(
         path.to_str().is_some(),
         "model artifact path {} is not valid UTF-8",
@@ -492,19 +523,7 @@ fn ensure_regular_model_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_metadata_against_protocol(
-    metadata: &CanonicalShardMetadata,
-    expected_model_id: Hash256,
-    expected_size_bytes: u64,
-) -> Result<()> {
-    ensure!(
-        metadata.trust_boundary()
-            == ArtifactTrustBoundary::VerifiedBlake3Commitment {
-                model_id: expected_model_id,
-                size_bytes: expected_size_bytes,
-            },
-        "model metadata trust boundary does not match verified BLAKE3 commitment"
-    );
+fn validate_metadata_protocol_geometry(metadata: &CanonicalShardMetadata) -> Result<()> {
     ensure!(
         metadata.canonical_profile() == CANONICAL_REWARD_INFERENCE_PROFILE,
         "unsupported execution profile {:?}; expected {:?}",
@@ -550,6 +569,80 @@ fn validate_metadata_against_protocol(
         );
     }
     Ok(())
+}
+
+fn validate_metadata_against_protocol(
+    metadata: &CanonicalShardMetadata,
+    expected_model_id: Hash256,
+    expected_size_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        metadata.trust_boundary()
+            == ArtifactTrustBoundary::VerifiedBlake3Commitment {
+                model_id: expected_model_id,
+                size_bytes: expected_size_bytes,
+            },
+        "model metadata trust boundary does not match verified BLAKE3 commitment"
+    );
+    validate_metadata_protocol_geometry(metadata)
+}
+
+pub(crate) fn prevalidate_early_shard_model_header(
+    spec: &ShardWorkerLaunchSpec,
+    validated: &ValidatedInputs,
+) -> Result<CanonicalShardMetadata> {
+    ensure_regular_model_file(&spec.model_path)?;
+    let metadata = CanonicalShardMetadata::from_path(&spec.model_path).with_context(|| {
+        format!(
+            "bounded pre-bind GGUF header validation failed for {}",
+            spec.model_path.display()
+        )
+    })?;
+    ensure!(
+        metadata.trust_boundary() == ArtifactTrustBoundary::UnverifiedHeaderOnly,
+        "pre-bind shard header inspection must remain unverified until BLAKE3 commitment completes"
+    );
+    validate_metadata_protocol_geometry(&metadata)?;
+    let _ = derive_all_roles_admission(
+        &metadata,
+        spec.max_resident_layers,
+        spec.max_working_set_bytes,
+        validated.max_kv_cache_bytes_u64,
+    )?;
+    Ok(metadata)
+}
+
+fn check_header_only_with_parallelism(
+    args: &CommunityShardWorkerArgs,
+    available_parallelism: usize,
+) -> Result<HeaderOnlyAdmissionReport> {
+    ensure!(
+        args.check_header_only,
+        "--check-header-only must be set for header-only admission check"
+    );
+    let validated = validate_args_with_parallelism(args, available_parallelism)?;
+    let spec = ShardWorkerLaunchSpec::from_cli_args(args);
+    let metadata = prevalidate_early_shard_model_header(&spec, &validated)?;
+    ensure!(
+        metadata.trust_boundary() == ArtifactTrustBoundary::UnverifiedHeaderOnly,
+        "header-only admission check must keep model metadata unverified"
+    );
+    let admission = derive_all_roles_admission(
+        &metadata,
+        spec.max_resident_layers,
+        spec.max_working_set_bytes,
+        validated.max_kv_cache_bytes_u64,
+    )?;
+    Ok(HeaderOnlyAdmissionReport {
+        mode: HEADER_ADMISSION_ONLY_MODE,
+        artifact_verified: false,
+        coordinator_url: validated.normalized_coordinator_url,
+        coordinator_id: spec.coordinator_id.to_hex(),
+        transaction_domain: spec.transaction_domain.to_hex(),
+        expected_model_id: spec.expected_model_id.to_hex(),
+        max_working_set_bytes: spec.max_working_set_bytes,
+        admission,
+    })
 }
 
 fn evaluate_roles_at_width<A: ShardBudgetAdmitter>(
@@ -678,22 +771,40 @@ fn derive_all_roles_admission<A: ShardBudgetAdmitter>(
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("model preparation canceled")]
+pub(crate) struct ModelPreparationCanceled;
+
 pub(crate) fn prepare_launch_spec_blocking(
     spec: &ShardWorkerLaunchSpec,
     validated: &ValidatedInputs,
     cancel: &AtomicBool,
 ) -> Result<PreparedWorker> {
-    ensure!(
-        !cancel.load(Ordering::Acquire),
-        "model preparation canceled"
-    );
+    prepare_launch_spec_blocking_with_after_commit_hook(spec, validated, cancel, || {})
+}
+
+fn prepare_launch_spec_blocking_with_after_commit_hook(
+    spec: &ShardWorkerLaunchSpec,
+    validated: &ValidatedInputs,
+    cancel: &AtomicBool,
+    after_first_commit: impl FnOnce(),
+) -> Result<PreparedWorker> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(ModelPreparationCanceled.into());
+    }
     ensure_regular_model_file(&spec.model_path)?;
-    let artifact = ModelArtifactCommitment::from_path(&spec.model_path).with_context(|| {
-        format!(
-            "failed to compute BLAKE3 commitment for {}",
-            spec.model_path.display()
-        )
-    })?;
+    let artifact = match ModelArtifactCommitment::from_path_cancellable(&spec.model_path, cancel) {
+        Ok(artifact) => artifact,
+        Err(ModelArtifactLoadError::Cancelled) => return Err(ModelPreparationCanceled.into()),
+        Err(ModelArtifactLoadError::Inference(error)) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to compute BLAKE3 commitment for {}",
+                    spec.model_path.display()
+                )
+            });
+        }
+    };
     ensure!(
         artifact.model_id() == spec.expected_model_id,
         "model artifact {} BLAKE3 digest {} does not match pinned --expected-model-id {}; \
@@ -702,21 +813,23 @@ pub(crate) fn prepare_launch_spec_blocking(
         artifact.model_id().to_hex(),
         spec.expected_model_id.to_hex()
     );
-    ensure!(
-        !cancel.load(Ordering::Acquire),
-        "model preparation canceled"
-    );
+    after_first_commit();
     let metadata =
-        CanonicalShardMetadata::from_committed_artifact(&artifact).with_context(|| {
-            format!(
-                "failed to inspect committed model artifact {}",
-                spec.model_path.display()
-            )
-        })?;
-    ensure!(
-        !cancel.load(Ordering::Acquire),
-        "model preparation canceled"
-    );
+        match CanonicalShardMetadata::from_committed_artifact_cancellable(&artifact, cancel) {
+            Ok(metadata) => metadata,
+            Err(ShardAdmissionError::Cancelled) => return Err(ModelPreparationCanceled.into()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect committed model artifact {}",
+                        spec.model_path.display()
+                    )
+                });
+            }
+        };
+    if cancel.load(Ordering::Acquire) {
+        return Err(ModelPreparationCanceled.into());
+    }
     validate_metadata_against_protocol(&metadata, spec.expected_model_id, artifact.size_bytes())?;
     let admission = derive_all_roles_admission(
         &metadata,
@@ -798,6 +911,10 @@ fn prepare_model_blocking(
     validated: &ValidatedInputs,
     cancel: &AtomicBool,
 ) -> Result<PreparedWorker> {
+    ensure!(
+        !args.check_header_only,
+        "--check-header-only must not enter full verified model preparation"
+    );
     let spec = ShardWorkerLaunchSpec::from_cli_args(args);
     prepare_launch_spec_blocking(&spec, validated, cancel)
 }
@@ -1014,7 +1131,13 @@ fn format_exit_report(
 }
 
 pub async fn run(args: CommunityShardWorkerArgs) -> Result<()> {
-    let validated = validate_args_with_parallelism(&args, host_available_parallelism())?;
+    let available_parallelism = host_available_parallelism();
+    if args.check_header_only {
+        let report = check_header_only_with_parallelism(&args, available_parallelism)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let validated = validate_args_with_parallelism(&args, available_parallelism)?;
     let mut signals = ShutdownSignals::install()?;
     let cancel_prepare = Arc::new(AtomicBool::new(false));
     let prepare_args = args.clone();
@@ -1029,10 +1152,9 @@ pub async fn run(args: CommunityShardWorkerArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&prepared.report)?);
         return Ok(());
     }
-    let keyfile_path = args
-        .worker_key_file
-        .as_deref()
-        .ok_or_else(|| anyhow!("--worker-key-file is required unless --check-only is set"))?;
+    let keyfile_path = args.worker_key_file.as_deref().ok_or_else(|| {
+        anyhow!("--worker-key-file is required unless --check-only or --check-header-only is set")
+    })?;
     let keypair = Arc::new(crate::validator_identity::load_ed25519_keyfile(
         keyfile_path,
     )?);
@@ -1119,15 +1241,25 @@ async fn drive_integrated_worker_task<F, Fut>(
     }
 }
 
+fn configure_integrated_worker_config(
+    mut config: CommunityShardWorkerConfig,
+    status: Arc<arc_node::community_worker::CommunityWorkerStatus>,
+    worker_execution_gate: Arc<arc_node::native_inference::WorkerExecutionGate>,
+) -> CommunityShardWorkerConfig {
+    config.auto_reconnect = true;
+    config.telemetry = Some(status.into());
+    config.worker_execution_gate = Some(worker_execution_gate.into());
+    config
+}
+
 pub(crate) fn spawn_integrated_worker(
     prepared: PreparedWorker,
     keypair: Arc<KeyPair>,
+    worker_execution_gate: Arc<arc_node::native_inference::WorkerExecutionGate>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<JoinHandle<()>> {
     let loader = prepared.build_loader()?;
     let report = prepared.report;
-    let mut config = prepared.config;
-    config.auto_reconnect = true;
     let status = arc_node::community_worker::install(Arc::new(
         arc_node::community_worker::CommunityWorkerStatus::new_sharded(
             format!("0x{}", keypair.address().to_hex()),
@@ -1135,10 +1267,14 @@ pub(crate) fn spawn_integrated_worker(
             &report.model_name,
             &report.model_id,
             report.n_layers,
-            config.prevent_sleep_during_jobs,
+            prepared.config.prevent_sleep_during_jobs,
         ),
     ));
-    config.telemetry = Some(Arc::clone(&status).into());
+    let config = configure_integrated_worker_config(
+        prepared.config,
+        Arc::clone(&status),
+        worker_execution_gate,
+    );
     let model_spec = prepared.model_spec;
     Ok(tokio::spawn(drive_integrated_worker_task(
         report,
@@ -1270,6 +1406,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn integrated_shard_worker_shared_prepare_cancels_during_committed_metadata_verification() {
+        let model_file = TempPath::new("committed-cancel.gguf");
+        std::fs::write(&model_file.0, minimal_canonical_llama_gguf_header_bytes(4)).unwrap();
+        let commitment = ModelArtifactCommitment::from_path(&model_file.0).unwrap();
+        let mut spec = sample_integrated_launch_spec(model_file.0.clone());
+        spec.expected_model_id = commitment.model_id();
+        let validated = validate_launch_spec_with_parallelism(&spec, 4).unwrap();
+
+        let uncancelled = AtomicBool::new(false);
+        let prepared = prepare_launch_spec_blocking(&spec, &validated, &uncancelled)
+            .expect("pinned canonical GGUF should prepare when uncancelled");
+        assert_eq!(prepared.report.model_id, commitment.model_id().to_hex());
+
+        let cancel = AtomicBool::new(false);
+        let mut first_commit_completed = false;
+        let canceled =
+            prepare_launch_spec_blocking_with_after_commit_hook(&spec, &validated, &cancel, || {
+                first_commit_completed = true;
+                cancel.store(true, Ordering::Release);
+            })
+            .err()
+            .expect("cancel during committed metadata verification must abort");
+        assert!(first_commit_completed);
+        assert!(
+            canceled
+                .downcast_ref::<ModelPreparationCanceled>()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn integrated_shard_worker_runtime_task_drains_before_join_returns() {
         let (runtime_shutdown_tx, runtime_shutdown_rx) = watch::channel(false);
@@ -1315,6 +1482,41 @@ mod tests {
         )
         .await;
         assert!(!entered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn integrated_worker_config_wires_execution_gate_while_standalone_leaves_it_none() {
+        use arc_node::community_worker::CommunityWorkerStatus;
+        use arc_node::native_inference::WorkerExecutionGate;
+
+        let base = CommunityShardWorkerConfig::new(
+            "https://coordinator.example.com",
+            Hash256([0x11; 32]),
+            Some(Hash256([0x22; 32])),
+            1,
+            "worker-integrated",
+            "arc-2L-64d-1h-32v",
+            "linux-x86_64",
+        );
+        assert!(!base.auto_reconnect);
+        assert!(base.telemetry.is_none());
+        assert!(base.worker_execution_gate.is_none());
+
+        let status = Arc::new(CommunityWorkerStatus::new_sharded(
+            format!("0x{}", Hash256([0x44; 32]).to_hex()),
+            "worker-integrated",
+            "arc-2L-64d-1h-32v",
+            Hash256([0x33; 32]).to_hex(),
+            2,
+            false,
+        ));
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let status_arg = Arc::clone(&status);
+        let gate_arg = Arc::clone(&gate);
+        let integrated = configure_integrated_worker_config(base, status_arg, gate_arg);
+        assert!(integrated.auto_reconnect);
+        assert_eq!(integrated.telemetry, Some(status.into()));
+        assert_eq!(integrated.worker_execution_gate, Some(gate.into()));
     }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1899,5 +2101,614 @@ mod tests {
                 .to_string();
             assert!(err.contains("not valid UTF-8"), "{err}");
         }
+    }
+
+    fn minimal_canonical_llama_gguf_header_bytes(n_layers: usize) -> Vec<u8> {
+        fn push_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let d_model = 16usize;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let d_kv = 8usize;
+        let d_ff = 28usize;
+        let vocab_size = 24usize;
+        let tokens: Vec<String> = (0..vocab_size).map(|idx| format!("tok_{idx}")).collect();
+        let mut tensors: Vec<(String, Vec<u64>)> = vec![
+            (
+                "token_embd.weight".to_string(),
+                vec![d_model as u64, vocab_size as u64],
+            ),
+            (
+                "output.weight".to_string(),
+                vec![d_model as u64, vocab_size as u64],
+            ),
+            ("output_norm.weight".to_string(), vec![d_model as u64]),
+        ];
+        for layer in 0..n_layers {
+            let p = format!("blk.{layer}");
+            tensors.push((
+                format!("{p}.attn_q.weight"),
+                vec![d_model as u64, d_model as u64],
+            ));
+            tensors.push((
+                format!("{p}.attn_k.weight"),
+                vec![d_model as u64, d_kv as u64],
+            ));
+            tensors.push((
+                format!("{p}.attn_v.weight"),
+                vec![d_model as u64, d_kv as u64],
+            ));
+            tensors.push((
+                format!("{p}.attn_output.weight"),
+                vec![d_model as u64, d_model as u64],
+            ));
+            tensors.push((
+                format!("{p}.ffn_gate.weight"),
+                vec![d_model as u64, d_ff as u64],
+            ));
+            tensors.push((
+                format!("{p}.ffn_up.weight"),
+                vec![d_model as u64, d_ff as u64],
+            ));
+            tensors.push((
+                format!("{p}.ffn_down.weight"),
+                vec![d_ff as u64, d_model as u64],
+            ));
+            tensors.push((format!("{p}.attn_norm.weight"), vec![d_model as u64]));
+            tensors.push((format!("{p}.ffn_norm.weight"), vec![d_model as u64]));
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&9u64.to_le_bytes());
+
+        push_str(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        push_str(&mut buf, "llama");
+
+        for (key, val) in [
+            ("llama.block_count", n_layers as u32),
+            ("llama.embedding_length", d_model as u32),
+            ("llama.attention.head_count", n_heads as u32),
+            ("llama.attention.head_count_kv", n_kv_heads as u32),
+            ("llama.feed_forward_length", d_ff as u32),
+            ("tokenizer.ggml.bos_token_id", 1u32),
+        ] {
+            push_str(&mut buf, key);
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+
+        push_str(&mut buf, "tokenizer.ggml.eos_token_id");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+
+        push_str(&mut buf, "tokenizer.ggml.tokens");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&(tokens.len() as u64).to_le_bytes());
+        for token in &tokens {
+            push_str(&mut buf, token);
+        }
+
+        for (name, dims) in &tensors {
+            push_str(&mut buf, name);
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for dim in dims {
+                buf.extend_from_slice(&dim.to_le_bytes());
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn early_shard_header_prevalidation_rejects_bad_headers_and_budgets_before_bind() {
+        let missing_spec =
+            sample_integrated_launch_spec(PathBuf::from("/nonexistent/early-shard.gguf"));
+        let validated = validate_launch_spec_with_parallelism(&missing_spec, 4).unwrap();
+        let missing_err = prevalidate_early_shard_model_header(&missing_spec, &validated)
+            .expect_err("missing model file must fail before bind")
+            .to_string();
+        assert!(missing_err.contains("regular file"), "{missing_err}");
+
+        let empty_file = TempPath::new("empty.gguf");
+        std::fs::write(&empty_file.0, b"").unwrap();
+        let mut spec = sample_integrated_launch_spec(empty_file.0.clone());
+        let empty_err = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect_err("empty model file must fail before bind")
+            .to_string();
+        assert!(empty_err.contains("is empty"), "{empty_err}");
+
+        let invalid_file = TempPath::new("invalid.gguf");
+        std::fs::write(&invalid_file.0, b"not-a-gguf-header").unwrap();
+        spec.model_path = invalid_file.0.clone();
+        let invalid_err = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect_err("invalid GGUF must fail before bind")
+            .to_string();
+        assert!(
+            invalid_err.contains("bounded pre-bind GGUF header validation failed"),
+            "{invalid_err}"
+        );
+
+        let truncated_file = TempPath::new("truncated.gguf");
+        let valid_bytes = minimal_canonical_llama_gguf_header_bytes(4);
+        std::fs::write(&truncated_file.0, &valid_bytes[..28]).unwrap();
+        spec.model_path = truncated_file.0.clone();
+        let truncated_err = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect_err("truncated GGUF header must fail before bind")
+            .to_string();
+        assert!(
+            truncated_err.contains("bounded pre-bind GGUF header validation failed"),
+            "{truncated_err}"
+        );
+
+        let one_layer_file = TempPath::new("one-layer.gguf");
+        std::fs::write(
+            &one_layer_file.0,
+            minimal_canonical_llama_gguf_header_bytes(1),
+        )
+        .unwrap();
+        spec.model_path = one_layer_file.0.clone();
+        let one_layer_err = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect_err("1-layer GGUF must fail protocol geometry before bind")
+            .to_string();
+        assert!(
+            one_layer_err.contains("model n_layers 1"),
+            "{one_layer_err}"
+        );
+
+        let valid_file = TempPath::new("valid-4l.gguf");
+        std::fs::write(&valid_file.0, &valid_bytes).unwrap();
+        spec.model_path = valid_file.0.clone();
+        spec.max_working_set_bytes = 1_024;
+        let budget_err = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect_err("undersized working-set budget must fail admission before bind")
+            .to_string();
+        assert!(
+            budget_err.contains("cannot admit even 1 resident layer"),
+            "{budget_err}"
+        );
+
+        spec.max_working_set_bytes = 512 * 1024 * 1024;
+        let meta = prevalidate_early_shard_model_header(&spec, &validated)
+            .expect("valid canonical header with sufficient budget should pass prevalidation");
+        assert_eq!(
+            meta.trust_boundary(),
+            ArtifactTrustBoundary::UnverifiedHeaderOnly
+        );
+        let unpinned_err = prepare_launch_spec_blocking(&spec, &validated, &AtomicBool::new(false))
+            .err()
+            .expect("prevalidated unverified header must still enforce pinned BLAKE3 digest")
+            .to_string();
+        assert!(
+            unpinned_err.contains("does not match pinned --expected-model-id"),
+            "{unpinned_err}"
+        );
+
+        #[cfg(unix)]
+        {
+            let dangling_link = TempPath::new("dangling-link.gguf");
+            std::os::unix::fs::symlink("/nonexistent/dangling-target.gguf", &dangling_link.0)
+                .unwrap();
+            spec.model_path = dangling_link.0.clone();
+            assert!(prevalidate_early_shard_model_header(&spec, &validated).is_err());
+
+            let dir_target = TempPath::new("dir-target");
+            std::fs::create_dir(&dir_target.0).unwrap();
+            let dir_link = TempPath::new("dir-link.gguf");
+            std::os::unix::fs::symlink(&dir_target.0, &dir_link.0).unwrap();
+            spec.model_path = dir_link.0.clone();
+            let dir_link_err = prevalidate_early_shard_model_header(&spec, &validated)
+                .expect_err("symlink to directory must fail before bind")
+                .to_string();
+            assert!(dir_link_err.contains("regular file"), "{dir_link_err}");
+
+            let malformed_link = TempPath::new("malformed-link.gguf");
+            std::os::unix::fs::symlink(&truncated_file.0, &malformed_link.0).unwrap();
+            spec.model_path = malformed_link.0.clone();
+            assert!(prevalidate_early_shard_model_header(&spec, &validated).is_err());
+
+            let valid_link = TempPath::new("valid-link.gguf");
+            std::os::unix::fs::symlink(&valid_file.0, &valid_link.0).unwrap();
+            spec.model_path = valid_link.0.clone();
+            let link_meta = prevalidate_early_shard_model_header(&spec, &validated)
+                .expect("symlink to valid canonical GGUF header should prevalidate unverified");
+            assert_eq!(
+                link_meta.trust_boundary(),
+                ArtifactTrustBoundary::UnverifiedHeaderOnly
+            );
+        }
+    }
+
+    fn header_only_argv(model_path: &Path) -> Vec<String> {
+        let mut argv = base_argv();
+        let key_pos = argv
+            .iter()
+            .position(|item| item == "--worker-key-file")
+            .unwrap();
+        argv.drain(key_pos..=key_pos + 1);
+        let model_pos = argv.iter().position(|item| item == "--model-path").unwrap();
+        argv[model_pos + 1] = model_path.display().to_string();
+        let budget_pos = argv
+            .iter()
+            .position(|item| item == "--max-working-set-bytes")
+            .unwrap();
+        argv[budget_pos + 1] = (512u64 * 1024 * 1024).to_string();
+        argv.push("--check-header-only".into());
+        argv
+    }
+
+    #[test]
+    fn cli_check_header_only_allows_missing_keyfile_and_conflicts_with_check_only() {
+        let argv = header_only_argv(Path::new("/tmp/nonexistent.gguf"));
+        let args = parse_worker_args(&argv).expect("check-header-only should omit keyfile");
+        assert!(args.check_header_only);
+        assert!(!args.check_only);
+        assert!(args.worker_key_file.is_none());
+
+        let mut conflict_argv = argv.clone();
+        conflict_argv.push("--check-only".into());
+        assert!(
+            crate::Cli::try_parse_from(&conflict_argv).is_err(),
+            "--check-only and --check-header-only must conflict in CLI parsing"
+        );
+
+        let mut both = args.clone();
+        both.check_only = true;
+        let both_err = validate_args_with_parallelism(&both, 4)
+            .expect_err("programmatic check_only + check_header_only must fail")
+            .to_string();
+        assert!(both_err.contains("mutually exclusive"), "{both_err}");
+
+        let validated_header_only = validate_args_with_parallelism(&args, 4).unwrap();
+        let prepare_err =
+            prepare_model_blocking(&args, &validated_header_only, &AtomicBool::new(false))
+                .err()
+                .expect("header-only args must be refused by full model preparation")
+                .to_string();
+        assert!(
+            prepare_err.contains("must not enter full verified model preparation"),
+            "{prepare_err}"
+        );
+
+        let mut run_without_key = args.clone();
+        run_without_key.check_header_only = false;
+        let missing_key_err = validate_args_with_parallelism(&run_without_key, 4)
+            .expect_err("normal run mode must still require worker keyfile")
+            .to_string();
+        assert!(
+            missing_key_err.contains("--worker-key-file is required"),
+            "{missing_key_err}"
+        );
+
+        for flag in [
+            "--coordinator-url",
+            "--coordinator-id",
+            "--transaction-domain",
+            "--expected-model-id",
+            "--model-path",
+            "--worker-name",
+            "--max-working-set-bytes",
+        ] {
+            let mut missing_pin = argv.clone();
+            let pos = missing_pin.iter().position(|item| item == flag).unwrap();
+            missing_pin.drain(pos..=pos + 1);
+            assert!(
+                crate::Cli::try_parse_from(&missing_pin).is_err(),
+                "expected missing {flag} to fail in --check-header-only mode"
+            );
+        }
+    }
+
+    #[test]
+    fn check_header_only_rejects_malformed_headers_geometry_pins_urls_threads_and_budgets() {
+        let valid_bytes = minimal_canonical_llama_gguf_header_bytes(4);
+        let valid_file = TempPath::new("header-only-valid-4l.gguf");
+        std::fs::write(&valid_file.0, &valid_bytes).unwrap();
+        let base = parse_worker_args(&header_only_argv(&valid_file.0)).unwrap();
+
+        let mut zero_coord = base.clone();
+        zero_coord.coordinator_id = Hash256::ZERO;
+        assert!(check_header_only_with_parallelism(&zero_coord, 4).is_err());
+
+        let mut zero_domain = base.clone();
+        zero_domain.transaction_domain = Hash256::ZERO;
+        assert!(check_header_only_with_parallelism(&zero_domain, 4).is_err());
+
+        let mut zero_model = base.clone();
+        zero_model.expected_model_id = Hash256::ZERO;
+        assert!(check_header_only_with_parallelism(&zero_model, 4).is_err());
+
+        let mut insecure_url = base.clone();
+        insecure_url.coordinator_url = "http://127.0.0.1:9944".into();
+        assert!(check_header_only_with_parallelism(&insecure_url, 4).is_err());
+
+        let mut remote_http = base.clone();
+        remote_http.coordinator_url = "http://192.0.2.10:9944".into();
+        remote_http.allow_insecure_for_loopback = true;
+        assert!(check_header_only_with_parallelism(&remote_http, 4).is_err());
+
+        let mut zero_threads = base.clone();
+        zero_threads.threads = 0;
+        assert!(check_header_only_with_parallelism(&zero_threads, 4).is_err());
+
+        let mut excess_threads = base.clone();
+        excess_threads.threads = 5;
+        assert!(check_header_only_with_parallelism(&excess_threads, 4).is_err());
+
+        let mut missing_model = base.clone();
+        missing_model.model_path = PathBuf::from("/nonexistent/header-only-missing.gguf");
+        assert!(check_header_only_with_parallelism(&missing_model, 4).is_err());
+
+        let dir_path = TempPath::new("header-only-dir");
+        std::fs::create_dir(&dir_path.0).unwrap();
+        let mut dir_model = base.clone();
+        dir_model.model_path = dir_path.0.clone();
+        let dir_err = check_header_only_with_parallelism(&dir_model, 4)
+            .expect_err("directory model path must fail")
+            .to_string();
+        assert!(dir_err.contains("regular file"), "{dir_err}");
+
+        let empty_file = TempPath::new("header-only-empty.gguf");
+        std::fs::write(&empty_file.0, b"").unwrap();
+        let mut empty_model = base.clone();
+        empty_model.model_path = empty_file.0.clone();
+        assert!(check_header_only_with_parallelism(&empty_model, 4).is_err());
+
+        let invalid_file = TempPath::new("header-only-bad-magic.gguf");
+        std::fs::write(&invalid_file.0, b"not-a-valid-gguf-header").unwrap();
+        let mut invalid_model = base.clone();
+        invalid_model.model_path = invalid_file.0.clone();
+        let invalid_err = check_header_only_with_parallelism(&invalid_model, 4)
+            .expect_err("malformed GGUF header must fail")
+            .to_string();
+        assert!(
+            invalid_err.contains("bounded pre-bind GGUF header validation failed"),
+            "{invalid_err}"
+        );
+
+        let truncated_file = TempPath::new("header-only-truncated.gguf");
+        std::fs::write(&truncated_file.0, &valid_bytes[..28]).unwrap();
+        let mut truncated_model = base.clone();
+        truncated_model.model_path = truncated_file.0.clone();
+        assert!(check_header_only_with_parallelism(&truncated_model, 4).is_err());
+
+        let one_layer_file = TempPath::new("header-only-one-layer.gguf");
+        std::fs::write(
+            &one_layer_file.0,
+            minimal_canonical_llama_gguf_header_bytes(1),
+        )
+        .unwrap();
+        let mut one_layer_model = base.clone();
+        one_layer_model.model_path = one_layer_file.0.clone();
+        let geometry_err = check_header_only_with_parallelism(&one_layer_model, 4)
+            .expect_err("1-layer GGUF must fail protocol geometry")
+            .to_string();
+        assert!(geometry_err.contains("model n_layers 1"), "{geometry_err}");
+
+        let mut below_kv = base.clone();
+        below_kv.max_working_set_bytes = (DEFAULT_MAX_KV_CACHE_BYTES as u64) - 1;
+        assert!(check_header_only_with_parallelism(&below_kv, 4).is_err());
+
+        let mut tight_budget = base.clone();
+        tight_budget.max_working_set_bytes = DEFAULT_MAX_KV_CACHE_BYTES as u64;
+        let budget_err = check_header_only_with_parallelism(&tight_budget, 4)
+            .expect_err("undersized working-set budget must fail admission")
+            .to_string();
+        assert!(
+            budget_err.contains("cannot admit even 1 resident layer"),
+            "{budget_err}"
+        );
+
+        let mut over_resident = base.clone();
+        over_resident.max_resident_layers = Some(3);
+        let resident_err = check_header_only_with_parallelism(&over_resident, 4)
+            .expect_err("max_resident_layers above ceil(n_layers/2) must fail")
+            .to_string();
+        assert!(
+            resident_err.contains("--max-resident-layers 3 must be in 1..=2"),
+            "{resident_err}"
+        );
+
+        #[cfg(any(unix, windows))]
+        {
+            use std::ffi::OsString;
+            #[cfg(unix)]
+            use std::os::unix::ffi::OsStringExt;
+            #[cfg(windows)]
+            use std::os::windows::ffi::OsStringExt;
+
+            let non_utf8_dir = TempPath::new("header-only-non-utf8");
+            std::fs::create_dir(&non_utf8_dir.0).unwrap();
+            #[cfg(unix)]
+            let bad_name = OsString::from_vec(b"model-\xff.gguf".to_vec());
+            #[cfg(windows)]
+            let bad_name = OsString::from_wide(&[0x6d, 0x6f, 0x64, 0x65, 0x6c, 0xd800]);
+            let mut non_utf8_model = base;
+            non_utf8_model.model_path = non_utf8_dir.0.join(bad_name);
+            let utf8_err = check_header_only_with_parallelism(&non_utf8_model, 4)
+                .expect_err("non-UTF-8 model path must fail")
+                .to_string();
+            assert!(utf8_err.contains("not valid UTF-8"), "{utf8_err}");
+        }
+    }
+
+    #[test]
+    fn check_header_only_accepts_header_only_gguf_while_check_only_rejects_unverified() {
+        use std::collections::BTreeSet;
+
+        #[derive(serde::Deserialize)]
+        struct VerifiedModelClaim {
+            model_id: String,
+            artifact_size_bytes: u64,
+        }
+
+        let model_file = TempPath::new("header-only-no-tensors-4l.gguf");
+        let header_only_bytes = minimal_canonical_llama_gguf_header_bytes(4);
+        std::fs::write(&model_file.0, &header_only_bytes).unwrap();
+        let actual_commitment = ModelArtifactCommitment::from_path(&model_file.0).unwrap();
+        assert_ne!(
+            actual_commitment.model_id(),
+            Hash256([0x33; 32]),
+            "header-only fixture hash must differ from pinned expected_model_id"
+        );
+
+        let mut argv = header_only_argv(&model_file.0);
+        let url_pos = argv
+            .iter()
+            .position(|item| item == "--coordinator-url")
+            .unwrap();
+        argv[url_pos + 1] = "https://COORDINATOR.EXAMPLE.INVALID:9944/".into();
+        let mut args = parse_worker_args(&argv).unwrap();
+
+        let report = check_header_only_with_parallelism(&args, 4)
+            .expect("tiny header-only GGUF with no tensor payload should pass header-only check");
+        assert_eq!(report.mode, HEADER_ADMISSION_ONLY_MODE);
+        assert!(!report.artifact_verified);
+        assert_eq!(
+            report.coordinator_url,
+            "https://coordinator.example.invalid:9944"
+        );
+        assert_eq!(report.coordinator_id, hex_id(0x11));
+        assert_eq!(report.transaction_domain, hex_id(0x22));
+        assert_eq!(report.expected_model_id, hex_id(0x33));
+        assert_ne!(
+            report.expected_model_id,
+            actual_commitment.model_id().to_hex()
+        );
+        assert_eq!(report.max_working_set_bytes, 512u64 * 1024 * 1024);
+        assert_eq!(report.admission.protocol_max_resident_layers, 2);
+        assert_eq!(report.admission.admitted_max_resident_layers, 2);
+        assert!(report.admission.interior_role.is_some());
+
+        let json_value = serde_json::to_value(&report).unwrap();
+        let json_obj = json_value
+            .as_object()
+            .expect("report must serialize as JSON object");
+        let expected_keys: BTreeSet<&str> = [
+            "mode",
+            "artifact_verified",
+            "coordinator_url",
+            "coordinator_id",
+            "transaction_domain",
+            "expected_model_id",
+            "max_working_set_bytes",
+            "admission",
+        ]
+        .into_iter()
+        .collect();
+        let actual_keys: BTreeSet<&str> = json_obj.keys().map(String::as_str).collect();
+        assert_eq!(actual_keys, expected_keys);
+        assert_eq!(
+            json_obj.get("mode"),
+            Some(&serde_json::json!("header-admission-only"))
+        );
+        assert_eq!(
+            json_obj.get("artifact_verified"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            json_obj.get("coordinator_url"),
+            Some(&serde_json::json!(
+                "https://coordinator.example.invalid:9944"
+            ))
+        );
+        assert_eq!(
+            json_obj.get("coordinator_id"),
+            Some(&serde_json::json!(hex_id(0x11)))
+        );
+        assert_eq!(
+            json_obj.get("transaction_domain"),
+            Some(&serde_json::json!(hex_id(0x22)))
+        );
+        assert_eq!(
+            json_obj.get("expected_model_id"),
+            Some(&serde_json::json!(hex_id(0x33)))
+        );
+        assert_eq!(
+            json_obj.get("max_working_set_bytes"),
+            Some(&serde_json::json!(512u64 * 1024 * 1024))
+        );
+        assert_eq!(
+            json_obj.get("admission"),
+            Some(&serde_json::to_value(&report.admission).unwrap())
+        );
+        assert!(!json_obj.contains_key("model_id"));
+        assert!(!json_obj.contains_key("artifact_size_bytes"));
+        assert!(
+            serde_json::from_value::<VerifiedModelClaim>(json_value).is_err(),
+            "header-only report must not deserialize as a verified model report"
+        );
+
+        let mut with_unread_key = args.clone();
+        with_unread_key.worker_key_file = Some(PathBuf::from("/nonexistent/unread-key.json"));
+        assert_eq!(
+            check_header_only_with_parallelism(&with_unread_key, 4).unwrap(),
+            report
+        );
+
+        args.check_header_only = false;
+        args.check_only = true;
+        let validated = validate_args_with_parallelism(&args, 4).unwrap();
+        let full_err = prepare_model_blocking(&args, &validated, &AtomicBool::new(false))
+            .err()
+            .expect("full --check-only must reject unverified header-only artifact pin mismatch")
+            .to_string();
+        assert!(
+            full_err.contains("does not match pinned --expected-model-id"),
+            "{full_err}"
+        );
+
+        args.expected_model_id = actual_commitment.model_id();
+        let pinned_validated = validate_args_with_parallelism(&args, 4).unwrap();
+        let prepared = prepare_model_blocking(&args, &pinned_validated, &AtomicBool::new(false))
+            .expect("full --check-only must preserve verified check behavior when pin matches");
+        assert_eq!(prepared.report.mode, "check-only");
+        let full_json = serde_json::to_value(&prepared.report).unwrap();
+        let verified_claim: VerifiedModelClaim = serde_json::from_value(full_json)
+            .expect("verified AdmissionReport must expose verified model_id and size");
+        assert_eq!(
+            verified_claim.model_id,
+            actual_commitment.model_id().to_hex()
+        );
+        assert_eq!(
+            verified_claim.artifact_size_bytes,
+            actual_commitment.size_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_header_only_returns_early_without_hashing_key_load_rayon_or_network() {
+        let model_file = TempPath::new("run-header-only-4l.gguf");
+        std::fs::write(&model_file.0, minimal_canonical_llama_gguf_header_bytes(4)).unwrap();
+
+        let mut args = parse_worker_args(&header_only_argv(&model_file.0)).unwrap();
+        args.worker_key_file = Some(PathBuf::from("/nonexistent/never-loaded-key.json"));
+        run(args.clone())
+            .await
+            .expect("run --check-header-only must succeed offline without hashing or key load");
+
+        args.worker_key_file = None;
+        run(args.clone())
+            .await
+            .expect("run --check-header-only without keyfile must succeed");
+
+        args.check_header_only = false;
+        args.check_only = true;
+        let full_err = run(args)
+            .await
+            .expect_err("run --check-only must fail BLAKE3 pin check on header-only file")
+            .to_string();
+        assert!(
+            full_err.contains("does not match pinned --expected-model-id"),
+            "{full_err}"
+        );
     }
 }

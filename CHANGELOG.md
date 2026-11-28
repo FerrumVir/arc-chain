@@ -18,6 +18,52 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.28 - Release-preparation snapshot (2026-11-28)
+
+> **Candidate note:** This entry records the v0.8.28 release-preparation
+> snapshot. It does not claim publication, deployment, or 100 active operators.
+
+- Partial workers recover from a lost lease release by cleaning up the exact
+  remembered assignment before requesting new work. Regressed lease sequences
+  and old coordinator boots remain fenced.
+- Integrated workers reconnect after exhausted lease and registration recovery
+  budgets, retaining cancellable backoff and the existing protocol checks.
+- Partial work holds the shared update-drain permit through claim, execution
+  and result submission. Closed admission pauses claims while heartbeats and
+  cancellation continue.
+- Cleanly stopped desktops with launch-on-start disabled can install updates
+  under a lifecycle fence. Contention retries without stopping detached nodes;
+  pending recovery, failure state and manual-stop behavior stay preserved.
+- Eligible stake-zero TCP `--full-integer-worker` and `--community-shard-worker`
+  launches expose early startup liveness on `/health` (`status: "loading"`,
+  `startup_phase: "loading_model"`) after state/WAL, `--enable-community-rewards-v1`
+  activation-height, identity, and bounded pre-bind GGUF header checks while
+  failing closed with HTTP `503`, `Retry-After: 5`, and `Connection: close` on
+  `/inference/readiness`, worker status, non-`GET` methods on those routes, and
+  all other routes until full canonical GGUF BLAKE3 verification and INT8
+  loading complete, then hand off atomically on the same TCP listener without a
+  rebind gap.
+- Canonical GGUF hashing, committed shard metadata re-verification
+  (`from_committed_artifact_cancellable`), TOCTOU verification, and full INT8
+  loading support cooperative shutdown cancellation across chunk, header,
+  tensor, and layer boundaries while preserving bit-identical commitments and
+  weights, revalidating regular model files before full-worker open, and joining
+  the blocking task before supervised bounded listener stop, watcher join, WAL
+  sync, receipt acknowledgement, and data-directory lock release. Early-startup
+  cancellation fails closed without acknowledging a desktop shutdown receipt if
+  live connections or handlers remain or stop fails, while fatal startup aborts
+  retain the original error with cleanup context. Post-bind fatal RPC errors
+  (including pre-handoff errors, unexpected server task exits, and panics)
+  signal an RPC-owned shutdown sender to drain all RPC-owned runtime tasks and
+  wait for the inference compute barrier without aborting active compute (with
+  fallible RPC factory validations and journal replay completed before spawning
+  tasks), then broadcast node shutdown, drain any ETH RPC task, owned tasks,
+  and consensus writers first, and run the final WAL durability barrier without
+  falsely acknowledging a clean desktop shutdown receipt. Validators,
+  non-eligible modes, and `--rpc-unix` listeners retain their startup ordering.
+- Early, ordinary, and ETH TCP RPC listeners reject occupied ports on Windows
+  and preserve immediate rebinding after shutdown on Unix.
+
 ## v0.8.27 - Release-preparation snapshot (2026-11-27)
 
 > **Candidate note:** This entry records the v0.8.27 release-preparation

@@ -303,10 +303,72 @@ It excludes whole-model and validator roles, requires explicit model and network
 pins and a memory budget, and defaults to one compute thread. Existing local
 recovery domains must match the supplied pin. Stop closes worker admission before
 the lifecycle waits for drained tasks and acknowledges the WAL receipt.
-Integrated workers retry exhausted transient connection failures with bounded,
-cancellable backoff while retaining lease fences. Authentication, model and
+Integrated workers retry exhausted transient connection, lease-reacquisition
+and registration-recovery budgets with bounded, cancellable backoff while
+retaining lease fences. After a lost release, an exact remembered prior
+assignment is released again rather than rebound or accepted as new work.
+Regressed assignments and fenced coordinator boots remain invalid. Integrated
+partial workers acquire the shared update-drain permit before claiming work
+and hold it through execution and submission retries. A closed gate suppresses
+new claims while heartbeats and cancellation continue. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
+Stake-zero TCP `--full-integer-worker` and `--community-shard-worker` launches
+with an explicit canonical GGUF model (excluding validators, chain
+participation, shard holders, coordinators, native inference runtime,
+`--tokenizer-only`, `--enable-i16`, `.arc-int8`, and `--rpc-unix`) bind their
+loading RPC listener after the pre-bind barriers (signals, CLI/role checks,
+data-dir lock, desktop shutdown watchers, identity, fast model file and
+bounded GGUF header checks (including unverified header-only
+`CanonicalShardMetadata::from_path` geometry and admission validation for
+partial workers before binding, with mandatory full-file BLAKE3 verification
+retained afterward), and `StateDB`/WAL replay, `--enable-community-rewards-v1` activation-height
+pre-validation, and recovery-domain verification) and before blocking canonical
+GGUF hashing and INT8 weight preparation (`crates/arc-node/src/worker_startup.rs`).
+While model preparation runs, `GET /health` returns HTTP `200` with
+`status: "loading"`, `startup_phase: "loading_model"`, a non-ready
+`degraded_reason`, and `Connection: close`, while `/inference/readiness`,
+`/community/worker/status`, non-`GET` methods on those routes, and all other
+routes fail closed with HTTP `503`, `Retry-After: 5`, and `Connection: close`.
+Preparation honors shutdown cancellation at chunk, header, tensor and layer
+boundaries (`from_path_cancellable`, `verify_unchanged_cancellable`,
+`CanonicalShardMetadata::from_committed_artifact_cancellable`,
+`load_cached_model_canonical_i8_cancellable`), revalidates regular model paths
+before full-worker open, and always joins the blocking task before bounded
+supervised listener stop, watcher join, WAL sync, receipt acknowledgement, and
+data-dir lock release; only cancellation with `shutdown_requested == true` and
+a cleanly drained listener (no remaining live connections/handlers or stop
+errors) exits cleanly and acknowledges a desktop shutdown receipt, while fatal
+early-startup aborts retain the original error with cleanup context. On fatal
+post-bind RPC errors without a clean shutdown request (including pre-handoff
+`handoff_router` errors and unexpected server task returns or panics), the RPC
+server signals its owned lifecycle shutdown sender to drain all RPC-owned
+runtime tasks and waits for the inference compute barrier without aborting
+active compute (while all fallible RPC state validations and settlement replay
+run before spawning tasks), and the node then broadcasts shutdown, drains any
+ETH RPC task, owned watcher/worker tasks, and consensus writers first, and runs
+the final WAL durability sync while preserving the fatal error and never
+acknowledging a clean desktop shutdown receipt. On success, the full RPC router replaces the loading router atomically on the same
+bound TCP listener without a close/rebind gap, and outbound worker registration
+or job claims begin only after preparation completes. Validators, non-eligible
+roles, and `--rpc-unix` listeners keep the existing post-initialization
+`rpc::serve` bind order unchanged.
+Early, ordinary, and ETH TCP RPC listeners share a platform-aware binding helper:
+Unix permits reuse after closing a socket; Windows never enables address reuse
+that would allow a second process to bind an occupied port.
+The offline `community-shard-worker --check-header-only` command returns bounded
+header geometry and memory admission with `artifact_verified: false` and the
+expected model pin. It neither hashes the complete artifact nor loads keys,
+weights, or network state. It cannot authorize inference; the launched worker
+still verifies the complete artifact before registration or execution. The
+existing `--check-only` command retains full artifact verification. Both check
+modes omit the worker key requirement and are mutually exclusive.
+An ordinary cleanly stopped desktop node can prepare an unattended update only
+with launch-on-start disabled. The idle path takes a lifecycle fence, rechecks
+the data lock and never signals detached or legacy nodes. Contention remains
+retryable; pending recovery and manual-stop intent are preserved. Successful
+preparation cancels startup retries, while Busy leaves them intact. The existing
+fenced durability-repair path retains its separate recovery behavior.
 All desktop update schedules use the `UpdateDeadline` wrapper for wall-clock
 deadlines and callback identity. Native ticks recover suspended startup,
 periodic, failed-check, install and shutdown-reconciliation waits exactly once.
@@ -523,7 +585,7 @@ request-success evidence.
 
 ## Releases and versions
 
-Both the checked-in candidate version and the published release version are
+The checked-in candidate is 0.8.28; the published release remains
 0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while
 validators remain on v0.8.26. The headless installer defaults `--worker-mode`
 to `auto`. With a model it qualifies the pinned community partial-shard mode
@@ -557,13 +619,13 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.27 entry is a release-preparation
-  snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
+- `CHANGELOG.md` is newest first. Its v0.8.28 entry is a release-preparation
+  snapshot dated 2026-11-28 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins both the published version and the candidate at
-  0.8.27, pins the exact published installer digest, requires the
+- The doc contract test pins the published version at 0.8.27 and the candidate
+  at 0.8.28, pins the exact published installer digest, requires the
   `desktop-update-existing-validators-v1` release profile, and keeps the actual
   validator baseline at v0.8.26. Active install links change only after
   immutable publication is verified; historical version observations remain
