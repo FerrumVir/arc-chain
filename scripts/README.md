@@ -25,7 +25,7 @@ recovery candidate does not mean that candidate has been released.
 
 | Script | When to use |
 |--------|-------------|
-| [`install-community-node.sh`](install-community-node.sh) | **Joining the network headlessly.** Compatibility entry point for the root [`install.sh`](../install.sh). It installs checksummed `arc-node` + `arc-cli` assets and exact-tag seeds/genesis, a stake-0 service, and an optional verified updater. Repository tag protection remains an owner-controlled release prerequisite. It does **not** download a model; pass `--model /absolute/path.gguf` to execute compatible local inference. |
+| [`install-community-node.sh`](install-community-node.sh) | **Joining the network headlessly.** Compatibility entry point for the root [`install.sh`](../install.sh). It installs checksummed `arc-node` + `arc-cli` assets and exact-tag seeds/genesis, a stake-0 service, and an optional verified updater. Repository tag protection remains an owner-controlled release prerequisite. It does **not** download a model; without `--model` it stays observer/router-only, and with `--model /absolute/path.gguf` `--worker-mode` defaults to `auto` (qualifying partial shards on eligible hosts or falling back to whole-model mode, while explicit `full` persists and explicit `shard` fails before stopping an existing service; partial-shard rewards remain disabled). |
 | [`arc-demo.sh`](arc-demo.sh) | **Inspecting a controlled coordinator.** Requires explicit `ARC_COORDINATOR`; prints its response/trace and distinguishes cache matches from recomputation without claiming public-fleet health. |
 | [`arc-verify.sh`](arc-verify.sh) | **Comparing a past inference claim.** Requires explicit `ARC_COORDINATOR`; compares reported commitments and labels cache vs recomputation. This is not exact-artifact or payment proof by itself. |
 | [`arc-bench.sh`](arc-bench.sh) | **Testing one controlled endpoint.** Requires explicit `ARC_COORDINATOR`; runs 5 (or 10) prompts and emits a dated endpoint-specific report, not a public-fleet determinism claim. |
@@ -77,26 +77,37 @@ asset, and verifies all downloads with that release's `SHA256SUMS`. It does not
 walk backward through old tags: an incomplete release fails closed.
 
 Public v0.7.10 and v0.7.11 were desktop-only releases. The protected v0.8.0
-tag has no published assets; v0.8.26 is the current published update. The
+tag has no published assets; v0.8.27 is the current published update under
+`desktop-update-existing-validators-v1`, while validators remain on v0.8.26. The
 commands below are release-shape examples, not a claim that GitHub's current
 `latest` release can install every platform today.
 
-The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+The v0.8.27 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
-The candidate service launches with `--stake 0 --min-stake 0 --community-mode`.
-Keep it that way: a community node does not enter the validator set. The
-candidate release contract requires Linux x86_64 and ARM64, macOS Apple
+Without `--model`, the managed service launches observer/router mode with
+`--stake 0 --min-stake 0 --community-mode`. With `--model`, `--worker-mode`
+defaults to `auto` (selecting `--community-shard-worker` when nominal 16 GB RAM,
+available memory, and six-layer offline `--check-only` admission qualify, or
+falling back to `--full-integer-worker`), while `--worker-mode full` persists
+whole-model mode and `--worker-mode shard` refuses failed admission before
+stopping an existing service. Same-version `--update-only` reconciles missing
+or stale `worker-policy.conf` and can promote `auto` fallbacks, unchanged
+policy is a no-op, downgrades remain refused, older scheduled installers update
+`arc-installer` first and reconcile on the next cycle, and `--no-service` or
+`--no-auto-update` installs require manually rerunning a verified `install.sh`.
+Keep `--stake 0`: a community node does not enter the validator set. The
+release contract requires Linux x86_64 and ARM64, macOS Apple
 Silicon and Intel, and Windows x86_64; the shell installer manages Linux/macOS,
 while Windows service setup is manual. See
 [`docs/HEADLESS_INSTALL.md`](../docs/HEADLESS_INSTALL.md).
@@ -181,14 +192,14 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 
 **I want to join the network as a community node:**
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
 **I want to reproduce the factual benchmark:**

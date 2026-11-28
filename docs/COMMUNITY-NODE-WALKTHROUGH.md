@@ -6,14 +6,20 @@ model loading, assignment, block inclusion, or the two-receipt earnings proof co
 in three minutes of wall-clock time. Record the verified waits, then cut them.
 At the 2026-08-31 source-freeze review cutoff, the v0.8.0 recovery candidate
 was not published or deployed; that is a tag-stable historical statement, not
-a live probe. Use this script only when the complete v0.8.26 CLI release is
+a live probe. Use this script only when the complete v0.8.27 CLI release is
 visible on GitHub and signed evidence proves the seed rollout checklist below
-has been completed. Do not record against a mixed v0.7.2/v0.7.9 fleet as
-though these branch fixes are already live.
+has been completed. v0.8.27 ships under `desktop-update-existing-validators-v1`,
+while validators remain on v0.8.26. Do not record against a mixed v0.7.2/v0.7.9
+fleet as though these branch fixes are already live.
 
-The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
-This walkthrough exercises whole-model headless jobs; it does not prove
-partial-shard reward settlement or 100 active operators.
+The v0.8.27 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+This walkthrough deliberately qualifies the whole-model headless reward path
+with `--worker-mode full`. Omitting `--worker-mode` defaults a `--model`
+install to `auto`, which selects partial-shard worker mode on eligible hosts;
+partial-worker readiness and submitted shard steps are not whole jobs or `0x25`
+rewards, and multi-worker partial-shard rewards remain disabled. This
+walkthrough does not claim complete six-range community coverage or 100 active
+operators.
 
 ## Before recording
 
@@ -80,26 +86,33 @@ closed; the CLI flag alone cannot turn issuance on.
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.27 --worker-mode full --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is
-`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
+`3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22`.
 
 The protected source-tag installer resolves one exact semantic-versioned
 release and verifies the owner signature on `SHA256SUMS` before trusting any
 download hash. It creates a stake-zero community service and
 preserves its identity across updates. It never substitutes a desktop package
-for `arc-node`, and its RPC listener stays on `127.0.0.1` by default. A
-model-backed install uses the full deterministic integer-worker role without
-announcing the home machine as a validator shard.
+for `arc-node`, and its RPC listener stays on `127.0.0.1` by default. Passing
+`--worker-mode full` explicitly is required for this walkthrough: default
+`--worker-mode auto` selects `--community-shard-worker` on hosts that meet the
+nominal 16 GB RAM floor, available-memory check, and six-layer offline
+`--check-only` admission, and partial-shard workers do not register for
+whole-job dispatch or `0x25` reward settlement. They can appear in the scoreboard
+with the `shard-inference-v1` capability; their partial-shard rewards remain
+disabled. `--worker-mode full` persists the whole
+deterministic integer-worker role (`--full-integer-worker`) across updates
+without announcing the home machine as a validator shard.
 
 With authentic cutover and retirement evidence in a separately qualified
 release, the installer preserves a recognized v0.7.x node at the exact default

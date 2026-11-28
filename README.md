@@ -13,16 +13,21 @@ ARC's protocol and product code are developed in this repository. Reviewed
 upstream components vendored for reproducibility are identified under
 `vendor/`; they are not represented as ARC-authored code.
 
-## v0.8.26 release status and quickstart
+## v0.8.27 release status and quickstart
 
-**Published update (2026-11-27):** v0.8.26 updates the existing recovered chain.
-It includes desktop recovery reconciliation and bounded overlap between shard
-execution and verification. Eligible desktop workers use pinned partial shards
-with automatic assignment and rebalancing.
-Multi-worker rewards remain disabled. Headless `--model` installs remain whole-model workers.
-Publication does not establish 100 active operators or unbounded scaling.
+**Published update:** v0.8.27 ships under the `desktop-update-existing-validators-v1`
+release profile while validators remain on v0.8.26. It recovers overdue desktop
+update checks and retries, and adds automatic headless partial-shard selection.
+Eligible workers receive layer assignments automatically. Hosts that fail the
+memory and model checks keep the whole-model fallback; explicit `full` mode
+persists across updates. See the [headless guide](docs/HEADLESS_INSTALL.md) for
+mode choices and upgrade steps.
 
-The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+Partial-worker readiness and submitted shard steps are not whole jobs
+or rewards. Multi-worker partial-shard rewards remain disabled. Publication
+alone does not establish six-range community coverage or 100 active operators.
+
+The v0.8.27 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
 The dated v0.8.16 observation below remains a historical record.
 
 <!-- ARC_PUBLIC_TRUTH_BEGIN -->
@@ -44,29 +49,29 @@ This README does not use the moving `latest` release as an install source. The
 immutable v0.8.x release is intentionally not promoted to GitHub's global
 `latest` channel while unsigned v0.7 updaters remain in the field. The
 legacy updater is not a supported migration mechanism. This release uses
-`existing-recovered-chain-update-v1`, which refuses legacy migration; an exact
-tag does not change that release profile.
+`desktop-update-existing-validators-v1`, while validators remain on v0.8.26, and
+refuses legacy migration; an exact tag does not change that release profile.
 
 The protected v0.8.0 tag has no published assets. The current release is
-v0.8.26. The
-[exact v0.8.26 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.26)
+v0.8.27. The
+[exact v0.8.27 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.27)
 carries the signed release assets, `SHA256SUMS`, and `SHA256SUMS.sig`, so an
-SSH/EC2/VPS operator can run:
+SSH/EC2/VPS operator can run this observer/router quickstart (add a verified
+`--model` path to execute inference):
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-# Observer/router quickstart. Add a verified --model path to execute inference.
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
-Expected `install.sh` SHA-256 for v0.8.26:
-`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
+Expected `install.sh` SHA-256 for v0.8.27:
+`3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -177,15 +182,15 @@ trade, not a better prover.
 
 ### Desktop GUI (requires a screen)
 
-| Desktop build target | Normalized v0.8.26 asset |
+| Desktop build target | Normalized v0.8.27 asset |
 |---|---|
-| **macOS — Apple Silicon** (built/packaged on macOS 15) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-macos-arm64.dmg) |
-| **macOS — Intel** (built/packaged on macOS 15 Intel) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-macos-x86_64.dmg) |
-| **Windows — x86_64** (built/packaged on GitHub `windows-latest`) | [NSIS installer](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-windows-x86_64-setup.exe) · [MSI](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-windows-x86_64.msi) |
-| **Linux desktop — x86_64** (built/packaged on Ubuntu 24.04) | [AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.rpm) |
+| **macOS — Apple Silicon** (built/packaged on macOS 15) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-macos-arm64.dmg) |
+| **macOS — Intel** (built/packaged on macOS 15 Intel) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-macos-x86_64.dmg) |
+| **Windows — x86_64** (built/packaged on GitHub `windows-latest`) | [NSIS installer](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-windows-x86_64-setup.exe) · [MSI](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-windows-x86_64.msi) |
+| **Linux desktop — x86_64** (built/packaged on Ubuntu 24.04) | [AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/arc-desktop-linux-x86_64.rpm) |
 
-These stable names are generated by the unified v0.8.26 release pipeline, and
-the links point at the published v0.8.26 release.
+These stable names are generated by the unified v0.8.27 release pipeline, and
+the links point at the published v0.8.27 release.
 The macOS package metadata declares 11.0 as its minimum, but CI currently runs
 the package only on macOS 15; no older-macOS or Windows-version runtime floor is
 claimed until those exact versions receive a release-blocking test.
@@ -196,7 +201,12 @@ below. Linux ARM64 is also headless-only.
 The public v0.7.11 desktop could manually check, verify, and install a signed
 update from Settings, but its saved automatic-update preference never started
 a scheduler. v0.8 desktops check the signed manifest shortly after startup and
-every 24 hours when **Check for app updates automatically** is on. Since
+on a recurring schedule when **Check for app updates automatically** is on. In
+v0.8.27, native ticks recover overdue startup, periodic, failed-check retry,
+auto-install, and shutdown-reconciliation waits when webview timers suspend—including
+manual shutdown reconciliation while automatic checks are disabled—and one
+deadline wrapper prevents cancelled or replaced callbacks from running stale
+checks. Since
 v0.8.14, **Install signed app updates automatically when idle** is also on by
 default: ARC downloads a signed update in the background, installs it when no
 jobs are running, and restarts. v0.8.14 turned it on once for desktops that
@@ -216,10 +226,10 @@ and FAQ.
 
 ### Headless / server node (no GUI or display required)
 
-The v0.8.26 headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
+The v0.8.27 headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
 Silicon and Intel, and Windows x86_64. The installer supports Linux and macOS;
 Windows Server operators download the two `.exe` assets and `SHA256SUMS`
-manually from the exact v0.8.26 release. The Linux x86_64/amd64 artifact is
+manually from the exact v0.8.27 release. The Linux x86_64/amd64 artifact is
 built on Ubuntu 22.04 and must boot with `DISPLAY` unset on Ubuntu 22.04,
 24.04, and 26.04 before publication; the ARM64 artifact has the same GUI-free
 runtime gate on Ubuntu 24.04 and 26.04. The macOS binaries boot on macOS 15
@@ -227,22 +237,22 @@ Apple-Silicon and Intel runners, and the Windows x86_64 binary boots on GitHub's
 `windows-latest` runner; those gates do not establish older OS-version floors.
 
 The following recovery command is intentionally pinned to the complete
-`v0.8.26` release. The moving `latest` alias is never used by the initial
+`v0.8.27` release. The moving `latest` alias is never used by the initial
 install command.
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
 Expected `install.sh` SHA-256:
-`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
+`3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22`.
 
 The bootstrap installer comes from the owner-created protected source tag.
 It resolves an exact immutable, non-draft release, requires GitHub to identify
@@ -336,38 +346,66 @@ requires a matching offline-retirement receipt before v0.8 starts. The old
 history continues from the signed checkpoint in fresh `data-v0.8/` state. The
 presence of a new lock never makes mixed v0.7/v0.8 overlap safe.
 
-Useful server options:
+Choose one setup after downloading and verifying the installer above.
+
+Use custom ports and a dedicated data volume:
 
 ```bash
-# SSH-only Ubuntu server, custom RPC/P2P ports and data volume
-bash install.sh --version 0.8.26 \
+bash install.sh --version 0.8.27 \
   --port 19090 --p2p-port 19091 --data-dir /srv/arc-data
-
-# Install binaries/config only; print the command but do not start anything
-bash install.sh --version 0.8.26 --no-service --no-auto-update
-
-# Serve deterministic community inference. The installer adds
-# --full-integer-worker; it does not advertise this home node as a layer shard.
-bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
-
-# Reproducible pin; an older version is rejected if a newer one is installed
-bash install.sh --version 0.8.26
 ```
 
-For an install that kept the scheduled updater, the manual commands are:
+Install files without starting a service or scheduling updates:
 
 ```bash
-# Linux user service, adopted v0.7 system-user bridge, or macOS LaunchAgent
-"$HOME/.arc/bin/arc-installer" --update-only --install-dir "$HOME/.arc"
+bash install.sh --version 0.8.27 --no-service --no-auto-update
+```
 
-# Linux system service
+Provide a verified model and let automatic mode choose the worker role:
+
+```bash
+bash install.sh --version 0.8.27 --model /absolute/path/to/model.gguf
+```
+
+Keep whole-model execution explicitly:
+
+```bash
+bash install.sh --version 0.8.27 --worker-mode full --model /absolute/path/to/model.gguf
+```
+
+Require partial-shard qualification before changing an existing service:
+
+```bash
+bash install.sh --version 0.8.27 --worker-mode shard --model /absolute/path/to/model.gguf
+```
+
+For an install that kept the scheduled updater, choose the command matching
+its service scope.
+
+Linux user service, macOS LaunchAgent, or unprivileged adopted `system-user` bridge:
+
+```bash
+"$HOME/.arc/bin/arc-installer" --update-only --install-dir "$HOME/.arc"
+```
+
+Linux system service:
+
+```bash
 sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/arc-chain --system-service
 ```
 
 Update mode intentionally resolves the newest immutable, non-draft release,
-requires the complete bundle for the installed platform, verifies it, and
-refuses equality or downgrade; do not add `--version 0.8.26` when the goal is to
-discover a later safe update.
+requires the complete bundle for the installed platform, verifies its signed
+manifest, and refuses any downgrade; do not add `--version 0.8.27` when the goal
+is to discover a later safe update. Same-version `--update-only` reconciles missing or stale `worker-policy.conf` launcher policy
+and can promote an `auto` whole-model fallback to `shard` when qualification now
+passes; an already reconciled unchanged policy exits as a no-op (`Already up to
+date`). Older scheduled installers first update the node and replace
+`arc-installer` with the signed new installer, then reconcile launcher policy on
+the next scheduled cycle. Installs created with `--no-service` or
+`--no-auto-update` do not install `arc-installer` or a timer, so operators must
+manually rerun a freshly verified `install.sh` instead of assuming
+`arc-installer` exists.
 
 Managed v0.8 macOS nodes receive a 4,420-second launchd `ExitTimeOut`, covering
 their admission-close, task-join, and final WAL-fsync barrier. A later
@@ -378,20 +416,36 @@ updater and treats TERM-only process death as retirement evidence, never as a
 graceful-drain claim; the signed cutover and offline receipt govern whether
 v0.8 may start.
 
-Without `--model`, the node is an observer/router and will not execute local
-model inference. It still joins with `--stake 0 --community-mode`; stake-zero
-is the safe community posture, but rewards and work assignment are determined
-by the network and are not guaranteed by the installer. See
+Without `--model`, the node resolves to observer/router mode and will not
+execute local model inference. It still joins with `--stake 0 --community-mode`;
+stake-zero is the safe community posture, but rewards and work assignment are
+determined by the network and are not guaranteed by the installer. See
 [`docs/HEADLESS_INSTALL.md`](docs/HEADLESS_INSTALL.md) for service commands,
 firewall notes, upgrade behavior, and Windows verification. The short operator
 demo is [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](docs/COMMUNITY-NODE-WALKTHROUGH.md).
 
-With `--model`, the managed runner also passes `--full-integer-worker`. That
-loads all deterministic integer transformer layers so a claimed result can be
-independently recomputed, but deliberately emits no `ShardInfo`. Do not replace
-it with `--shard-range 0:32`: a residential node would then announce an
-overlapping, normally NAT-unreachable validator shard and poison the displayed
-coverage map.
+With `--model`, `--worker-mode` defaults to `auto` and persists configured mode,
+resolved mode, model path, policy revision, and the running installer SHA-256 in
+`worker-policy.conf` (which rolls back atomically with the service). `auto`
+qualifies pinned partial-shard mode (`--community-shard-worker`) only when the
+host meets the nominal 16 GB RAM floor, has sufficient available memory
+(crediting bounded reclaimable RSS only from a verified matching managed worker
+service that the transaction will stop), and passes six-layer offline admission
+via `arc-node community-shard-worker --check-only` against the pinned canonical
+model and coordinator; not all machines are eligible. When `auto` does not
+qualify, it retains `configured_worker_mode=auto`, falls back to whole-model
+mode (`--full-integer-worker`), and reassesses on later updates. Explicit
+`--worker-mode full` persists whole-model mode across updates for whole-job
+execution and `0x25` reward eligibility without emitting validator `ShardInfo`;
+do not replace `--full-integer-worker` with `--shard-range 0:32`, which would
+announce an overlapping, normally NAT-unreachable validator shard and poison the
+displayed coverage map. Explicit `--worker-mode shard` runs qualification before
+stopping an existing service and fails closed without altering the running node
+when admission fails. Partial-shard worker readiness and submitted layer steps
+are separate from completed whole-model jobs and rewards: multi-worker
+partial-shard rewards remain disabled, and partial sharding does not claim
+faster per-node execution, complete six-range community coverage, or 100 online
+operators.
 
 **📖 Desktop walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md).
 
@@ -943,7 +997,7 @@ See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
 **Superseded.** This section is the dated record from the 2026-08-31 source
 freeze, kept for history. It was written before v0.8.16 was released on
 2026-10-27 and no longer describes the network. For the current status, see
-[v0.8.26 release status and quickstart](#v0826-release-status-and-quickstart).
+[v0.8.27 release status and quickstart](#v0827-release-status-and-quickstart).
 
 > **Source-freeze snapshot (2026-08-31; tag-stable):** At this commit's review
 > cutoff, v0.8.0 / protocol v3 was not published or deployed, and GitHub

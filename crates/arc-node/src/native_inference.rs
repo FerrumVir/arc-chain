@@ -5033,29 +5033,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_quiescence_closes_admission_drains_leases_and_resumes_only_matching_request() {
         let gate = Arc::new(WorkerExecutionGate::default());
         let request_id = [0x71; 32];
         let other_request = [0x72; 32];
         let permit = gate.try_enter().expect("open gate admits work");
-        let gate_for_drain = gate.clone();
-        let drain = tokio::spawn(async move {
-            gate_for_drain
-                .quiesce(
-                    request_id,
-                    std::time::Duration::from_secs(1),
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
+        let mut drain = Box::pin(gate.quiesce(
+            request_id,
+            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         assert!(gate.is_closed());
         assert_eq!(gate.active_jobs(), 1);
         assert!(gate.try_enter().is_none(), "drain rejects new work");
         drop(permit);
         assert_eq!(
-            drain.await.unwrap(),
+            drain.await,
             WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
         );
         assert!(gate.try_enter().is_none(), "successful drain stays closed");
@@ -5083,7 +5082,7 @@ mod tests {
         assert_eq!(gate.active_jobs(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_quiescence_timeout_reopens_admission() {
         let gate = Arc::new(WorkerExecutionGate::default());
         let _permit = gate.try_enter().unwrap();
@@ -5100,57 +5099,96 @@ mod tests {
         assert!(gate.try_enter().is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_quiescence_lease_reopens_when_shutdown_never_begins() {
         let gate = Arc::new(WorkerExecutionGate::default());
+        let lease_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(15);
         let result = gate
             .quiesce(
                 [0x74; 32],
                 std::time::Duration::from_secs(1),
-                tokio::time::Instant::now() + std::time::Duration::from_millis(15),
+                lease_deadline,
             )
             .await;
         assert_eq!(result, WorkerQuiescenceResult::Quiesced { active_jobs: 0 });
         assert!(gate.is_closed());
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep_until(lease_deadline - std::time::Duration::from_millis(1)).await;
+        assert!(
+            gate.is_closed(),
+            "admission must remain closed before lease expiry"
+        );
+        let changed = gate.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        tokio::time::timeout_at(
+            lease_deadline + std::time::Duration::from_millis(1),
+            changed,
+        )
+        .await
+        .expect("the lease watchdog must reopen admission at expiry");
+        assert!(tokio::time::Instant::now() >= lease_deadline);
         assert!(!gate.is_closed());
         assert!(gate.try_enter().is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn canceled_pending_quiescence_reopens_at_lease_deadline() {
         let gate = Arc::new(WorkerExecutionGate::default());
         let _active = gate.try_enter().unwrap();
-        let gate_for_drain = gate.clone();
-        let drain = tokio::spawn(async move {
-            gate_for_drain
-                .quiesce(
-                    [0x75; 32],
-                    std::time::Duration::from_secs(1),
-                    tokio::time::Instant::now() + std::time::Duration::from_millis(20),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
+        let lease_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut drain = Box::pin(gate.quiesce(
+            [0x75; 32],
+            std::time::Duration::from_secs(1),
+            lease_deadline,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         assert!(gate.is_closed());
-        drain.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        drop(drain);
+        tokio::time::sleep_until(lease_deadline - std::time::Duration::from_millis(1)).await;
+        assert!(
+            gate.is_closed(),
+            "cancellation must retain the lease until expiry"
+        );
+        assert_eq!(gate.active_jobs(), 1);
+        let changed = gate.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        tokio::time::timeout_at(
+            lease_deadline + std::time::Duration::from_millis(1),
+            changed,
+        )
+        .await
+        .expect("the lease watchdog must survive cancellation of the drain future");
+        assert!(tokio::time::Instant::now() >= lease_deadline);
         assert!(!gate.is_closed());
+        assert_eq!(gate.active_jobs(), 1);
+        assert!(gate.try_enter().is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn authenticated_shutdown_commit_keeps_quiescence_closed_past_lease() {
         let gate = Arc::new(WorkerExecutionGate::default());
+        let lease_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
         let result = gate
             .quiesce(
                 [0x76; 32],
                 std::time::Duration::from_secs(1),
-                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                lease_deadline,
             )
             .await;
         assert_eq!(result, WorkerQuiescenceResult::Quiesced { active_jobs: 0 });
+        assert_eq!(Arc::strong_count(&gate), 2);
         gate.commit_shutdown();
-        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        tokio::time::sleep_until(lease_deadline + std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            Arc::strong_count(&gate),
+            1,
+            "the lease watchdog must finish"
+        );
         assert!(gate.is_closed());
         assert!(gate.try_enter().is_none());
         assert_eq!(
@@ -5159,34 +5197,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_during_active_drain_prevents_timeout_or_resume_reopening() {
         let gate = Arc::new(WorkerExecutionGate::default());
         let _active = gate.try_enter().unwrap();
         let request_id = [0x77; 32];
-        let gate_for_drain = gate.clone();
-        let drain = tokio::spawn(async move {
-            gate_for_drain
-                .quiesce(
-                    request_id,
-                    std::time::Duration::from_millis(40),
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
+        let lease_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut drain = Box::pin(gate.quiesce(
+            request_id,
+            std::time::Duration::from_millis(40),
+            lease_deadline,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         assert!(gate.is_closed());
 
         gate.commit_shutdown();
-        assert_eq!(
-            drain.await.unwrap(),
-            WorkerQuiescenceResult::Busy { active_jobs: 1 }
-        );
+        assert_eq!(drain.await, WorkerQuiescenceResult::Busy { active_jobs: 1 });
         assert!(gate.is_closed());
         assert_eq!(
             gate.resume(request_id),
             Err(WorkerResumeError::ShutdownCommitted)
         );
+        assert!(gate.try_enter().is_none());
+        assert_eq!(Arc::strong_count(&gate), 3);
+        tokio::time::sleep_until(lease_deadline + std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            Arc::strong_count(&gate),
+            2,
+            "the lease watchdog must finish"
+        );
+        assert!(gate.is_closed());
         assert!(gate.try_enter().is_none());
     }
 
@@ -5213,7 +5257,7 @@ mod tests {
         assert!(gate.try_enter().is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_commit_on_open_gate_is_terminal_and_rejects_quiesce() {
         let gate = Arc::new(WorkerExecutionGate::default());
         gate.commit_shutdown();
