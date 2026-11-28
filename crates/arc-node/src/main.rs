@@ -11427,15 +11427,15 @@ mod worker_startup_main_tests {
                 cancel_receipt.lock().unwrap().is_some(),
                 "receipt must remain armed while owned blocking runtime task is still running"
             );
-            assert_eq!(
-                arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+            assert!(
+                !arc_crypto::secret_file::validate_desktop_shutdown_ack(
                     &cancel_receipt_check.data_dir,
                     &cancel_receipt_check.expected_token,
+                    &cancel_receipt_check.nonce,
                     &cancel_receipt_check.executable,
                     &cancel_receipt_check.genesis,
                 )
-                .unwrap(),
-                Some(cancel_receipt_check.nonce)
+                .unwrap()
             );
 
             owned.release_guard.release();
@@ -11450,6 +11450,16 @@ mod worker_startup_main_tests {
         assert!(
             cancel_receipt.lock().unwrap().is_none(),
             "armed receipt must be acknowledged once owned blocking task joins cleanly"
+        );
+        assert!(
+            arc_crypto::secret_file::validate_desktop_shutdown_ack(
+                &cancel_receipt_check.data_dir,
+                &cancel_receipt_check.expected_token,
+                &cancel_receipt_check.nonce,
+                &cancel_receipt_check.executable,
+                &cancel_receipt_check.genesis,
+            )
+            .unwrap()
         );
 
         let fatal_server = StartupRpcServer::start_tcp(
@@ -11543,15 +11553,15 @@ mod worker_startup_main_tests {
         );
         assert!(dirty_runtime_tasks.is_empty());
         assert!(dirty_receipt.lock().unwrap().is_some());
-        assert_eq!(
-            arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+        assert!(
+            !arc_crypto::secret_file::validate_desktop_shutdown_ack(
                 &dirty_receipt_check.data_dir,
                 &dirty_receipt_check.expected_token,
+                &dirty_receipt_check.nonce,
                 &dirty_receipt_check.executable,
                 &dirty_receipt_check.genesis,
             )
-            .unwrap(),
-            Some(dirty_receipt_check.nonce)
+            .unwrap()
         );
 
         let (panic_fatal_tx, mut panic_fatal_rx) = tokio::sync::watch::channel(false);
