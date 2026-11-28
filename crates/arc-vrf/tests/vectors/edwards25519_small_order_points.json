@@ -1,0 +1,80 @@
+{
+  "source": "RFC 9381 Section 5.4.5 (ECVRF_validate_key), the bad_pk list for edwards25519, both sign bits",
+  "source_url": "https://www.rfc-editor.org/rfc/rfc9381.txt",
+  "expected_values": {
+    "small_order": "PublicKey::from_bytes returns VrfError::SmallOrderPublicKey",
+    "invalid_encoding": "PublicKey::from_bytes returns VrfError::InvalidPublicKey (non-canonical: y >= p, or x = 0 with the sign bit set)"
+  },
+  "cases": [
+    {
+      "description": "y = 0: the two points of order 4 (x = +/- sqrt(-1)) [sign bit 0]",
+      "encoding": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = 0: the two points of order 4 (x = +/- sqrt(-1)) [sign bit 1]",
+      "encoding": "0000000000000000000000000000000000000000000000000000000000000080",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = 1: the identity (x = 0); the sign-bit variant is a non-canonical encoding [sign bit 0]",
+      "encoding": "0100000000000000000000000000000000000000000000000000000000000000",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = 1: the identity (x = 0); the sign-bit variant is a non-canonical encoding [sign bit 1]",
+      "encoding": "0100000000000000000000000000000000000000000000000000000000000080",
+      "expected": "invalid_encoding"
+    },
+    {
+      "description": "y = bad_y2: two points of order 8 [sign bit 0]",
+      "encoding": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = bad_y2: two points of order 8 [sign bit 1]",
+      "encoding": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = p - bad_y2: two points of order 8 [sign bit 0]",
+      "encoding": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = p - bad_y2: two points of order 8 [sign bit 1]",
+      "encoding": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = p - 1: the point of order 2 (x = 0); the sign-bit variant is non-canonical [sign bit 0]",
+      "encoding": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "expected": "small_order"
+    },
+    {
+      "description": "y = p - 1: the point of order 2 (x = 0); the sign-bit variant is non-canonical [sign bit 1]",
+      "encoding": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": "invalid_encoding"
+    },
+    {
+      "description": "y = p: non-canonical encoding of y = 0 (bad_pk[5]) [sign bit 0]",
+      "encoding": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "expected": "invalid_encoding"
+    },
+    {
+      "description": "y = p: non-canonical encoding of y = 0 (bad_pk[5]) [sign bit 1]",
+      "encoding": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": "invalid_encoding"
+    },
+    {
+      "description": "y = p + 1: non-canonical encoding of the identity (bad_pk[6]) [sign bit 0]",
+      "encoding": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "expected": "invalid_encoding"
+    },
+    {
+      "description": "y = p + 1: non-canonical encoding of the identity (bad_pk[6]) [sign bit 1]",
+      "encoding": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": "invalid_encoding"
+    }
+  ]
+}
