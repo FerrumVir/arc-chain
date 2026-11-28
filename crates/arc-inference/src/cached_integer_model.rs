@@ -4962,6 +4962,21 @@ pub fn load_tokenizer_only(_path: &str) -> Result<CachedIntegerModel, crate::Inf
     ))
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum CanonicalModelLoadError {
+    #[error("canonical integer model load cancelled")]
+    Cancelled,
+
+    #[error(transparent)]
+    Inference(#[from] crate::InferenceError),
+}
+
+impl CanonicalModelLoadError {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
 #[cfg(feature = "candle")]
 pub fn load_cached_model_shard(
     path: &str,
@@ -4976,6 +4991,34 @@ pub fn load_cached_model_canonical_i8(
     path: &str,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     let model = load_cached_model_shard_profile(path, 0, usize::MAX, false)?;
+    debug_assert!(model.has_all_transformer_layers());
+    debug_assert!(model.has_canonical_i8_profile());
+    Ok(model)
+}
+
+#[cfg(feature = "candle")]
+pub fn load_cached_model_canonical_i8_cancellable(
+    path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<CachedIntegerModel, CanonicalModelLoadError> {
+    load_cached_model_canonical_i8_cancellable_with_layer_hook(path, cancel, |_| {})
+}
+
+#[cfg(feature = "candle")]
+pub(crate) fn load_cached_model_canonical_i8_cancellable_with_layer_hook(
+    path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_layer_loaded: impl FnMut(usize),
+) -> Result<CachedIntegerModel, CanonicalModelLoadError> {
+    let model = load_cached_model_shard_profile_with_mode_cancellable(
+        path,
+        0,
+        usize::MAX,
+        ShardRangeMode::Clamped,
+        false,
+        Some(cancel),
+        on_layer_loaded,
+    )?;
     debug_assert!(model.has_all_transformer_layers());
     debug_assert!(model.has_canonical_i8_profile());
     Ok(model)
@@ -5224,15 +5267,53 @@ fn load_cached_model_shard_profile_with_mode(
     range_mode: ShardRangeMode,
     include_optional_quantizations: bool,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
+    match load_cached_model_shard_profile_with_mode_cancellable(
+        path,
+        start_layer,
+        end_layer,
+        range_mode,
+        include_optional_quantizations,
+        None,
+        |_| {},
+    ) {
+        Ok(model) => Ok(model),
+        Err(CanonicalModelLoadError::Inference(error)) => Err(error),
+        Err(CanonicalModelLoadError::Cancelled) => Err(crate::InferenceError::Runtime(
+            "canonical integer model load cancelled".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "candle")]
+fn load_cached_model_shard_profile_with_mode_cancellable(
+    path: &str,
+    start_layer: usize,
+    end_layer: usize,
+    range_mode: ShardRangeMode,
+    include_optional_quantizations: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    mut on_layer_loaded: impl FnMut(usize),
+) -> Result<CachedIntegerModel, CanonicalModelLoadError> {
     use crate::InferenceError;
     use candle_core::Device;
     use candle_core::quantized::gguf_file;
+    use std::sync::atomic::Ordering;
 
+    let check_cancelled = || -> Result<(), CanonicalModelLoadError> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            Err(CanonicalModelLoadError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+
+    check_cancelled()?;
     let device = Device::Cpu;
     let mut reader =
         std::fs::File::open(path).map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
     let content = gguf_file::Content::read(&mut reader)
         .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+    check_cancelled()?;
     let (config, vocab) = config_from_gguf(&content)?;
     let (n_layers, d_model, d_ff, d_kv, vocab_size) = (
         config.n_layers,
@@ -5248,7 +5329,8 @@ fn load_cached_model_shard_profile_with_mode(
             if start_layer >= end_layer {
                 return Err(InferenceError::Runtime(format!(
                     "Invalid shard range: [{start_layer}, {end_layer}) is empty (n_layers={n_layers})"
-                )));
+                ))
+                .into());
             }
             end_layer
         }
@@ -5273,17 +5355,20 @@ fn load_cached_model_shard_profile_with_mode(
     let extract_f32 = |reader: &mut std::fs::File,
                        content: &gguf_file::Content,
                        name: &str|
-     -> Result<Vec<f32>, InferenceError> {
+     -> Result<Vec<f32>, CanonicalModelLoadError> {
+        check_cancelled()?;
         let qt = content
             .tensor(reader, name, &device)
             .map_err(|e| InferenceError::Runtime(format!("{name}: {e}")))?;
+        check_cancelled()?;
         let deq = qt
             .dequantize(&device)
             .map_err(|e| InferenceError::Runtime(format!("dequant {name}: {e}")))?;
+        check_cancelled()?;
         deq.flatten_all()
             .map_err(|e| InferenceError::Runtime(format!("flatten: {e}")))?
             .to_vec1::<f32>()
-            .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
+            .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")).into())
     };
 
     let extract_i8_i16 = |reader: &mut std::fs::File,
@@ -5291,7 +5376,7 @@ fn load_cached_model_shard_profile_with_mode(
                           name: &str,
                           rows: usize,
                           cols: usize|
-     -> Result<(I8Weights, I16Weights), InferenceError> {
+     -> Result<(I8Weights, I16Weights), CanonicalModelLoadError> {
         let f = extract_f32(reader, content, name)?;
         let i8w = I8Weights::quantize_f32(&f, rows, cols);
         let i16w = if include_optional_quantizations {
@@ -5306,13 +5391,14 @@ fn load_cached_model_shard_profile_with_mode(
                         content: &gguf_file::Content,
                         name: &str,
                         size: usize|
-     -> Result<Vec<i64>, InferenceError> {
+     -> Result<Vec<i64>, CanonicalModelLoadError> {
         let values = extract_f32(reader, content, name)?;
         if values.len() != size {
             return Err(InferenceError::Runtime(format!(
                 "{name}: expected {size} norm weights, found {}",
                 values.len()
-            )));
+            ))
+            .into());
         }
         Ok(values
             .iter()
@@ -5338,8 +5424,13 @@ fn load_cached_model_shard_profile_with_mode(
     };
 
     let (output_weight, output_weight_i16, final_norm) = if is_last {
-        let f = extract_f32(&mut reader, &content, "output.weight")
-            .or_else(|_| extract_f32(&mut reader, &content, "token_embd.weight"))?;
+        let f = match extract_f32(&mut reader, &content, "output.weight") {
+            Ok(values) => values,
+            Err(CanonicalModelLoadError::Cancelled) => {
+                return Err(CanonicalModelLoadError::Cancelled);
+            }
+            Err(_) => extract_f32(&mut reader, &content, "token_embd.weight")?,
+        };
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
         let i16w = include_optional_quantizations
             .then(|| I16Weights::quantize_f32(&f, vocab_size, d_model));
@@ -5412,6 +5503,7 @@ fn load_cached_model_shard_profile_with_mode(
     let mut any_i16 = false;
     let mut any_q4 = false;
     for l in start_layer..end_layer {
+        check_cancelled()?;
         let p = format!("blk.{l}");
         let (wq8, wq16) = extract_i8_i16(
             &mut reader,
@@ -5506,6 +5598,7 @@ fn load_cached_model_shard_profile_with_mode(
             };
             any_q4 = true;
         }
+        on_layer_loaded(l);
         if (l - start_layer).is_multiple_of(4) || l == end_layer - 1 {
             info!(
                 "Shard layer {}/{} loaded as I8{}{} ({} of {})",
@@ -5519,6 +5612,7 @@ fn load_cached_model_shard_profile_with_mode(
         }
     }
 
+    check_cancelled()?;
     let shard_mb: usize = layers
         .iter()
         .filter(|l| l.is_loaded())
@@ -5576,6 +5670,19 @@ pub fn load_cached_model_canonical_i8(
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime(
         "candle feature not enabled".into(),
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_canonical_i8_cancellable(
+    _path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<CachedIntegerModel, CanonicalModelLoadError> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(CanonicalModelLoadError::Cancelled);
+    }
+    Err(CanonicalModelLoadError::Inference(
+        crate::InferenceError::Runtime("candle feature not enabled".into()),
     ))
 }
 

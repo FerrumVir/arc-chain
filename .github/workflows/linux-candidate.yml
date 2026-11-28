@@ -13,6 +13,7 @@ on:
           - recovery-peer
           - desktop-shard
           - desktop-ui
+          - worker-startup
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 
@@ -115,7 +116,7 @@ jobs:
           retention-days: 14
 
   recovered-v3-paid-lifecycle:
-    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && inputs.qualification != 'worker-startup'
     name: Recovered-v3 paid lifecycle (isolated Linux process test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -257,7 +258,7 @@ jobs:
           retention-days: 14
 
   desktop-native-paid-test:
-    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'worker-startup'
     name: Desktop lifecycle and native paid Rust tests (macOS)
     runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
@@ -352,7 +353,7 @@ jobs:
           exit 0
 
   linux-candidate:
-    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && inputs.qualification != 'worker-startup'
     name: Linux production candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -494,7 +495,7 @@ jobs:
 
   real-model-conformance:
     name: Fresh-runner real-model conformance (${{ matrix.layout }})
-    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && inputs.qualification != 'worker-startup' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
     strategy:
       fail-fast: false
       matrix:
@@ -709,5 +710,148 @@ jobs:
             ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.json
             ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.log
             ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  worker-startup:
+    if: inputs.qualification == 'worker-startup'
+    name: Real-model worker startup qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: 1
+      RUSTUP_TOOLCHAIN: nightly-2026-03-16
+      RAYON_NUM_THREADS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify candidate commit and qualification checks
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 scripts/ci/no_comments.py
+          python3 -m unittest scripts/qualification/tests/test_worker_startup_qualification.py
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          shared-key: worker-startup
+          cache-on-failure: true
+
+      - name: Build candidate release arc-node and arc binaries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo build --locked --release -p arc-node --features candle --bin arc-node
+          cargo build --locked --release -p arc-cli --bin arc
+
+      - name: Qualify real-model full integer worker startup
+        timeout-minutes: 30
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          META_DIR: ${{ runner.temp }}/worker-startup-meta
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-startup-evidence
+          MODEL_DIR: ${{ runner.temp }}/worker-startup-model
+          PRIVATE_DIR: ${{ runner.temp }}/worker-startup-private
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$META_DIR" "$MODEL_DIR"
+          install -d -m 0700 "$PRIVATE_DIR"
+          if [[ -e "$EVIDENCE_DIR" ]]; then
+            echo "refusing to reuse stale qualification evidence directory: $EVIDENCE_DIR" >&2
+            exit 1
+          fi
+          exec > >(tee "$META_DIR/job.log") 2>&1
+
+          on_exit() {
+            local rc=$?
+            set +eu
+            rm -rf "$MODEL_DIR" "$PRIVATE_DIR"
+            exit "$rc"
+          }
+          trap on_exit EXIT
+
+          python3 scripts/qualification/qualify_worker_startup.py \
+            --print-pins-json > "$META_DIR/pins.json"
+
+          mapfile -t prod_ips < <(python3 -c 'import json, sys; ips = json.load(open(sys.argv[1], encoding="utf-8"))["production_ipv4s"]; assert len(ips) == 6; print("\n".join(ips))' "$META_DIR/pins.json")
+
+          for ip in "${prod_ips[@]}"; do
+            sudo -n iptables -I OUTPUT -d "$ip" -j REJECT
+          done
+          for ip in "${prod_ips[@]}"; do
+            sudo -n iptables -C OUTPUT -d "$ip" -j REJECT
+            if /usr/bin/curl -s -k -m 5 -o /dev/null "https://${ip}/health"; then
+              echo "production validator IPv4 ${ip} is still reachable after iptables block" >&2
+              exit 1
+            fi
+          done
+
+          python3 scripts/qualification/qualify_worker_startup.py \
+            --check-resources \
+            --disk-path "$RUNNER_TEMP" \
+            --write-resource-report "$META_DIR/pre-download-resources.json"
+
+          model_url="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["model_url"])' "$META_DIR/pins.json")"
+          model_file="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["model_file_name"])' "$META_DIR/pins.json")"
+          model_size="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["model_size"])' "$META_DIR/pins.json")"
+          model_sha256="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["model_sha256"])' "$META_DIR/pins.json")"
+
+          model_path="${MODEL_DIR}/${model_file}"
+          curl --fail --location --retry 2 --retry-all-errors --retry-max-time 600 \
+            --connect-timeout 15 --max-time 300 --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --output "$model_path" "$model_url"
+
+          actual_size="$(wc -c < "$model_path" | tr -d '[:space:]')"
+          if [[ "$actual_size" != "$model_size" ]]; then
+            echo "downloaded model byte size mismatch: expected $model_size, got $actual_size" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$model_sha256" "$model_path" | sha256sum -c -
+
+          timeout --signal=TERM --kill-after=30s 20m \
+            python3 scripts/qualification/qualify_worker_startup.py \
+              --node-binary target/release/arc-node \
+              --arc-cli-binary target/release/arc \
+              --model "$model_path" \
+              --output-dir "$EVIDENCE_DIR" \
+              --private-dir "$PRIVATE_DIR" \
+              --candidate-commit "$CANDIDATE_SHA" \
+              --require-blocked-ipv4 \
+              --max-loading-health-secs 30 \
+              --load-timeout-secs 360 \
+              --registration-timeout-secs 30 \
+              --sigterm-timeout-secs 30
+
+          python3 - "$EVIDENCE_DIR/summary.json" "$CANDIDATE_SHA" <<'PY'
+          import json
+          import sys
+
+          summary = json.load(open(sys.argv[1], encoding="utf-8"))
+          if summary.get("pass") is not True:
+              raise SystemExit("worker-startup qualification did not record pass=true")
+          if summary.get("candidate_commit") != sys.argv[2]:
+              raise SystemExit("worker-startup qualification commit mismatch")
+          PY
+
+      - name: Retain bounded worker-startup evidence (never model or keys)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: arc-worker-startup-qualification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/worker-startup-evidence/
+            ${{ runner.temp }}/worker-startup-meta/
           if-no-files-found: warn
           retention-days: 14

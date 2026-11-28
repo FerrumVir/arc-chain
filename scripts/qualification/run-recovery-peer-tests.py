@@ -7,11 +7,17 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    'community_shard_cli::tests::cli_check_header_only_allows_missing_keyfile_and_conflicts_with_check_only',
+    'community_shard_cli::tests::check_header_only_rejects_malformed_headers_geometry_pins_urls_threads_and_budgets',
+    'community_shard_cli::tests::check_header_only_accepts_header_only_gguf_while_check_only_rejects_unverified',
+    'community_shard_cli::tests::run_check_header_only_returns_early_without_hashing_key_load_rayon_or_network',
     'community_shard_cli::tests::integrated_worker_config_wires_execution_gate_while_standalone_leaves_it_none',
     'community_shard_cli::tests::integrated_shard_worker_shared_prepare_cancels_when_shutdown_flag_set',
+    'community_shard_cli::tests::integrated_shard_worker_shared_prepare_cancels_during_committed_metadata_verification',
     'community_shard_cli::tests::integrated_shard_worker_shared_prepare_rejects_unpinned_model_before_metadata_parse',
     'community_shard_cli::tests::integrated_shard_worker_runtime_task_drains_before_join_returns',
     'community_shard_cli::tests::integrated_shard_worker_skips_start_when_shutdown_already_requested',
+    'community_shard_cli::tests::early_shard_header_prevalidation_rejects_bad_headers_and_budgets_before_bind',
     'integrated_shard_worker_tests::integrated_shard_worker_parses_explicit_pins_and_defaults_to_one_thread',
     'integrated_shard_worker_tests::integrated_shard_worker_respects_explicit_threads_and_rejects_zero',
     'integrated_shard_worker_tests::integrated_shard_worker_requires_all_immutable_pins_and_budget',
@@ -41,6 +47,12 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_bad_paths_nesting_symlinks_and_hardlinks',
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_keyless_unsigned_forged_and_wrong_domain_dag_blocks',
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
+    'worker_startup_main_tests::early_worker_startup_role_for_cli_matches_eligible_and_ineligible_cli_invocations',
+    'worker_startup_main_tests::prepare_full_integer_worker_model_blocking_honors_cancel_and_reports_real_errors',
+    'worker_startup_main_tests::early_startup_abort_stops_listener_joins_watchers_and_gates_clean_shutdown',
+    'worker_startup_main_tests::early_startup_live_handler_blocks_clean_cancellation_and_receipt_while_preserving_fatal_error',
+    'worker_startup_main_tests::validate_community_rewards_v1_state_rejects_missing_activation_height_prebind',
+    'worker_startup_main_tests::post_bind_rpc_failure_cleanup_stops_tasks_syncs_wal_completes_eth_and_preserves_fatal_err',
 }
 EXPECTED_LIBRARY_TESTS = {
     'community_shard_worker::tests::duplicate_prior_lease_after_dropped_release_triggers_release_and_advances',
@@ -146,12 +158,20 @@ EXPECTED_LIBRARY_TESTS = {
     'rpc::tests::community_auth_fresh_requests_have_distinct_random_nonces',
     'rpc::tests::community_auth_is_bound_to_exact_coordinator_and_recovery_domain',
     'rpc::tests::community_auth_concurrent_replay_is_atomically_rejected',
+    'worker_startup::tests::early_worker_startup_role_policy_restricts_to_eligible_tcp_canonical_workers',
+    'worker_startup::tests::rpc_tcp_listener_rejects_an_occupied_port_and_rebinds_after_release',
+    'worker_startup::tests::startup_loading_serves_health_loading_and_rejects_readiness_and_mutations_503',
+    'worker_startup::tests::startup_rpc_server_hands_off_to_full_router_on_same_listener_without_gap',
+    'worker_startup::tests::cancellable_preparation_joins_before_cleanup_and_distinguishes_shutdown_from_errors',
+    'worker_startup::tests::stop_bounded_reports_live_handlers_until_completion_and_refuses_new_connections',
+    'worker_startup::tests::serve_eth_rejects_occupied_tcp_port',
 }
 
 
 EXPECTED_INFERENCE_TESTS = {
     'golden_vectors::gguf_preparation::load_cached_model_ranges_canonical_i8_parity_clamping_and_roles',
     'canonical_shard_admission::candle_tests::admit_rejects_zero_kv_cache_and_zero_working_set_budgets',
+    'canonical_shard_admission::candle_tests::committed_artifact_cancellable_matches_noncancellable_and_aborts_mid_verification',
     'canonical_shard_admission::candle_tests::rejects_layer_ceiling_above_1024_and_accepts_1024_boundary_without_weights',
     'canonical_shard_admission::candle_tests::content_parses_captured_header_only_never_reads_past_header_or_mutated_source',
     'canonical_shard_admission::candle_tests::boundary_overflow_undersized_cap_reserved_kv_and_header_limit',
@@ -165,6 +185,8 @@ EXPECTED_INFERENCE_TESTS = {
     'golden_vectors::gguf_preparation::a_gguf_missing_a_norm_weight_is_refused_by_the_canonical_loader',
     'golden_vectors::gguf_preparation::canonical_i8_partial_shards_match_full_engine_and_ownership',
     'golden_vectors::gguf_preparation::canonical_i8_shard_loader_rejects_invalid_ranges_before_reading_tensor_weights',
+    'golden_vectors::gguf_preparation::canonical_i8_cancellable_loader_matches_weights_and_aborts_when_cancelled',
+    'model_artifact::tests::cancellable_hashing_matches_ordinary_hash_and_aborts_mid_stream',
 }
 
 
@@ -193,9 +215,9 @@ def run_recorded(command, log, timeout):
 def expected_test_targets():
     targets = {
         "arc_state": (("wal::tests::verified_recovery_identity_probe_", "wal::tests::attach_verified_recovery_wal_", "recovery::tests::staged_attach_", "recovery::tests::prepared_recovery_restart_restores_rooted_native_migration_and_context", "recovery::tests::restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base", "recovery::tests::restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base", "recovery::tests::streaming_recovery_reread_rejects_same_size_mutation_and_added_empty_plan_entry"), EXPECTED_STATE_TESTS),
-        "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
-        "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
-        "arc_node": (("rpc::community_sharded_routing_tests::", "rpc::community_shard_dispatch::inference_run_adapter_tests::", "community_worker::tests::partial_snapshot_", "rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
+        "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::", "model_artifact::tests::cancellable_hashing_"), EXPECTED_INFERENCE_TESTS),
+        "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::", "worker_startup_main_tests::"), EXPECTED_BINARY_TESTS),
+        "arc_node": (("rpc::community_sharded_routing_tests::", "rpc::community_shard_dispatch::inference_run_adapter_tests::", "community_worker::tests::partial_snapshot_", "rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_", "worker_startup::tests::"), EXPECTED_LIBRARY_TESTS),
     }
     validate_selector_prefixes(targets)
     return targets

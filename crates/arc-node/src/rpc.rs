@@ -37,7 +37,7 @@ pub enum RpcListen {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RpcPeerAddr(SocketAddr);
+pub(crate) struct RpcPeerAddr(pub(crate) SocketAddr);
 
 impl
     axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
@@ -1735,8 +1735,7 @@ fn explorer_url_for(
 const COMMUNITY_WORK_QUEUE_CAP: usize = 256;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    listen: RpcListen,
+fn build_rpc_server_state_and_router(
     state: Arc<StateDB>,
     mempool: Arc<Mempool>,
     validator_address: Hash256,
@@ -1767,7 +1766,7 @@ pub async fn serve(
     community_release_on_verification: bool,
     community_profiles: CommunityProfileServing,
     community_shard_coordinator: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(NodeState, Router)> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
             "--enable-community-rewards-v1 requires [chain].community_rewards_v1_activation_height in canonical genesis"
@@ -2168,13 +2167,80 @@ pub async fn serve(
         .layer(CorsLayer::permissive())
         .with_state(node.clone());
 
+    Ok((node, app))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve(
+    listen: RpcListen,
+    state: Arc<StateDB>,
+    mempool: Arc<Mempool>,
+    validator_address: Hash256,
+    validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
+    stake: u64,
+    boot_time: Instant,
+    peer_count: Arc<AtomicU32>,
+    inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    candle_model_id: Option<arc_crypto::Hash256>,
+    model_artifact_id: Option<arc_crypto::Hash256>,
+    dag_validators: Option<SharedValidators>,
+    dag_round: Option<Arc<AtomicU64>>,
+    dag_committed: Option<Arc<AtomicU64>>,
+    consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
+    shard_infos: Vec<ShardInfo>,
+    seed_rpc_addrs: Vec<String>,
+    community_rpc_bases: Vec<String>,
+    compute_threads: usize,
+    compute_pool: ComputePool,
+    chain_identity: Option<ChainIdentity>,
+    community_rewards_v1_enabled: bool,
+    native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
+    community_twin: crate::twin::TwinConfig,
+    community_release_on_verification: bool,
+    community_profiles: CommunityProfileServing,
+    community_shard_coordinator: bool,
+) -> anyhow::Result<()> {
+    let (node, app) = build_rpc_server_state_and_router(
+        state,
+        mempool,
+        validator_address,
+        validator_keypair,
+        stake,
+        boot_time,
+        peer_count,
+        inference_model,
+        candle_engine,
+        candle_model_id,
+        model_artifact_id,
+        dag_validators,
+        dag_round,
+        dag_committed,
+        consensus_engine,
+        shard_infos,
+        seed_rpc_addrs,
+        community_rpc_bases,
+        compute_threads,
+        compute_pool,
+        chain_identity,
+        community_rewards_v1_enabled,
+        native_serving,
+        native_request_admission,
+        shutdown.clone(),
+        transport_wire_policy,
+        community_twin,
+        community_release_on_verification,
+        community_profiles,
+        community_shard_coordinator,
+    )?;
+
     let lifecycle_supervised = shutdown.is_some();
     let server_result = match listen {
         RpcListen::Tcp(address) => {
-            let socket = tokio::net::TcpSocket::new_v4()?;
-            socket.set_reuseaddr(true)?;
-            socket.bind(address.parse()?)?;
-            let listener = socket.listen(1024)?;
+            let listener = crate::worker_startup::bind_rpc_tcp_listener(address.parse()?)?;
             let server = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<RpcPeerAddr>(),
@@ -2209,6 +2275,135 @@ pub async fn serve(
     }
     server_result?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_on_startup_server(
+    startup_server: crate::worker_startup::StartupRpcServer,
+    state: Arc<StateDB>,
+    mempool: Arc<Mempool>,
+    validator_address: Hash256,
+    validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
+    stake: u64,
+    boot_time: Instant,
+    peer_count: Arc<AtomicU32>,
+    inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    candle_model_id: Option<arc_crypto::Hash256>,
+    model_artifact_id: Option<arc_crypto::Hash256>,
+    dag_validators: Option<SharedValidators>,
+    dag_round: Option<Arc<AtomicU64>>,
+    dag_committed: Option<Arc<AtomicU64>>,
+    consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
+    shard_infos: Vec<ShardInfo>,
+    seed_rpc_addrs: Vec<String>,
+    community_rpc_bases: Vec<String>,
+    compute_threads: usize,
+    compute_pool: ComputePool,
+    chain_identity: Option<ChainIdentity>,
+    community_rewards_v1_enabled: bool,
+    native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
+    community_twin: crate::twin::TwinConfig,
+    community_release_on_verification: bool,
+    community_profiles: CommunityProfileServing,
+    community_shard_coordinator: bool,
+) -> anyhow::Result<()> {
+    let lifecycle_supervised = shutdown.is_some();
+    let (node, app) = match build_rpc_server_state_and_router(
+        state,
+        mempool,
+        validator_address,
+        validator_keypair,
+        stake,
+        boot_time,
+        peer_count,
+        inference_model,
+        candle_engine,
+        candle_model_id,
+        model_artifact_id,
+        dag_validators,
+        dag_round,
+        dag_committed,
+        consensus_engine,
+        shard_infos,
+        seed_rpc_addrs,
+        community_rpc_bases,
+        compute_threads,
+        compute_pool,
+        chain_identity,
+        community_rewards_v1_enabled,
+        native_serving,
+        native_request_admission,
+        shutdown.clone(),
+        transport_wire_policy,
+        community_twin,
+        community_release_on_verification,
+        community_profiles,
+        community_shard_coordinator,
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            return Err(attach_startup_stop_context(error, startup_server).await);
+        }
+    };
+    if let Err(error) = startup_server.handoff_router(app) {
+        return Err(attach_startup_stop_context(error, startup_server).await);
+    }
+    let server_result = startup_server.wait_until_shutdown(shutdown).await;
+    if lifecycle_supervised {
+        join_node_runtime_tasks(&node).await?;
+        wait_for_inference_compute_barrier(&node).await?;
+    }
+    server_result?;
+    Ok(())
+}
+
+async fn attach_startup_stop_context(
+    fatal_error: anyhow::Error,
+    startup_server: crate::worker_startup::StartupRpcServer,
+) -> anyhow::Error {
+    match startup_server
+        .stop_bounded(crate::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT)
+        .await
+    {
+        Ok(crate::worker_startup::StartupStopOutcome::Drained) => fatal_error,
+        Ok(crate::worker_startup::StartupStopOutcome::ForcedCloseAfterTimeout {
+            remaining_connections: 0,
+            remaining_handlers: 0,
+        }) => {
+            tracing::warn!(
+                "startup loading RPC server timed out draining and force-closed stalled connections"
+            );
+            fatal_error
+        }
+        Ok(crate::worker_startup::StartupStopOutcome::ForcedCloseAfterTimeout {
+            remaining_connections,
+            remaining_handlers,
+        }) => {
+            tracing::error!(
+                remaining_connections,
+                remaining_handlers,
+                "startup loading RPC server timed out draining with live connections or handlers remaining"
+            );
+            let summary = fatal_error.to_string();
+            fatal_error.context(format!(
+                "{summary} (startup loading RPC server did not drain cleanly: {remaining_connections} live connections, {remaining_handlers} live handlers remaining)"
+            ))
+        }
+        Err(stop_error) => {
+            tracing::error!(
+                %stop_error,
+                "startup loading RPC server stop failed after startup error"
+            );
+            let summary = fatal_error.to_string();
+            fatal_error.context(format!(
+                "{summary} (startup loading RPC server stop failed: {stop_error})"
+            ))
+        }
+    }
 }
 
 async fn wait_for_shutdown_request(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -2302,10 +2497,7 @@ pub async fn serve_eth(
         .layer(CorsLayer::permissive())
         .with_state(node);
 
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr.parse()?)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::worker_startup::bind_rpc_tcp_listener(addr.parse()?)?;
     let server = axum::serve(listener, app);
     if let Some(shutdown) = shutdown {
         server
@@ -2343,27 +2535,29 @@ fn paid_inference_unavailable() -> (StatusCode, Json<ApiError>) {
 }
 
 #[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
-    height: u64,
-    peers: u32,
-    chain_participation_enabled: bool,
-    legacy_v3_wire: bool,
-    extended_consensus_wire_enabled: bool,
-    wire_messages_suppressed: u64,
-    uptime_secs: u64,
-    dag_round: u64,
-    dag_committed: u64,
-    validators: usize,
-    last_block_age_secs: Option<u64>,
-    chain_advancing: Option<bool>,
-    dag_bootstrapping: bool,
+pub(crate) struct HealthResponse {
+    pub(crate) status: String,
+    pub(crate) version: String,
+    pub(crate) height: u64,
+    pub(crate) peers: u32,
+    pub(crate) chain_participation_enabled: bool,
+    pub(crate) legacy_v3_wire: bool,
+    pub(crate) extended_consensus_wire_enabled: bool,
+    pub(crate) wire_messages_suppressed: u64,
+    pub(crate) uptime_secs: u64,
+    pub(crate) dag_round: u64,
+    pub(crate) dag_committed: u64,
+    pub(crate) validators: usize,
+    pub(crate) last_block_age_secs: Option<u64>,
+    pub(crate) chain_advancing: Option<bool>,
+    pub(crate) dag_bootstrapping: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    degraded_reason: Option<String>,
+    pub(crate) degraded_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    binary_sha256: Option<&'static str>,
-    features: Vec<&'static str>,
+    pub(crate) startup_phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binary_sha256: Option<&'static str>,
+    pub(crate) features: Vec<&'static str>,
 }
 
 pub const HEALTH_STALL_SECS: u64 = 1_800;
@@ -2424,6 +2618,7 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
             .as_ref()
             .is_some_and(|engine| engine.dag_bootstrapping()),
         degraded_reason,
+        startup_phase: None,
         binary_sha256: crate::build_identity::executable_sha256(),
         features: crate::build_identity::features(),
     })

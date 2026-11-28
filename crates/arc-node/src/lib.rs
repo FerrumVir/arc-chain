@@ -28,5 +28,6 @@ pub mod twin;
 mod unix_listener;
 pub mod validator_identity;
 pub mod vrf;
+pub mod worker_startup;
 
 pub type SharedValidators = std::sync::Arc<parking_lot::RwLock<Vec<(arc_crypto::Hash256, u64)>>>;

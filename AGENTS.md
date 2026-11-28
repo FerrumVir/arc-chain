@@ -313,6 +313,52 @@ and hold it through execution and submission retries. A closed gate suppresses
 new claims while heartbeats and cancellation continue. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
+Stake-zero TCP `--full-integer-worker` and `--community-shard-worker` launches
+with an explicit canonical GGUF model (excluding validators, chain
+participation, shard holders, coordinators, native inference runtime,
+`--tokenizer-only`, `--enable-i16`, `.arc-int8`, and `--rpc-unix`) bind their
+loading RPC listener after the pre-bind barriers (signals, CLI/role checks,
+data-dir lock, desktop shutdown watchers, identity, fast model file and
+bounded GGUF header checks (including unverified header-only
+`CanonicalShardMetadata::from_path` geometry and admission validation for
+partial workers before binding, with mandatory full-file BLAKE3 verification
+retained afterward), and `StateDB`/WAL replay, `--enable-community-rewards-v1` activation-height
+pre-validation, and recovery-domain verification) and before blocking canonical
+GGUF hashing and INT8 weight preparation (`crates/arc-node/src/worker_startup.rs`).
+While model preparation runs, `GET /health` returns HTTP `200` with
+`status: "loading"`, `startup_phase: "loading_model"`, a non-ready
+`degraded_reason`, and `Connection: close`, while `/inference/readiness`,
+`/community/worker/status`, non-`GET` methods on those routes, and all other
+routes fail closed with HTTP `503`, `Retry-After: 5`, and `Connection: close`.
+Preparation honors shutdown cancellation at chunk, header, tensor and layer
+boundaries (`from_path_cancellable`, `verify_unchanged_cancellable`,
+`CanonicalShardMetadata::from_committed_artifact_cancellable`,
+`load_cached_model_canonical_i8_cancellable`), revalidates regular model paths
+before full-worker open, and always joins the blocking task before bounded
+supervised listener stop, watcher join, WAL sync, receipt acknowledgement, and
+data-dir lock release; only cancellation with `shutdown_requested == true` and
+a cleanly drained listener (no remaining live connections/handlers or stop
+errors) exits cleanly and acknowledges a desktop shutdown receipt, while fatal
+early-startup aborts retain the original error with cleanup context. On fatal
+post-bind RPC errors without a clean shutdown request, the node broadcasts
+shutdown, drains any ETH RPC task, owned watcher/worker tasks, and consensus
+writers first, and then runs the final WAL durability sync while preserving the
+fatal error and never acknowledging a clean desktop shutdown receipt. On
+success, the full RPC router replaces the loading router atomically on the same
+bound TCP listener without a close/rebind gap, and outbound worker registration
+or job claims begin only after preparation completes. Validators, non-eligible
+roles, and `--rpc-unix` listeners keep the existing post-initialization
+`rpc::serve` bind order unchanged.
+Early, ordinary, and ETH TCP RPC listeners share a platform-aware binding helper:
+Unix permits reuse after closing a socket; Windows never enables address reuse
+that would allow a second process to bind an occupied port.
+The offline `community-shard-worker --check-header-only` command returns bounded
+header geometry and memory admission with `artifact_verified: false` and the
+expected model pin. It neither hashes the complete artifact nor loads keys,
+weights, or network state. It cannot authorize inference; the launched worker
+still verifies the complete artifact before registration or execution. The
+existing `--check-only` command retains full artifact verification. Both check
+modes omit the worker key requirement and are mutually exclusive.
 An ordinary cleanly stopped desktop node can prepare an unattended update only
 with launch-on-start disabled. The idle path takes a lifecycle fence, rechecks
 the data lock and never signals detached or legacy nodes. Contention remains

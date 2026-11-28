@@ -6819,10 +6819,10 @@ mod tests {
             .expect("detached stand-in shutdown arguments must be valid")
             .expect("detached stand-in must retain the shutdown arguments used by discovery");
         assert_eq!(observed_control.data_dir, data);
-        assert!(process
-            .cmd()
-            .windows(2)
-            .any(|pair| { pair[0] == "--genesis" && pair[1] == genesis.as_os_str() }));
+        assert_eq!(
+            unique_command_flag_value(process.cmd(), "--genesis"),
+            Some(genesis.as_os_str())
+        );
 
         let mut manager = NodeManager::new();
         manager.configure_managed_data_dir(&configured).unwrap();

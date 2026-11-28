@@ -483,7 +483,8 @@ struct Cli {
     community_shard_transaction_domain: Option<Hash256>,
 
     /// Pinned nonzero 64-hex full-artifact BLAKE3 model_id for
-    /// --community-shard-worker. Verified before GGUF header inspection.
+    /// --community-shard-worker. Verified before execution; startup may first
+    /// inspect bounded, untrusted GGUF header metadata.
     #[arg(
         long,
         value_name = "HEX64",
@@ -6092,6 +6093,17 @@ fn validate_pinned_shard_transaction_domain(
     Ok(())
 }
 
+fn validate_community_rewards_v1_state(
+    community_rewards_v1_enabled: bool,
+    activation_height: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        !community_rewards_v1_enabled || activation_height.is_some(),
+        "--enable-community-rewards-v1 requires [chain].community_rewards_v1_activation_height in canonical genesis"
+    );
+    Ok(())
+}
+
 fn validate_legacy_v3_wire_state(
     protocol_major: u16,
     has_native_context: bool,
@@ -6868,6 +6880,434 @@ fn complete_startup_shutdown_if_requested(
     Ok(true)
 }
 
+fn early_worker_startup_role_for_cli(
+    cli: &Cli,
+    stake: u64,
+    chain_participation_enabled: bool,
+    rpc_listener: &rpc::RpcListen,
+) -> Option<arc_node::worker_startup::EarlyWorkerStartupRole> {
+    arc_node::worker_startup::early_worker_startup_role(
+        &arc_node::worker_startup::WorkerStartupPolicyInput {
+            full_integer_worker: cli.full_integer_worker,
+            community_shard_worker: cli.community_shard_worker,
+            stake,
+            chain_participation_enabled,
+            is_shard_holder: !cli.shard_ranges.is_empty()
+                || cli.shard_start.is_some()
+                || cli.shard_end.is_some(),
+            auto_shard_join: cli.auto_shard_join,
+            community_shard_coordinator: cli.community_shard_coordinator,
+            native_inference_runtime: cli.native_inference_runtime,
+            tokenizer_only: cli.tokenizer_only,
+            enable_i16: cli.enable_i16,
+            model_path: cli.model.as_deref(),
+            tcp_rpc_listener: matches!(rpc_listener, rpc::RpcListen::Tcp(_)),
+        },
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FullWorkerModelLoadError {
+    #[error("full integer worker model preparation canceled")]
+    Cancelled,
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+impl FullWorkerModelLoadError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+fn prepare_full_integer_worker_model_blocking(
+    model_path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> std::result::Result<
+    (
+        arc_inference::model_artifact::ModelArtifactCommitment,
+        arc_inference::cached_integer_model::CachedIntegerModel,
+    ),
+    FullWorkerModelLoadError,
+> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(FullWorkerModelLoadError::Cancelled);
+    }
+    community_shard_cli::ensure_regular_model_file(Path::new(model_path))
+        .context("cannot establish the exact --model artifact commitment")?;
+    let artifact =
+        match arc_inference::model_artifact::ModelArtifactCommitment::from_path_cancellable(
+            model_path, cancel,
+        ) {
+            Ok(artifact) => artifact,
+            Err(arc_inference::model_artifact::ModelArtifactLoadError::Cancelled) => {
+                return Err(FullWorkerModelLoadError::Cancelled);
+            }
+            Err(arc_inference::model_artifact::ModelArtifactLoadError::Inference(error)) => {
+                return Err(FullWorkerModelLoadError::Failed(
+                    anyhow::Error::from(error)
+                        .context("cannot establish the exact --model artifact commitment"),
+                ));
+            }
+        };
+    let mut model =
+        match arc_inference::cached_integer_model::load_cached_model_canonical_i8_cancellable(
+            model_path, cancel,
+        ) {
+            Ok(model) => model,
+            Err(arc_inference::cached_integer_model::CanonicalModelLoadError::Cancelled) => {
+                return Err(FullWorkerModelLoadError::Cancelled);
+            }
+            Err(arc_inference::cached_integer_model::CanonicalModelLoadError::Inference(error)) => {
+                return Err(FullWorkerModelLoadError::Failed(
+                    anyhow::Error::from(error).context(
+                        "--full-integer-worker failed to load the deterministic integer model",
+                    ),
+                ));
+            }
+        };
+    model.enforce_canonical_i8_profile();
+    match artifact.verify_unchanged_cancellable(cancel) {
+        Ok(()) => {}
+        Err(arc_inference::model_artifact::ModelArtifactLoadError::Cancelled) => {
+            return Err(FullWorkerModelLoadError::Cancelled);
+        }
+        Err(arc_inference::model_artifact::ModelArtifactLoadError::Inference(error)) => {
+            return Err(FullWorkerModelLoadError::Failed(
+                anyhow::Error::from(error)
+                    .context("--model changed while the inference runtime was loading it"),
+            ));
+        }
+    }
+    if !model.has_all_transformer_layers() {
+        let loaded = model
+            .layers
+            .iter()
+            .filter(|layer| layer.is_loaded())
+            .count();
+        return Err(FullWorkerModelLoadError::Failed(anyhow::anyhow!(
+            "--full-integer-worker loaded only {loaded}/{} transformer layers",
+            model.config.n_layers
+        )));
+    }
+    if !model.has_canonical_i8_profile() {
+        return Err(FullWorkerModelLoadError::Failed(anyhow::anyhow!(
+            "--full-integer-worker invariant failed: worker must use the canonical per-row INT8 profile and must not advertise shard ranges"
+        )));
+    }
+    Ok((artifact, model))
+}
+
+fn log_full_integer_worker_model_loaded(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    elapsed: std::time::Duration,
+) {
+    tracing::info!(
+        profile = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+        "Pinned full community worker to the validator-compatible reward profile"
+    );
+    let mb_held: usize = model
+        .layers
+        .iter()
+        .filter(|layer| layer.is_loaded())
+        .map(|layer| {
+            layer.wq.memory_bytes()
+                + layer.wk.memory_bytes()
+                + layer.wv.memory_bytes()
+                + layer.wo.memory_bytes()
+                + layer.w_gate.memory_bytes()
+                + layer.w_up.memory_bytes()
+                + layer.w_down.memory_bytes()
+        })
+        .sum::<usize>()
+        / (1024 * 1024);
+    let layers_held = model
+        .layers
+        .iter()
+        .filter(|layer| layer.is_loaded())
+        .count();
+    let kernels = arc_inference::canonical_simd::kernel_report();
+    tracing::info!(
+        one_token = kernels.one_token_label(),
+        batched = kernels.batched_label(),
+        pin_status = kernels.pin_status.label(),
+        "Canonical INT8 projection kernels: {kernels}"
+    );
+    tracing::info!(
+        "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
+        elapsed.as_secs_f64(),
+        layers_held,
+        model.config.n_layers,
+        mb_held,
+        model.config.vocab_size
+    );
+    tracing::info!(
+        kernel = arc_inference::canonical_simd::effective_kernel_name(),
+        source = arc_inference::canonical_simd::kernel_choice_source(),
+        "Canonical INT8 projection kernel selected \
+         (ARC_CANONICAL_KERNEL=scalar forces the scalar reference)"
+    );
+}
+
+async fn stop_early_startup_and_join_watchers(
+    startup_rpc_server: Option<arc_node::worker_startup::StartupRpcServer>,
+    native_request_admission: &arc_node::native_inference::NativeRequestAdmission,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    background_admission_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    drain_timeout: std::time::Duration,
+) -> Result<()> {
+    let mut cleanup_error = None::<anyhow::Error>;
+    if let Some(server) = startup_rpc_server {
+        match server.stop_bounded(drain_timeout).await {
+            Ok(arc_node::worker_startup::StartupStopOutcome::Drained) => {}
+            Ok(arc_node::worker_startup::StartupStopOutcome::ForcedCloseAfterTimeout {
+                remaining_connections: 0,
+                remaining_handlers: 0,
+            }) => {
+                tracing::warn!(
+                    "startup loading RPC server timed out draining and force-closed stalled connections cleanly"
+                );
+            }
+            Ok(arc_node::worker_startup::StartupStopOutcome::ForcedCloseAfterTimeout {
+                remaining_connections,
+                remaining_handlers,
+            }) => {
+                tracing::error!(
+                    remaining_connections,
+                    remaining_handlers,
+                    "startup loading RPC server timed out draining with live connections or handlers remaining"
+                );
+                cleanup_error = Some(anyhow::anyhow!(
+                    "startup loading RPC server did not drain cleanly ({remaining_connections} live connections, {remaining_handlers} live handlers remaining)"
+                ));
+            }
+            Err(error) => {
+                tracing::error!(%error, "startup loading RPC server stopped with error");
+                cleanup_error =
+                    Some(error.context("startup loading RPC server failed to stop cleanly"));
+            }
+        }
+    }
+    native_request_admission
+        .worker_execution_gate()
+        .commit_shutdown();
+    let _ = background_admission_shutdown_tx.send(true);
+    let _ = shutdown_tx.send(true);
+    let _ = runtime_shutdown_tx.send(true);
+    for task in runtime_tasks.drain(..) {
+        if let Err(error) = task.await {
+            tracing::warn!(%error, "startup watcher task failed to join during early abort");
+            cleanup_error.get_or_insert_with(|| {
+                anyhow::anyhow!("startup watcher task failed to join during early abort: {error}")
+            });
+        }
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_early_startup_cancellation(
+    startup_rpc_server: Option<arc_node::worker_startup::StartupRpcServer>,
+    state: &StateDB,
+    native_request_admission: &arc_node::native_inference::NativeRequestAdmission,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    background_admission_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    desktop_shutdown_receipt: &std::sync::Mutex<Option<DesktopShutdownReceiptIdentity>>,
+    drain_timeout: std::time::Duration,
+) -> Result<bool> {
+    stop_early_startup_and_join_watchers(
+        startup_rpc_server,
+        native_request_admission,
+        shutdown_tx,
+        background_admission_shutdown_tx,
+        runtime_shutdown_tx,
+        runtime_tasks,
+        drain_timeout,
+    )
+    .await?;
+    complete_startup_shutdown_if_requested(
+        shutdown_requested,
+        Some(state),
+        desktop_shutdown_receipt,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn abort_early_startup_with_error(
+    fatal_error: anyhow::Error,
+    startup_rpc_server: Option<arc_node::worker_startup::StartupRpcServer>,
+    eth_server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    state: &StateDB,
+    native_request_admission: &arc_node::native_inference::NativeRequestAdmission,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    background_admission_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    drain_timeout: std::time::Duration,
+) -> anyhow::Error {
+    let cleanup_result = stop_early_startup_and_join_watchers(
+        startup_rpc_server,
+        native_request_admission,
+        shutdown_tx,
+        background_admission_shutdown_tx,
+        runtime_shutdown_tx,
+        runtime_tasks,
+        drain_timeout,
+    )
+    .await;
+    if let Some(task) = eth_server_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "ETH RPC server failed during early startup abort");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "ETH RPC server task failed to join during early startup abort"
+                );
+            }
+        }
+    }
+    if let Err(error) = state.try_sync_wal() {
+        tracing::error!(%error, "WAL durability sync failed during early startup abort");
+    }
+    match cleanup_result {
+        Ok(()) => fatal_error,
+        Err(cleanup_error) => {
+            let summary = fatal_error.to_string();
+            fatal_error.context(format!(
+                "{summary} (early startup cleanup failed: {cleanup_error})"
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_post_rpc_shutdown(
+    rpc_result: Result<()>,
+    eth_server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    state: &StateDB,
+    native_request_admission: &arc_node::native_inference::NativeRequestAdmission,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    background_admission_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    runtime_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    consensus_thread: Option<std::thread::JoinHandle<()>>,
+    desktop_shutdown_receipt: &std::sync::Mutex<Option<DesktopShutdownReceiptIdentity>>,
+) -> Result<bool> {
+    if !shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        native_request_admission
+            .worker_execution_gate()
+            .commit_shutdown();
+        let _ = background_admission_shutdown_tx.send(true);
+        let _ = shutdown_tx.send(true);
+        let _ = runtime_shutdown_tx.send(true);
+        let eth_result = if let Some(task) = eth_server_task {
+            match task.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("ETH RPC server task join failed: {error}")),
+            }
+        } else {
+            Ok(())
+        };
+        for task in runtime_tasks.drain(..) {
+            if let Err(error) = task.await {
+                tracing::warn!(
+                    %error,
+                    "node runtime task failed to join during RPC failure cleanup"
+                );
+            }
+        }
+        if let Some(thread) = consensus_thread {
+            match tokio::task::spawn_blocking(move || thread.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    tracing::error!("consensus thread panicked during RPC failure cleanup");
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "consensus thread join task failed during RPC failure cleanup"
+                    );
+                }
+            }
+        }
+        let wal_result = state.try_sync_wal();
+        if let Err(error) = &wal_result {
+            tracing::error!(%error, "WAL durability sync failed during RPC failure cleanup");
+        }
+        rpc_result?;
+        eth_result?;
+        wal_result.context("WAL durability barrier failed during RPC failure cleanup")?;
+        return Ok(false);
+    }
+
+    let eth_result = if let Some(task) = eth_server_task {
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("ETH RPC server task join failed: {error}")),
+        }
+    } else {
+        Ok(())
+    };
+
+    let _ = runtime_shutdown_tx.send(true);
+    let mut runtime_join_error = None::<String>;
+    for task in runtime_tasks.drain(..) {
+        if let Err(error) = task.await
+            && runtime_join_error.is_none()
+        {
+            runtime_join_error = Some(format!("node runtime task failed to join: {error}"));
+        }
+    }
+    if let Some(thread) = consensus_thread {
+        match tokio::task::spawn_blocking(move || thread.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                runtime_join_error
+                    .get_or_insert_with(|| "consensus thread panicked during shutdown".to_string());
+            }
+            Err(error) => {
+                runtime_join_error.get_or_insert_with(|| {
+                    format!("consensus thread join task failed during shutdown: {error}")
+                });
+            }
+        }
+    }
+
+    let wal_result = state.try_sync_wal();
+    if shutdown_exit_code(&wal_result) != 0 {
+        let error = wal_result.expect_err("nonzero shutdown status requires WAL failure");
+        tracing::error!(%error, "shutdown WAL durability barrier failed");
+        return Err(anyhow::anyhow!(
+            "shutdown WAL durability barrier failed: {error}"
+        ));
+    }
+    rpc_result?;
+    eth_result?;
+    if let Some(error) = runtime_join_error {
+        return Err(anyhow::anyhow!(error));
+    }
+    if let Some(receipt) = desktop_shutdown_receipt
+        .lock()
+        .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
+        .take()
+    {
+        receipt.acknowledge()?;
+    }
+    Ok(true)
+}
+
 fn p2p_listen_ip(
     p2p_port: u16,
     benchmark_mode: bool,
@@ -7451,7 +7891,14 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
-    let model_artifact = if cli.community_shard_worker {
+    let early_worker_role =
+        early_worker_startup_role_for_cli(&cli, stake, chain_participation_enabled, &rpc_listener);
+
+    let mut model_artifact = if cli.community_shard_worker
+        || matches!(
+            early_worker_role,
+            Some(arc_node::worker_startup::EarlyWorkerStartupRole::FullIntegerWorker)
+        ) {
         None
     } else {
         cli.model
@@ -7460,7 +7907,21 @@ async fn run_arc_node() -> Result<()> {
             .transpose()
             .context("cannot establish the exact --model artifact commitment")?
     };
-    let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
+    let mut model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
+    match early_worker_role {
+        Some(arc_node::worker_startup::EarlyWorkerStartupRole::FullIntegerWorker) => {
+            if let Some(path) = cli.model.as_deref() {
+                community_shard_cli::ensure_regular_model_file(Path::new(path))?;
+            }
+        }
+        Some(arc_node::worker_startup::EarlyWorkerStartupRole::CommunityShardWorker) => {
+            let (spec, validated) = integrated_shard_launch
+                .as_ref()
+                .expect("--community-shard-worker launch spec validated above");
+            let _ = community_shard_cli::prevalidate_early_shard_model_header(spec, validated)?;
+        }
+        None => {}
+    }
     let model_shape = if cli.community_shard_worker {
         None
     } else {
@@ -7750,6 +8211,10 @@ async fn run_arc_node() -> Result<()> {
     )? {
         return Ok(());
     }
+    validate_community_rewards_v1_state(
+        cli.enable_community_rewards_v1,
+        state.community_rewards_v1_activation_height(),
+    )?;
     if let Some((spec, _)) = integrated_shard_launch.as_ref() {
         let local_recovery_domain = state
             .recovery_context()
@@ -8133,6 +8598,32 @@ async fn run_arc_node() -> Result<()> {
     )? {
         return Ok(());
     }
+    let mut early_boot_time = None::<Instant>;
+    let mut startup_rpc_server = if let Some(early_role) = early_worker_role {
+        let started_at = Instant::now();
+        let server = arc_node::worker_startup::StartupRpcServer::start_tcp(
+            &rpc_addr,
+            arc_node::worker_startup::StartupLoadingState {
+                role: early_role,
+                state: state.clone(),
+                boot_time: started_at,
+                transport_wire_policy: transport_wire_policy.clone(),
+            },
+        )
+        .with_context(|| {
+            format!("failed to start early worker loading RPC listener on {rpc_addr}")
+        })?;
+        tracing::info!(
+            role = early_role.label(),
+            address = %server.local_addr(),
+            "Early worker startup RPC listening in loading state before canonical model preparation"
+        );
+        early_boot_time = Some(started_at);
+        Some(server)
+    } else {
+        None
+    };
+
     let (candle_engine, candle_model_id): (
         Option<Arc<arc_inference::candle_backend::GgufEngine>>,
         Option<arc_crypto::Hash256>,
@@ -8172,121 +8663,179 @@ async fn run_arc_node() -> Result<()> {
         (None, None)
     };
 
-    let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
-        if cli.community_shard_worker {
-            None
-        } else if let Some(model_path) = &cli.model {
-            tracing::info!("Loading model from {}...", model_path);
-            let load_start = Instant::now();
-            let load_result = if cli.tokenizer_only || candle_engine.is_some() {
-                tracing::info!("TOKENIZER-ONLY MODE: loading vocab + config, no weights (~30MB)");
-                arc_inference::cached_integer_model::load_tokenizer_only(model_path)
-            } else if model_path.ends_with(".arc-int8") {
-                arc_inference::cached_integer_model::load_cached_model_binary(model_path)
-            } else if !held_ranges.is_empty() {
-                let summary: Vec<String> = held_ranges
-                    .iter()
-                    .map(|(s, e)| format!("[{s}, {e})"))
-                    .collect();
-                tracing::info!("SHARD MODE: loading ranges {}", summary.join(", "));
-                arc_inference::cached_integer_model::load_cached_model_ranges(
-                    model_path,
-                    &held_ranges,
+    let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> = if matches!(
+        early_worker_role,
+        Some(arc_node::worker_startup::EarlyWorkerStartupRole::FullIntegerWorker)
+    ) {
+        let model_path = cli
+            .model
+            .clone()
+            .expect("--full-integer-worker requires --model");
+        tracing::info!("Loading model from {}...", model_path);
+        let load_start = Instant::now();
+        match arc_node::worker_startup::run_cancellable_blocking_preparation(
+            Arc::clone(&shutdown_requested),
+            "full integer worker model preparation",
+            move |cancel| prepare_full_integer_worker_model_blocking(&model_path, cancel.as_ref()),
+            FullWorkerModelLoadError::is_cancelled,
+        )
+        .await
+        {
+            Ok(arc_node::worker_startup::StartupPreparationOutcome::Ready((artifact, model))) => {
+                log_full_integer_worker_model_loaded(&model, load_start.elapsed());
+                model_artifact = Some(artifact);
+                model_artifact_id = model_artifact.as_ref().map(|item| item.model_id());
+                Some(Arc::new(model))
+            }
+            Ok(arc_node::worker_startup::StartupPreparationOutcome::Cancelled) => {
+                let _ = complete_early_startup_cancellation(
+                    startup_rpc_server.take(),
+                    state.as_ref(),
+                    &native_request_admission,
+                    &shutdown_requested,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                    &runtime_shutdown_tx,
+                    &mut runtime_tasks,
+                    &desktop_shutdown_receipt,
+                    arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
                 )
-            } else if cli.full_integer_worker {
-                arc_inference::cached_integer_model::load_cached_model_canonical_i8(model_path)
-            } else {
-                arc_inference::cached_integer_model::load_cached_model(model_path)
-            };
-            match load_result {
-                Ok(mut model) => {
-                    if cli.full_integer_worker {
-                        model.enforce_canonical_i8_profile();
-                        tracing::info!(
-                            profile = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
-                            "Pinned full community worker to the validator-compatible reward profile"
-                        );
-                    }
-                    if is_shard_holder {
-                        model.enforce_canonical_i8_profile();
-                        tracing::info!(
-                            profile = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
-                            "Pinned protocol-v3 shard holder to the canonical reward verification profile"
-                        );
-                    }
-                    let elapsed = load_start.elapsed();
-                    let mb_held: usize = model
-                        .layers
-                        .iter()
-                        .filter(|l| l.is_loaded())
-                        .map(|l| {
-                            l.wq.memory_bytes()
-                                + l.wk.memory_bytes()
-                                + l.wv.memory_bytes()
-                                + l.wo.memory_bytes()
-                                + l.w_gate.memory_bytes()
-                                + l.w_up.memory_bytes()
-                                + l.w_down.memory_bytes()
-                        })
-                        .sum::<usize>()
-                        / (1024 * 1024);
-                    let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
-                    let want_i16 = !is_shard_holder
-                        && !cli.full_integer_worker
-                        && (cli.enable_i16 || cfg!(target_arch = "aarch64"));
-                    if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
-                        model.enable_i16();
-                        tracing::info!(
-                            "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
-                        );
-                    } else if model.i16_layers.is_none() && layers_held > 0 {
-                        tracing::info!(
-                            "I16 promotion SKIPPED on {}: from_i8 adds no precision and this \
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(abort_early_startup_with_error(
+                    error,
+                    startup_rpc_server.take(),
+                    None,
+                    state.as_ref(),
+                    &native_request_admission,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                    &runtime_shutdown_tx,
+                    &mut runtime_tasks,
+                    arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+                )
+                .await);
+            }
+        }
+    } else if cli.community_shard_worker {
+        None
+    } else if let Some(model_path) = &cli.model {
+        tracing::info!("Loading model from {}...", model_path);
+        let load_start = Instant::now();
+        let load_result = if cli.tokenizer_only || candle_engine.is_some() {
+            tracing::info!("TOKENIZER-ONLY MODE: loading vocab + config, no weights (~30MB)");
+            arc_inference::cached_integer_model::load_tokenizer_only(model_path)
+        } else if model_path.ends_with(".arc-int8") {
+            arc_inference::cached_integer_model::load_cached_model_binary(model_path)
+        } else if !held_ranges.is_empty() {
+            let summary: Vec<String> = held_ranges
+                .iter()
+                .map(|(s, e)| format!("[{s}, {e})"))
+                .collect();
+            tracing::info!("SHARD MODE: loading ranges {}", summary.join(", "));
+            arc_inference::cached_integer_model::load_cached_model_ranges(model_path, &held_ranges)
+        } else if cli.full_integer_worker {
+            arc_inference::cached_integer_model::load_cached_model_canonical_i8(model_path)
+        } else {
+            arc_inference::cached_integer_model::load_cached_model(model_path)
+        };
+        match load_result {
+            Ok(mut model) => {
+                if cli.full_integer_worker {
+                    model.enforce_canonical_i8_profile();
+                    tracing::info!(
+                        profile =
+                            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                        "Pinned full community worker to the validator-compatible reward profile"
+                    );
+                }
+                if is_shard_holder {
+                    model.enforce_canonical_i8_profile();
+                    tracing::info!(
+                        profile =
+                            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                        "Pinned protocol-v3 shard holder to the canonical reward verification profile"
+                    );
+                }
+                let elapsed = load_start.elapsed();
+                let mb_held: usize = model
+                    .layers
+                    .iter()
+                    .filter(|l| l.is_loaded())
+                    .map(|l| {
+                        l.wq.memory_bytes()
+                            + l.wk.memory_bytes()
+                            + l.wv.memory_bytes()
+                            + l.wo.memory_bytes()
+                            + l.w_gate.memory_bytes()
+                            + l.w_up.memory_bytes()
+                            + l.w_down.memory_bytes()
+                    })
+                    .sum::<usize>()
+                    / (1024 * 1024);
+                let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
+                let want_i16 = !is_shard_holder
+                    && !cli.full_integer_worker
+                    && (cli.enable_i16 || cfg!(target_arch = "aarch64"));
+                if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
+                    model.enable_i16();
+                    tracing::info!(
+                        "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
+                    );
+                } else if model.i16_layers.is_none() && layers_held > 0 {
+                    tracing::info!(
+                        "I16 promotion SKIPPED on {}: from_i8 adds no precision and this \
                              target's i16 dot product is scalar, so promoting would double \
                              per-layer weight bytes for identical output. Pass --enable-i16 to force.",
-                            std::env::consts::ARCH
-                        );
-                    }
-                    let kernels = arc_inference::canonical_simd::kernel_report();
-                    if model.has_canonical_i8_profile() {
-                        tracing::info!(
-                            one_token = kernels.one_token_label(),
-                            batched = kernels.batched_label(),
-                            pin_status = kernels.pin_status.label(),
-                            "Canonical INT8 projection kernels: {kernels}"
-                        );
-                    } else {
-                        tracing::info!(
-                            "Canonical INT8 projection kernels: {kernels}. This model is not on \
+                        std::env::consts::ARCH
+                    );
+                }
+                let kernels = arc_inference::canonical_simd::kernel_report();
+                if model.has_canonical_i8_profile() {
+                    tracing::info!(
+                        one_token = kernels.one_token_label(),
+                        batched = kernels.batched_label(),
+                        pin_status = kernels.pin_status.label(),
+                        "Canonical INT8 projection kernels: {kernels}"
+                    );
+                } else {
+                    tracing::info!(
+                        "Canonical INT8 projection kernels: {kernels}. This model is not on \
                              the canonical per-row INT8 profile, so none of its projections run them"
-                        );
-                    }
-                    tracing::info!(
-                        "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
-                        elapsed.as_secs_f64(),
-                        layers_held,
-                        model.config.n_layers,
-                        mb_held,
-                        model.config.vocab_size
                     );
-                    tracing::info!(
-                        kernel = arc_inference::canonical_simd::effective_kernel_name(),
-                        source = arc_inference::canonical_simd::kernel_choice_source(),
-                        "Canonical INT8 projection kernel selected \
+                }
+                tracing::info!(
+                    "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
+                    elapsed.as_secs_f64(),
+                    layers_held,
+                    model.config.n_layers,
+                    mb_held,
+                    model.config.vocab_size
+                );
+                tracing::info!(
+                    kernel = arc_inference::canonical_simd::effective_kernel_name(),
+                    source = arc_inference::canonical_simd::kernel_choice_source(),
+                    "Canonical INT8 projection kernel selected \
                          (ARC_CANONICAL_KERNEL=scalar forces the scalar reference)"
-                    );
-                    Some(Arc::new(model))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load model: {}", e);
-                    None
-                }
+                );
+                Some(Arc::new(model))
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                tracing::error!("Failed to load model: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    if let Some(artifact) = &model_artifact {
+    if !matches!(
+        early_worker_role,
+        Some(arc_node::worker_startup::EarlyWorkerStartupRole::FullIntegerWorker)
+    ) && let Some(artifact) = &model_artifact
+    {
         artifact
             .verify_unchanged()
             .context("--model changed while the inference runtime was loading it")?;
@@ -8311,24 +8860,57 @@ async fn run_arc_node() -> Result<()> {
         );
     }
     let prepared_shard_worker = if let Some((spec, validated)) = integrated_shard_launch.take() {
-        let cancel_prepare = Arc::clone(&shutdown_requested);
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            community_shard_cli::prepare_launch_spec_blocking(
-                &spec,
-                &validated,
-                cancel_prepare.as_ref(),
-            )
-        })
+        let prepared = match arc_node::worker_startup::run_cancellable_blocking_preparation(
+            Arc::clone(&shutdown_requested),
+            "integrated community shard worker preparation",
+            move |cancel| {
+                community_shard_cli::prepare_launch_spec_blocking(
+                    &spec,
+                    &validated,
+                    cancel.as_ref(),
+                )
+            },
+            |error| {
+                error
+                    .downcast_ref::<community_shard_cli::ModelPreparationCanceled>()
+                    .is_some()
+            },
+        )
         .await
-        .context("integrated community shard worker preparation task panicked")?;
-        if complete_startup_shutdown_if_requested(
-            &shutdown_requested,
-            Some(state.as_ref()),
-            &desktop_shutdown_receipt,
-        )? {
-            return Ok(());
-        }
-        let prepared = prepare_result?;
+        {
+            Ok(arc_node::worker_startup::StartupPreparationOutcome::Ready(prepared)) => prepared,
+            Ok(arc_node::worker_startup::StartupPreparationOutcome::Cancelled) => {
+                let _ = complete_early_startup_cancellation(
+                    startup_rpc_server.take(),
+                    state.as_ref(),
+                    &native_request_admission,
+                    &shutdown_requested,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                    &runtime_shutdown_tx,
+                    &mut runtime_tasks,
+                    &desktop_shutdown_receipt,
+                    arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(abort_early_startup_with_error(
+                    error,
+                    startup_rpc_server.take(),
+                    None,
+                    state.as_ref(),
+                    &native_request_admission,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                    &runtime_shutdown_tx,
+                    &mut runtime_tasks,
+                    arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+                )
+                .await);
+            }
+        };
         ensure!(
             candle_engine.is_none() && inference_model.is_none() && held_ranges.is_empty(),
             "--community-shard-worker invariant failed: candle backend, full integer model, and validator shard ranges must remain unloaded"
@@ -8348,15 +8930,25 @@ async fn run_arc_node() -> Result<()> {
     } else {
         None
     };
-    if complete_startup_shutdown_if_requested(
-        &shutdown_requested,
-        Some(state.as_ref()),
-        &desktop_shutdown_receipt,
-    )? {
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst)
+        && complete_early_startup_cancellation(
+            startup_rpc_server.take(),
+            state.as_ref(),
+            &native_request_admission,
+            &shutdown_requested,
+            &shutdown_tx,
+            &background_admission_shutdown_tx,
+            &runtime_shutdown_tx,
+            &mut runtime_tasks,
+            &desktop_shutdown_receipt,
+            arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+        )
+        .await?
+    {
         return Ok(());
     }
 
-    let boot_time = Instant::now();
+    let boot_time = early_boot_time.unwrap_or_else(Instant::now);
 
     let mut consensus_thread = None::<std::thread::JoinHandle<()>>;
 
@@ -9798,13 +10390,29 @@ async fn run_arc_node() -> Result<()> {
     }
 
     if let Some(prepared_shard_worker) = prepared_shard_worker {
-        let shard_worker_task = community_shard_cli::spawn_integrated_worker(
+        match community_shard_cli::spawn_integrated_worker(
             prepared_shard_worker,
             Arc::new(validator_keypair.clone()),
             native_request_admission.worker_execution_gate(),
             background_admission_shutdown_rx.clone(),
-        )?;
-        runtime_tasks.push(shard_worker_task);
+        ) {
+            Ok(shard_worker_task) => runtime_tasks.push(shard_worker_task),
+            Err(error) => {
+                return Err(abort_early_startup_with_error(
+                    error,
+                    startup_rpc_server.take(),
+                    eth_server_task,
+                    state.as_ref(),
+                    &native_request_admission,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                    &runtime_shutdown_tx,
+                    &mut runtime_tasks,
+                    arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+                )
+                .await);
+            }
+        }
     }
 
     let coordinator_seed_rpcs = coordinator_rpc_bases;
@@ -9816,53 +10424,92 @@ async fn run_arc_node() -> Result<()> {
             node_cfg.inference.threads
         };
 
-    let rpc_result = rpc::serve(
-        rpc_listener,
-        state.clone(),
-        mempool,
-        validator_address,
-        Some(Arc::new(validator_keypair)),
-        stake,
-        boot_time,
-        peer_count,
-        inference_model,
-        candle_engine,
-        candle_model_id,
-        model_artifact_id,
-        Some(dag_validators),
-        Some(dag_round),
-        Some(dag_committed),
-        rpc_consensus_engine,
-        shard_infos,
-        coordinator_seed_rpcs,
-        community_rpc_bases,
-        compute_threads,
-        compute_pool,
-        genesis_chain_identity,
-        cli.enable_community_rewards_v1,
-        native_serving,
-        native_request_admission,
-        Some(shutdown_rx),
-        transport_wire_policy,
-        arc_node::twin::TwinConfig {
-            twin_execution: cli.community_twin_execution,
-            demand_pump: cli.community_demand_pump,
-            demand_dry_run: cli.community_demand_dry_run,
-            spot_check_per_mille: cli.community_twin_spot_check_per_mille,
-            demand_interval_secs: cli.community_demand_interval_secs,
-            demand_max_groups: cli.community_demand_max_groups,
-            demand_reserve_workers: cli.community_demand_reserve_workers,
-            demand_groups_per_hour: cli.community_demand_groups_per_hour,
-        },
-        cli.community_release_on_verification,
-        rpc::CommunityProfileServing {
-            verify: community_verify_profiles,
-            interleaved_rope_qk,
-            interleaved_rope_shard_infos,
-        },
-        cli.community_shard_coordinator,
-    )
-    .await;
+    let community_twin = arc_node::twin::TwinConfig {
+        twin_execution: cli.community_twin_execution,
+        demand_pump: cli.community_demand_pump,
+        demand_dry_run: cli.community_demand_dry_run,
+        spot_check_per_mille: cli.community_twin_spot_check_per_mille,
+        demand_interval_secs: cli.community_demand_interval_secs,
+        demand_max_groups: cli.community_demand_max_groups,
+        demand_reserve_workers: cli.community_demand_reserve_workers,
+        demand_groups_per_hour: cli.community_demand_groups_per_hour,
+    };
+    let community_profiles = rpc::CommunityProfileServing {
+        verify: community_verify_profiles,
+        interleaved_rope_qk,
+        interleaved_rope_shard_infos,
+    };
+    let rpc_result = if let Some(startup_server) = startup_rpc_server.take() {
+        rpc::serve_on_startup_server(
+            startup_server,
+            state.clone(),
+            mempool,
+            validator_address,
+            Some(Arc::new(validator_keypair)),
+            stake,
+            boot_time,
+            peer_count,
+            inference_model,
+            candle_engine,
+            candle_model_id,
+            model_artifact_id,
+            Some(dag_validators),
+            Some(dag_round),
+            Some(dag_committed),
+            rpc_consensus_engine,
+            shard_infos,
+            coordinator_seed_rpcs,
+            community_rpc_bases,
+            compute_threads,
+            compute_pool,
+            genesis_chain_identity,
+            cli.enable_community_rewards_v1,
+            native_serving,
+            native_request_admission.clone(),
+            Some(shutdown_rx),
+            transport_wire_policy,
+            community_twin,
+            cli.community_release_on_verification,
+            community_profiles,
+            cli.community_shard_coordinator,
+        )
+        .await
+    } else {
+        rpc::serve(
+            rpc_listener,
+            state.clone(),
+            mempool,
+            validator_address,
+            Some(Arc::new(validator_keypair)),
+            stake,
+            boot_time,
+            peer_count,
+            inference_model,
+            candle_engine,
+            candle_model_id,
+            model_artifact_id,
+            Some(dag_validators),
+            Some(dag_round),
+            Some(dag_committed),
+            rpc_consensus_engine,
+            shard_infos,
+            coordinator_seed_rpcs,
+            community_rpc_bases,
+            compute_threads,
+            compute_pool,
+            genesis_chain_identity,
+            cli.enable_community_rewards_v1,
+            native_serving,
+            native_request_admission.clone(),
+            Some(shutdown_rx),
+            transport_wire_policy,
+            community_twin,
+            cli.community_release_on_verification,
+            community_profiles,
+            cli.community_shard_coordinator,
+        )
+        .await
+    };
 
     if let Some(handle) = native_runtime_handle.take() {
         tracing::info!("stopping the native worker runtime");
@@ -9870,70 +10517,26 @@ async fn run_arc_node() -> Result<()> {
         handle.shutdown();
     }
 
-    let eth_result = if let Some(task) = eth_server_task {
-        match task.await {
-            Ok(result) => result,
-            Err(error) => Err(anyhow::anyhow!("ETH RPC server task join failed: {error}")),
-        }
-    } else {
-        Ok(())
-    };
-
-    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
-        let _ = runtime_shutdown_tx.send(true);
-        let mut runtime_join_error = None::<String>;
-        for task in runtime_tasks {
-            if let Err(error) = task.await
-                && runtime_join_error.is_none()
-            {
-                runtime_join_error = Some(format!("node runtime task failed to join: {error}"));
-            }
-        }
-        if let Some(thread) = consensus_thread {
-            match tokio::task::spawn_blocking(move || thread.join()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    runtime_join_error.get_or_insert_with(|| {
-                        "consensus thread panicked during shutdown".to_string()
-                    });
-                }
-                Err(error) => {
-                    runtime_join_error.get_or_insert_with(|| {
-                        format!("consensus thread join task failed during shutdown: {error}")
-                    });
-                }
-            }
-        }
-
-        let wal_result = state.try_sync_wal();
-        if shutdown_exit_code(&wal_result) != 0 {
-            let error = wal_result.expect_err("nonzero shutdown status requires WAL failure");
-            tracing::error!(%error, "shutdown WAL durability barrier failed");
-            return Err(anyhow::anyhow!(
-                "shutdown WAL durability barrier failed: {error}"
-            ));
-        }
-        rpc_result?;
-        eth_result?;
-        if let Some(error) = runtime_join_error {
-            return Err(anyhow::anyhow!(error));
-        }
-        if let Some(receipt) = desktop_shutdown_receipt
-            .lock()
-            .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
-            .take()
-        {
-            receipt.acknowledge()?;
-        }
+    if finalize_post_rpc_shutdown(
+        rpc_result,
+        eth_server_task,
+        state.as_ref(),
+        &native_request_admission,
+        &shutdown_requested,
+        &shutdown_tx,
+        &background_admission_shutdown_tx,
+        &runtime_shutdown_tx,
+        &mut runtime_tasks,
+        consensus_thread,
+        &desktop_shutdown_receipt,
+    )
+    .await?
+    {
         tracing::info!(
             "RPC handlers drained, node writers joined, WAL durability barrier completed, and the desktop receipt was acknowledged; shutdown is clean"
         );
         exit_after_clean_shutdown();
     }
-
-    rpc_result?;
-    eth_result?;
-
     Ok(())
 }
 
@@ -10256,6 +10859,644 @@ mod integrated_shard_worker_tests {
                 .to_string()
                 .contains("--community-shard-transaction-domain must be nonzero")
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_startup_main_tests {
+    use super::*;
+    use arc_node::worker_startup::{EarlyWorkerStartupRole, StartupLoadingState, StartupRpcServer};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn early_worker_startup_role_for_cli_matches_eligible_and_ineligible_cli_invocations() {
+        let tcp = rpc::RpcListen::Tcp("127.0.0.1:9090".to_string());
+
+        let full_cli = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--model",
+            "/tmp/llama2-7b.gguf",
+        ])
+        .unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&full_cli, 0, false, &tcp),
+            Some(EarlyWorkerStartupRole::FullIntegerWorker)
+        );
+        assert_eq!(
+            early_worker_startup_role_for_cli(&full_cli, 100, false, &tcp),
+            None
+        );
+        assert_eq!(
+            early_worker_startup_role_for_cli(&full_cli, 0, true, &tcp),
+            None
+        );
+
+        let shard_cli = Cli::try_parse_from([
+            "arc-node",
+            "--community-shard-worker",
+            "--model",
+            "/tmp/llama2-7b.gguf",
+            "--community-shard-coordinator-url",
+            "https://coordinator.example.com",
+            "--community-shard-coordinator-id",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--community-shard-transaction-domain",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "--community-shard-expected-model-id",
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            "--community-shard-max-working-set-bytes",
+            "536870912",
+        ])
+        .unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&shard_cli, 0, false, &tcp),
+            Some(EarlyWorkerStartupRole::CommunityShardWorker)
+        );
+
+        let plain_model =
+            Cli::try_parse_from(["arc-node", "--model", "/tmp/llama2-7b.gguf"]).unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&plain_model, 0, false, &tcp),
+            None
+        );
+
+        let binary_model = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--model",
+            "/tmp/llama2-7b.arc-int8",
+        ])
+        .unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&binary_model, 0, false, &tcp),
+            None
+        );
+
+        let coordinator = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--community-shard-coordinator",
+            "--model",
+            "/tmp/llama2-7b.gguf",
+        ])
+        .unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&coordinator, 0, false, &tcp),
+            None
+        );
+
+        let native_runtime = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--native-inference-activation",
+            "/tmp/activation.toml",
+            "--native-inference-runtime",
+            "--model",
+            "/tmp/llama2-7b.gguf",
+        ])
+        .unwrap();
+        assert_eq!(
+            early_worker_startup_role_for_cli(&native_runtime, 0, false, &tcp),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let unix = rpc::RpcListen::Unix(PathBuf::from("/tmp/arc-rpc.sock"));
+            assert_eq!(
+                early_worker_startup_role_for_cli(&full_cli, 0, false, &unix),
+                None
+            );
+            assert_eq!(
+                early_worker_startup_role_for_cli(&shard_cli, 0, false, &unix),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_full_integer_worker_model_blocking_honors_cancel_and_reports_real_errors() {
+        let cancel_pre = AtomicBool::new(true);
+        let canceled =
+            prepare_full_integer_worker_model_blocking("/nonexistent/model.gguf", &cancel_pre)
+                .err()
+                .expect("preset cancel must abort preparation");
+        assert!(canceled.is_cancelled());
+
+        let uncancelled = AtomicBool::new(false);
+        let missing =
+            prepare_full_integer_worker_model_blocking("/nonexistent/model.gguf", &uncancelled)
+                .err()
+                .expect("missing model file must fail");
+        assert!(!missing.is_cancelled());
+        assert!(
+            missing
+                .to_string()
+                .contains("cannot establish the exact --model artifact commitment")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_err =
+            prepare_full_integer_worker_model_blocking(dir.path().to_str().unwrap(), &uncancelled)
+                .err()
+                .expect("directory model path must fail before hashing");
+        assert!(!dir_err.is_cancelled());
+        assert!(
+            dir_err
+                .to_string()
+                .contains("cannot establish the exact --model artifact commitment")
+        );
+
+        let empty = dir.path().join("empty.gguf");
+        std::fs::write(&empty, b"").unwrap();
+        let empty_err =
+            prepare_full_integer_worker_model_blocking(empty.to_str().unwrap(), &uncancelled)
+                .err()
+                .expect("empty model file must fail before hashing");
+        assert!(!empty_err.is_cancelled());
+        assert!(
+            empty_err
+                .to_string()
+                .contains("cannot establish the exact --model artifact commitment")
+        );
+
+        let corrupt = dir.path().join("corrupt.gguf");
+        std::fs::write(&corrupt, b"not-a-valid-gguf-payload").unwrap();
+        let load_err =
+            prepare_full_integer_worker_model_blocking(corrupt.to_str().unwrap(), &uncancelled)
+                .err()
+                .expect("corrupt gguf must fail");
+        assert!(!load_err.is_cancelled());
+        assert!(
+            load_err
+                .to_string()
+                .contains("--full-integer-worker failed to load the deterministic integer model")
+        );
+    }
+
+    #[test]
+    fn validate_community_rewards_v1_state_rejects_missing_activation_height_prebind() {
+        let missing = validate_community_rewards_v1_state(true, None)
+            .expect_err("rewards v1 without activation height must fail before early bind");
+        assert!(
+            missing
+                .to_string()
+                .contains("community_rewards_v1_activation_height")
+        );
+        validate_community_rewards_v1_state(true, Some(1)).unwrap();
+        validate_community_rewards_v1_state(false, None).unwrap();
+        validate_community_rewards_v1_state(false, Some(1)).unwrap();
+
+        let mut state = StateDB::new();
+        assert!(
+            validate_community_rewards_v1_state(
+                true,
+                state.community_rewards_v1_activation_height()
+            )
+            .is_err()
+        );
+        state.set_community_rewards_v1_activation_height(Some(42));
+        validate_community_rewards_v1_state(true, state.community_rewards_v1_activation_height())
+            .unwrap();
+    }
+
+    fn arm_test_desktop_shutdown_receipt(root: &Path) -> DesktopShutdownReceiptIdentity {
+        std::fs::create_dir_all(root).unwrap();
+        let canonical_data_dir = root.canonicalize().unwrap();
+        let control_dir = canonical_data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        arc_crypto::secret_file::secure_private_directory(&control_dir).unwrap();
+        let genesis = canonical_data_dir.join("genesis.toml");
+        std::fs::write(&genesis, b"chain_id = \"receipt-test\"\n").unwrap();
+        let canonical_genesis = genesis.canonicalize().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let expected_token = [0x42u8; 32];
+        let arm = arc_crypto::secret_file::arm_desktop_shutdown_receipt(
+            &canonical_data_dir,
+            &expected_token,
+            &executable,
+            &canonical_genesis,
+        )
+        .unwrap();
+        DesktopShutdownReceiptIdentity {
+            data_dir: canonical_data_dir,
+            expected_token,
+            nonce: arm.nonce,
+            executable,
+            genesis: canonical_genesis,
+        }
+    }
+
+    type BlockingSlowServerHandle = (
+        StartupRpcServer,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
+    );
+
+    fn spawn_blocking_slow_server() -> BlockingSlowServerHandle {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_slot = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
+        let release_slot = Arc::new(parking_lot::Mutex::new(Some(release_rx)));
+        let exited_slot = Arc::new(parking_lot::Mutex::new(Some(exited_tx)));
+
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get({
+                let entered_slot = Arc::clone(&entered_slot);
+                let release_slot = Arc::clone(&release_slot);
+                let exited_slot = Arc::clone(&exited_slot);
+                move || {
+                    let entered_slot = Arc::clone(&entered_slot);
+                    let release_slot = Arc::clone(&release_slot);
+                    let exited_slot = Arc::clone(&exited_slot);
+                    async move {
+                        let entered_tx = entered_slot.lock().take();
+                        if let Some(tx) = entered_tx {
+                            let _ = tx.send(());
+                        }
+                        let release_rx = release_slot.lock().take();
+                        if let Some(rx) = release_rx {
+                            let _ = rx.await;
+                        }
+                        let exited_tx = exited_slot.lock().take();
+                        if let Some(tx) = exited_tx {
+                            let _ = tx.send(());
+                        }
+                        (axum::http::StatusCode::OK, "done")
+                    }
+                }
+            }),
+        );
+
+        let server = StartupRpcServer::start_tcp_with_router("127.0.0.1:0", router).unwrap();
+        let addr = server.local_addr();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let slow_url = format!("http://{addr}/slow");
+        let request_task = tokio::spawn(async move { client.get(slow_url).send().await });
+        (server, entered_rx, release_tx, exited_rx, request_task)
+    }
+
+    #[tokio::test]
+    async fn post_bind_rpc_failure_cleanup_stops_tasks_syncs_wal_completes_eth_and_preserves_fatal_err()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let producer = hash_bytes(b"post-bind-rpc-failure-producer");
+        let genesis_hash = hash_bytes(b"post-bind-rpc-failure-genesis");
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(&[(producer, 1_000)], &state_dir, genesis_hash)
+                .unwrap(),
+        );
+        assert!(state.is_persistent());
+
+        let admission = arc_node::native_inference::NativeRequestAdmission::new(false);
+        let shutdown_requested = AtomicBool::new(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bg_tx, mut bg_rx) = tokio::sync::watch::channel(false);
+        let (rt_tx, mut rt_rx) = tokio::sync::watch::channel(false);
+
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let eth_node = rpc::build_node_state(
+            Arc::clone(&state),
+            Arc::new(Mempool::new(1_000)),
+            keypair.address(),
+            Some(Arc::new(keypair)),
+            0,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let eth_completed = Arc::new(AtomicBool::new(false));
+        let eth_completed_task = Arc::clone(&eth_completed);
+        let eth_shutdown = shutdown_rx.clone();
+        let eth_task = tokio::spawn(async move {
+            let result = rpc::serve_eth("127.0.0.1:0", eth_node, Some(eth_shutdown)).await;
+            eth_completed_task.store(true, Ordering::Release);
+            result
+        });
+
+        let watcher_joined = Arc::new(AtomicBool::new(false));
+        let watcher_joined_task = Arc::clone(&watcher_joined);
+        let mut watcher_shutdown = shutdown_rx.clone();
+        let worker_joined = Arc::new(AtomicBool::new(false));
+        let worker_joined_task = Arc::clone(&worker_joined);
+        let mut runtime_tasks = vec![
+            tokio::spawn(async move {
+                if !*watcher_shutdown.borrow_and_update() {
+                    let _ = watcher_shutdown.changed().await;
+                }
+                watcher_joined_task.store(true, Ordering::Release);
+            }),
+            tokio::spawn(async move {
+                if !*bg_rx.borrow_and_update() {
+                    let _ = bg_rx.changed().await;
+                }
+                worker_joined_task.store(true, Ordering::Release);
+            }),
+        ];
+
+        let consensus_joined = Arc::new(AtomicBool::new(false));
+        let consensus_joined_thread = Arc::clone(&consensus_joined);
+        let consensus_state = Arc::clone(&state);
+        let consensus_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if !*rt_rx.borrow_and_update() {
+                    let _ = rt_rx.changed().await;
+                }
+            });
+            consensus_state.execute_block(&[], producer).unwrap();
+            consensus_joined_thread.store(true, Ordering::Release);
+        });
+
+        let receipt = std::sync::Mutex::new(Some(arm_test_desktop_shutdown_receipt(
+            &temp.path().join("desktop-receipt"),
+        )));
+
+        tokio::task::yield_now().await;
+        assert!(!eth_completed.load(Ordering::Acquire));
+
+        let cleanup_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finalize_post_rpc_shutdown(
+                Err(anyhow::anyhow!("startup router handoff failed")),
+                Some(eth_task),
+                state.as_ref(),
+                &admission,
+                &shutdown_requested,
+                &shutdown_tx,
+                &bg_tx,
+                &rt_tx,
+                &mut runtime_tasks,
+                Some(consensus_thread),
+                &receipt,
+            ),
+        )
+        .await
+        .expect("post-bind RPC failure cleanup must complete ETH task without hanging");
+
+        let fatal_err = cleanup_result.expect_err("fatal RPC error must be preserved");
+        assert!(
+            fatal_err
+                .to_string()
+                .contains("startup router handoff failed")
+        );
+        assert!(watcher_joined.load(Ordering::Acquire));
+        assert!(worker_joined.load(Ordering::Acquire));
+        assert!(consensus_joined.load(Ordering::Acquire));
+        assert!(eth_completed.load(Ordering::Acquire));
+        assert!(runtime_tasks.is_empty());
+        assert!(admission.worker_execution_gate().try_enter().is_none());
+        assert_eq!(state.height(), 1);
+        assert!(
+            receipt.lock().unwrap().is_some(),
+            "fatal RPC error cleanup must never acknowledge a clean desktop shutdown receipt"
+        );
+
+        shutdown_requested.store(true, Ordering::SeqCst);
+        let clean_shutdown = finalize_post_rpc_shutdown(
+            Ok(()),
+            None,
+            state.as_ref(),
+            &admission,
+            &shutdown_requested,
+            &shutdown_tx,
+            &bg_tx,
+            &rt_tx,
+            &mut runtime_tasks,
+            None,
+            &receipt,
+        )
+        .await
+        .expect("clean shutdown path must succeed and acknowledge the armed receipt");
+        assert!(clean_shutdown);
+        assert!(
+            receipt.lock().unwrap().is_none(),
+            "clean shutdown path must consume and acknowledge the armed desktop shutdown receipt"
+        );
+
+        drop(state);
+        let reopened =
+            StateDB::with_genesis_persistent(&[(producer, 1_000)], &state_dir, genesis_hash)
+                .unwrap();
+        assert_eq!(
+            reopened.height(),
+            1,
+            "committed block must survive reopen after final WAL durability barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_startup_abort_stops_listener_joins_watchers_and_gates_clean_shutdown() {
+        let state = Arc::new(StateDB::new());
+        let wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(false));
+        let admission = arc_node::native_inference::NativeRequestAdmission::new(false);
+        let server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time: Instant::now(),
+                transport_wire_policy: wire_policy,
+            },
+        )
+        .unwrap();
+        let addr = server.local_addr();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bg_tx, _bg_rx) = tokio::sync::watch::channel(false);
+        let (rt_tx, _rt_rx) = tokio::sync::watch::channel(false);
+        let watcher_joined = Arc::new(AtomicBool::new(false));
+        let watcher_joined_task = Arc::clone(&watcher_joined);
+        let mut runtime_tasks = vec![tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+            watcher_joined_task.store(true, Ordering::Release);
+        })];
+
+        stop_early_startup_and_join_watchers(
+            Some(server),
+            &admission,
+            &shutdown_tx,
+            &bg_tx,
+            &rt_tx,
+            &mut runtime_tasks,
+            arc_node::worker_startup::STARTUP_SHUTDOWN_DRAIN_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(watcher_joined.load(Ordering::Acquire));
+        assert!(runtime_tasks.is_empty());
+        assert!(
+            tokio::net::TcpListener::bind(addr).await.is_ok(),
+            "startup listener port must be released after abort cleanup"
+        );
+
+        let receipt = Arc::new(std::sync::Mutex::new(None));
+        let not_requested = AtomicBool::new(false);
+        assert!(!complete_startup_shutdown_if_requested(
+            &not_requested,
+            Some(state.as_ref()),
+            &receipt,
+        )
+        .unwrap());
+
+        let requested = AtomicBool::new(true);
+        assert!(
+            complete_startup_shutdown_if_requested(&requested, Some(state.as_ref()), &receipt,)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn early_startup_live_handler_blocks_clean_cancellation_and_receipt_while_preserving_fatal_error()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let producer = hash_bytes(b"early-startup-live-handler-producer");
+        let genesis_hash = hash_bytes(b"early-startup-live-handler-genesis");
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(&[(producer, 1_000)], &state_dir, genesis_hash)
+                .unwrap(),
+        );
+
+        let (server, entered_rx, release_tx, exited_rx, request_task) =
+            spawn_blocking_slow_server();
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .expect("slow handler must enter before cancellation")
+            .unwrap();
+
+        let admission = arc_node::native_inference::NativeRequestAdmission::new(false);
+        let shutdown_requested = AtomicBool::new(true);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bg_tx, _bg_rx) = tokio::sync::watch::channel(false);
+        let (rt_tx, _rt_rx) = tokio::sync::watch::channel(false);
+        let watcher_joined = Arc::new(AtomicBool::new(false));
+        let watcher_joined_task = Arc::clone(&watcher_joined);
+        let mut runtime_tasks = vec![tokio::spawn(async move {
+            if !*shutdown_rx.borrow_and_update() {
+                let _ = shutdown_rx.changed().await;
+            }
+            watcher_joined_task.store(true, Ordering::Release);
+        })];
+        let cancel_receipt = std::sync::Mutex::new(Some(arm_test_desktop_shutdown_receipt(
+            &temp.path().join("receipt-cancel"),
+        )));
+
+        let cancel_err = complete_early_startup_cancellation(
+            Some(server),
+            state.as_ref(),
+            &admission,
+            &shutdown_requested,
+            &shutdown_tx,
+            &bg_tx,
+            &rt_tx,
+            &mut runtime_tasks,
+            &cancel_receipt,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("remaining live handler must block clean early-startup cancellation");
+        assert!(cancel_err.to_string().contains("did not drain cleanly"));
+        assert!(cancel_err.to_string().contains("1 live handlers remaining"));
+        assert!(watcher_joined.load(Ordering::Acquire));
+        assert!(runtime_tasks.is_empty());
+        assert!(admission.worker_execution_gate().try_enter().is_none());
+        assert!(
+            cancel_receipt.lock().unwrap().is_some(),
+            "incomplete early-startup drain must never acknowledge a clean desktop shutdown receipt"
+        );
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), exited_rx)
+            .await
+            .expect("released handler must exit")
+            .unwrap();
+        let _ = request_task.await;
+
+        assert!(
+            complete_early_startup_cancellation(
+                None,
+                state.as_ref(),
+                &admission,
+                &shutdown_requested,
+                &shutdown_tx,
+                &bg_tx,
+                &rt_tx,
+                &mut runtime_tasks,
+                &cancel_receipt,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            cancel_receipt.lock().unwrap().is_none(),
+            "clean cancellation without remaining live handlers must acknowledge the armed receipt"
+        );
+
+        let (fatal_server, fatal_entered_rx, fatal_release_tx, fatal_exited_rx, fatal_req_task) =
+            spawn_blocking_slow_server();
+        tokio::time::timeout(std::time::Duration::from_secs(2), fatal_entered_rx)
+            .await
+            .expect("second slow handler must enter before fatal abort")
+            .unwrap();
+
+        let fatal_admission = arc_node::native_inference::NativeRequestAdmission::new(false);
+        let (fatal_shutdown_tx, mut fatal_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (fatal_bg_tx, _fatal_bg_rx) = tokio::sync::watch::channel(false);
+        let (fatal_rt_tx, _fatal_rt_rx) = tokio::sync::watch::channel(false);
+        let fatal_watcher_joined = Arc::new(AtomicBool::new(false));
+        let fatal_watcher_joined_task = Arc::clone(&fatal_watcher_joined);
+        let mut fatal_runtime_tasks = vec![tokio::spawn(async move {
+            if !*fatal_shutdown_rx.borrow_and_update() {
+                let _ = fatal_shutdown_rx.changed().await;
+            }
+            fatal_watcher_joined_task.store(true, Ordering::Release);
+        })];
+
+        let combined_err = abort_early_startup_with_error(
+            anyhow::anyhow!("corrupt canonical model"),
+            Some(fatal_server),
+            None,
+            state.as_ref(),
+            &fatal_admission,
+            &fatal_shutdown_tx,
+            &fatal_bg_tx,
+            &fatal_rt_tx,
+            &mut fatal_runtime_tasks,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(combined_err.to_string().contains("corrupt canonical model"));
+        assert!(
+            combined_err
+                .to_string()
+                .contains("early startup cleanup failed")
+        );
+        assert!(
+            combined_err
+                .to_string()
+                .contains("1 live handlers remaining")
+        );
+        assert!(fatal_watcher_joined.load(Ordering::Acquire));
+        assert!(fatal_runtime_tasks.is_empty());
+
+        let _ = fatal_release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), fatal_exited_rx)
+            .await
+            .expect("released fatal-path handler must exit")
+            .unwrap();
+        let _ = fatal_req_task.await;
     }
 }
 

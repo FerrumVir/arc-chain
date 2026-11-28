@@ -5537,7 +5537,7 @@ mod tests {
             format!("0x{}", keypair.address().to_hex()),
             "worker-unit",
             "arc-4L-16d",
-            &spec.model_id.to_hex(),
+            spec.model_id.to_hex(),
             spec.n_layers,
             false,
         ));

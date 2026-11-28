@@ -34,6 +34,31 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Cleanly stopped desktops with launch-on-start disabled can install updates
   under a lifecycle fence. Contention retries without stopping detached nodes;
   pending recovery, failure state and manual-stop behavior stay preserved.
+- Eligible stake-zero TCP `--full-integer-worker` and `--community-shard-worker`
+  launches expose early startup liveness on `/health` (`status: "loading"`,
+  `startup_phase: "loading_model"`) after state/WAL, `--enable-community-rewards-v1`
+  activation-height, identity, and bounded pre-bind GGUF header checks while
+  failing closed with HTTP `503`, `Retry-After: 5`, and `Connection: close` on
+  `/inference/readiness`, worker status, non-`GET` methods on those routes, and
+  all other routes until full canonical GGUF BLAKE3 verification and INT8
+  loading complete, then hand off atomically on the same TCP listener without a
+  rebind gap.
+- Canonical GGUF hashing, committed shard metadata re-verification
+  (`from_committed_artifact_cancellable`), TOCTOU verification, and full INT8
+  loading support cooperative shutdown cancellation across chunk, header,
+  tensor, and layer boundaries while preserving bit-identical commitments and
+  weights, revalidating regular model files before full-worker open, and joining
+  the blocking task before supervised bounded listener stop, watcher join, WAL
+  sync, receipt acknowledgement, and data-directory lock release. Early-startup
+  cancellation fails closed without acknowledging a desktop shutdown receipt if
+  live connections or handlers remain or stop fails, while fatal startup aborts
+  retain the original error with cleanup context. Post-bind fatal RPC errors
+  broadcast shutdown, drain any ETH RPC task, owned tasks, and consensus
+  writers first, and then run the final WAL durability barrier without falsely
+  acknowledging a clean desktop shutdown receipt. Validators, non-eligible
+  modes, and `--rpc-unix` listeners retain their startup ordering.
+- Early, ordinary, and ETH TCP RPC listeners reject occupied ports on Windows
+  and preserve immediate rebinding after shutdown on Unix.
 
 ## v0.8.27 - Release-preparation snapshot (2026-11-27)
 
