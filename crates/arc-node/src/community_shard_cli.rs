@@ -2214,8 +2214,7 @@ mod tests {
             sample_integrated_launch_spec(PathBuf::from("/nonexistent/early-shard.gguf"));
         let validated = validate_launch_spec_with_parallelism(&missing_spec, 4).unwrap();
         let missing_err = prevalidate_early_shard_model_header(&missing_spec, &validated)
-            .err()
-            .expect("missing model file must fail before bind")
+            .expect_err("missing model file must fail before bind")
             .to_string();
         assert!(missing_err.contains("regular file"), "{missing_err}");
 
@@ -2223,8 +2222,7 @@ mod tests {
         std::fs::write(&empty_file.0, b"").unwrap();
         let mut spec = sample_integrated_launch_spec(empty_file.0.clone());
         let empty_err = prevalidate_early_shard_model_header(&spec, &validated)
-            .err()
-            .expect("empty model file must fail before bind")
+            .expect_err("empty model file must fail before bind")
             .to_string();
         assert!(empty_err.contains("is empty"), "{empty_err}");
 
@@ -2232,8 +2230,7 @@ mod tests {
         std::fs::write(&invalid_file.0, b"not-a-gguf-header").unwrap();
         spec.model_path = invalid_file.0.clone();
         let invalid_err = prevalidate_early_shard_model_header(&spec, &validated)
-            .err()
-            .expect("invalid GGUF must fail before bind")
+            .expect_err("invalid GGUF must fail before bind")
             .to_string();
         assert!(
             invalid_err.contains("bounded pre-bind GGUF header validation failed"),
@@ -2245,8 +2242,7 @@ mod tests {
         std::fs::write(&truncated_file.0, &valid_bytes[..28]).unwrap();
         spec.model_path = truncated_file.0.clone();
         let truncated_err = prevalidate_early_shard_model_header(&spec, &validated)
-            .err()
-            .expect("truncated GGUF header must fail before bind")
+            .expect_err("truncated GGUF header must fail before bind")
             .to_string();
         assert!(
             truncated_err.contains("bounded pre-bind GGUF header validation failed"),
@@ -2261,8 +2257,7 @@ mod tests {
         .unwrap();
         spec.model_path = one_layer_file.0.clone();
         let one_layer_err = prevalidate_early_shard_model_header(&spec, &validated)
-            .err()
-            .expect("1-layer GGUF must fail protocol geometry before bind")
+            .expect_err("1-layer GGUF must fail protocol geometry before bind")
             .to_string();
         assert!(
             one_layer_err.contains("model n_layers 1"),
@@ -2274,8 +2269,7 @@ mod tests {
         spec.model_path = valid_file.0.clone();
         spec.max_working_set_bytes = 1_024;
         let budget_err = prevalidate_early_shard_model_header(&spec, &validated)
-            .err()
-            .expect("undersized working-set budget must fail admission before bind")
+            .expect_err("undersized working-set budget must fail admission before bind")
             .to_string();
         assert!(
             budget_err.contains("cannot admit even 1 resident layer"),
@@ -2312,8 +2306,7 @@ mod tests {
             std::os::unix::fs::symlink(&dir_target.0, &dir_link.0).unwrap();
             spec.model_path = dir_link.0.clone();
             let dir_link_err = prevalidate_early_shard_model_header(&spec, &validated)
-                .err()
-                .expect("symlink to directory must fail before bind")
+                .expect_err("symlink to directory must fail before bind")
                 .to_string();
             assert!(dir_link_err.contains("regular file"), "{dir_link_err}");
 

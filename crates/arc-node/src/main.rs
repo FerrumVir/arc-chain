@@ -11048,7 +11048,7 @@ mod worker_startup_main_tests {
         validate_community_rewards_v1_state(false, None).unwrap();
         validate_community_rewards_v1_state(false, Some(1)).unwrap();
 
-        let mut state = StateDB::new();
+        let state = StateDB::new();
         assert!(
             validate_community_rewards_v1_state(
                 true,
