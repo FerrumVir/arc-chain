@@ -40,8 +40,10 @@ CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CANDIDATE_VERSION=0.8.27
 CANDIDATE_SNAPSHOT_DATE=2026-11-27
-PUBLISHED_VERSION=0.8.26
-PUBLISHED_INSTALLER_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+PUBLISHED_VERSION=0.8.27
+PUBLISHED_INSTALLER_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
+PUBLISHED_RELEASE_PROFILE=desktop-update-existing-validators-v1
+VALIDATOR_BASELINE_VERSION=0.8.26
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -112,16 +114,34 @@ candidate_version_is_consistent() {
         'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
     require_literal "$CHANGELOG" 'Tag-stable lifecycle note' \
         'changelog lifecycle statement can become false after publication' || return 1
+    [ "$PUBLISHED_VERSION" != "$VALIDATOR_BASELINE_VERSION" ] || {
+        printf 'published desktop version must remain distinct from the actual validator baseline\n'
+        return 1
+    }
+    assert_equals 'desktop-update-existing-validators-v1' "$PUBLISHED_RELEASE_PROFILE" \
+        'published release profile must be desktop-update-existing-validators-v1' || return 1
     require_literal "$README" "## v$PUBLISHED_VERSION release status and quickstart" \
         'README does not identify the current published release' || return 1
     require_literal "$README" "[v$PUBLISHED_VERSION release status and quickstart](#v${PUBLISHED_VERSION//./}-release-status-and-quickstart)" \
         'README current-status link must target the published release heading' || return 1
-    require_literal "$README" 'Multi-worker rewards remain disabled. Headless `--model` installs remain whole-model workers.' \
-        'README must distinguish desktop partial shards from whole-model headless installs and disabled partial rewards' || return 1
+    require_literal "$README" "**Published update:** v$PUBLISHED_VERSION ships under the \`$PUBLISHED_RELEASE_PROFILE\`" \
+        'README current-status summary must identify the verified published release and profile' || return 1
+    require_literal "$README" "while validators remain on v$VALIDATOR_BASELINE_VERSION" \
+        'README must state that validators remain on the actual v0.8.26 baseline' || return 1
+    require_literal "$README" 'Partial-worker readiness and submitted shard steps are not whole jobs' \
+        'README must distinguish partial-worker readiness and steps from whole jobs' || return 1
+    require_literal "$README" 'Multi-worker partial-shard rewards remain disabled' \
+        'README must state that partial-shard rewards remain disabled' || return 1
     require_literal "$REPO_ROOT/AGENTS.md" '### Whole-model compatibility path' \
         'agent guide must scope whole-model routing separately from partial sharding' || return 1
     require_literal "$REPO_ROOT/AGENTS.md" 'The integrated desktop path described above selects this runtime for eligible' \
         'agent guide must acknowledge the integrated desktop partial-worker path' || return 1
+    require_literal "$REPO_ROOT/AGENTS.md" "v$PUBLISHED_VERSION ships under \`$PUBLISHED_RELEASE_PROFILE\`, while" \
+        'agent guide must record the published desktop-update profile' || return 1
+    require_literal "$REPO_ROOT/AGENTS.md" "validators remain on v$VALIDATOR_BASELINE_VERSION." \
+        'agent guide must keep the actual validator fleet on v0.8.26' || return 1
+    require_literal "$REPO_ROOT/AGENTS.md" "validator baseline at v$VALIDATOR_BASELINE_VERSION." \
+        'agent guide doc-contract summary must name the v0.8.26 validator baseline' || return 1
     require_literal "$README" 'Source-freeze snapshot (2026-08-31; tag-stable)' \
         'README release status is not preserved as a dated source-freeze fact' || return 1
     require_literal "$README" 'pre-tag statement, not a live status probe' \
@@ -147,8 +167,12 @@ candidate_install_commands_are_exact_and_honest() {
             'candidate install guide does not verify the bootstrap on macOS' || return 1
         require_literal "$file" "--proto '=https' --proto-redir '=https' --tlsv1.2" \
             'candidate install guide permits a non-HTTPS bootstrap or redirect' || return 1
-        require_literal "$file" 'The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.' \
+        require_literal "$file" "The v$PUBLISHED_VERSION update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required." \
             'install guide must state that this update profile cannot authorize legacy migration' || return 1
+        require_literal "$file" "$PUBLISHED_RELEASE_PROFILE" \
+            'install guide omits the distinct desktop-update-existing-validators-v1 profile' || return 1
+        require_literal "$file" "validators remain on v$VALIDATOR_BASELINE_VERSION" \
+            'install guide omits that validators remain on the v0.8.26 baseline' || return 1
         require_literal "$file" 'not published' \
             'candidate install guide could be mistaken for an already-published release' || return 1
         download_line="$(grep -nF -- "$exact_url" "$file" | head -n 1 | cut -d: -f1)"
@@ -166,6 +190,40 @@ candidate_install_commands_are_exact_and_honest() {
         'headless guide omits the exact signature namespace' || return 1
     if grep -Fq '0.7.12' "$README" "$HEADLESS" "$WALKTHROUGH" "$ROLLOUT"; then
         printf 'the superseded v0.7.12 candidate remains in active v0.8.0 operator docs\n'
+        return 1
+    fi
+}
+
+headless_worker_mode_and_desktop_profile_are_truthful() {
+    local file literal
+    if grep -Fq 'Headless `--model` installs remain whole-model workers.' "$README"; then
+        printf 'Document auto mode: eligible model-backed installs now select partial shards.\n'
+        return 1
+    fi
+    for file in "$README" "$HEADLESS"; do
+        for literal in \
+            "bash install.sh --version $PUBLISHED_VERSION --no-service --no-auto-update" \
+            "bash install.sh --version $PUBLISHED_VERSION --model /absolute/path/to/model.gguf" \
+            "bash install.sh --version $PUBLISHED_VERSION --worker-mode full --model /absolute/path/to/model.gguf" \
+            "bash install.sh --version $PUBLISHED_VERSION --worker-mode shard --model /absolute/path/to/model.gguf" \
+            'defaults to `auto`' \
+            'worker-policy.conf' \
+            'community-shard-worker --check-only' \
+            'nominal 16 GB RAM floor'
+        do
+            require_literal "$file" "$literal" \
+                'Document the supported worker modes, qualification checks, and manual update path.' || return 1
+        done
+        grep -Fiq 'same-version' "$file" || {
+            printf 'Document same-version worker-policy reconciliation: %s\n' "$file"
+            return 1
+        }
+    done
+    require_literal "$WALKTHROUGH" \
+        "bash install.sh --version $PUBLISHED_VERSION --worker-mode full --model /absolute/path/to/model.gguf" \
+        'Use explicit --worker-mode full in the whole-job reward walkthrough.' || return 1
+    if grep -En 'bash install\.sh .*--model' "$WALKTHROUGH" | grep -Fvq -- '--worker-mode full'; then
+        printf 'Add --worker-mode full to every model install in the whole-job reward walkthrough.\n'
         return 1
     fi
 }
@@ -2418,8 +2476,9 @@ PY
     }
 }
 
-run_test 'workspace, desktop, and changelog agree on the release candidate; README names published v0.8.26' candidate_version_is_consistent
-run_test 'install commands pin exact published v0.8.26 and preserve historical snapshots and legacy refusal' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on the release candidate; README names published v0.8.27 and validator baseline v0.8.26' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.27 and preserve historical snapshots and legacy refusal' candidate_install_commands_are_exact_and_honest
+run_test 'headless worker-mode policy, same-version reconciliation, walkthrough full mode, and desktop update profile stay truthful' headless_worker_mode_and_desktop_profile_are_truthful
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract

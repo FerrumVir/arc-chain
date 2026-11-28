@@ -36,32 +36,33 @@ macOS or Windows-version floor.
 
 ## Linux and macOS
 
-For the published v0.8.26 release, download the installer from the
+For the published v0.8.27 release, download the installer from the
 owner-created protected source tag and pin the same version when running it.
 Keeping download and execution separate makes network errors visible and
 lets you inspect the script first.
 
 The v0.8.x release is intentionally not GitHub's global `latest` while legacy
 v0.7 updaters remain deployed. Those unsigned updaters are not a migration
-path. This release uses `existing-recovered-chain-update-v1`.
-The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+path. This release uses `desktop-update-existing-validators-v1`, while
+validators remain on v0.8.26.
+The v0.8.27 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
 An exact protected tag and verified installer do not reconstruct those inputs.
 
 Installs whose released v0.7 updater still runs unattended can instead be
 moved only by a separately qualified, owner-published legacy bridge release
-with the required cutover and retirement evidence; v0.8.26 does not supply it. It starts the pinned,
+with the required cutover and retirement evidence; v0.8.27 does not supply it. It starts the pinned,
 signature-verified v0.8 node at stake 0 in a fresh data directory and never
 writes v0.7 data. See [LEGACY-BRIDGE.md](LEGACY-BRIDGE.md).
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
-ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.27/install.sh
+ARC_INSTALL_SHA256=3ff9c530ad3585a5916d84098fd05984b0d454355a3751dba8a05df54b5b3c22
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
 The branch above uses `sha256sum` on Linux and the standard `shasum` fallback
@@ -90,43 +91,94 @@ requires every supported platform before it can publish anything.
 
 ### Common server setups
 
+Choose one setup after verifying the installer. These are alternatives.
+
+Install a Linux user service under `~/.arc`:
+
 ```bash
-# Non-root Linux: ~/.arc plus a systemd user service
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
+```
 
-# Root/sudo Linux: root-owned programs in /var/lib/arc-chain and a system
-# service whose node process/data/identity belong to the invoking sudo user.
-# A direct root login intentionally runs the node as root.
-sudo bash install.sh --version 0.8.26 --system-service
+Install a Linux system service under `/var/lib/arc-chain`. The invoking `sudo`
+user owns the node identity and data; a direct root login uses root:
 
-# Custom install root, chain data volume, RPC, and P2P ports
+```bash
+sudo bash install.sh --version 0.8.27 --system-service
+```
+
+Choose a custom installation directory, data directory, and ports:
+
+```bash
 bash install.sh \
-  --version 0.8.26 \
+  --version 0.8.27 \
   --install-dir "$HOME/.arc-custom" \
   --data-dir "$HOME/arc-chain-data" \
   --port 19090 \
   --p2p-port 19091
-
-# Install and verify only. No service, background process, health request, or
-# update schedule is created.
-bash install.sh --version 0.8.26 --no-service --no-auto-update
-
-# Load a local model and become eligible to execute compatible inference work.
-bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
 ```
 
-The default node is deliberately `--stake 0 --community-mode`, with the EVM RPC
-disabled. It can register as a community observer/router without a model. A
-node without `--model` cannot execute local model inference, and installing a
-model does not guarantee jobs or rewards; assignment and reward policy are
-network behavior, not an installer promise.
+Install files without starting a service or scheduling updates:
 
-When `--model` is present, the managed runner adds
-`--full-integer-worker`. This loads the complete deterministic integer model
-required for independent verification but does not announce the residential
-machine as a validator layer shard. Never substitute `--shard-range 0:32` for
-that flag: doing so publishes an overlapping shard that is normally
-unreachable behind NAT.
+```bash
+bash install.sh --version 0.8.27 --no-service --no-auto-update
+```
+
+Provide a verified model and let automatic mode choose the worker role:
+
+```bash
+bash install.sh --version 0.8.27 --model /absolute/path/to/model.gguf
+```
+
+Keep whole-model execution explicitly:
+
+```bash
+bash install.sh --version 0.8.27 --worker-mode full --model /absolute/path/to/model.gguf
+```
+
+Require partial-shard qualification before changing an existing service:
+
+```bash
+bash install.sh --version 0.8.27 --worker-mode shard --model /absolute/path/to/model.gguf
+```
+
+The default node without `--model` is deliberately `--stake 0 --community-mode`,
+with the EVM RPC disabled (`resolved_worker_mode=observer`). It registers as a
+community observer/router without a model and cannot execute local model
+inference; passing `--worker-mode full` or `--worker-mode shard` without
+`--model` is rejected. Installing a model does not guarantee jobs or rewards;
+assignment and reward policy are network behavior, not an installer promise.
+
+With `--model`, `--worker-mode` (`ARC_WORKER_MODE`) accepts `auto`, `shard`, or
+`full` and defaults to `auto`. The installer writes `worker-policy.conf` with
+`policy_revision`, `installer_sha256`, `configured_worker_mode`,
+`resolved_worker_mode`, and `model_path`:
+
+- **`auto` (default with `--model`)**: qualifies pinned partial-shard mode by
+  checking the nominal 16 GB RAM floor, at least 6 GiB effective available RAM
+  (crediting bounded reclaimable RSS only from a verified matching managed ARC
+  worker service that the transaction will stop), a working-set cap of
+  `min(visible_ram - 4 GiB, visible_ram / 2)`, and six-layer offline admission
+  through `arc-node community-shard-worker --check-only` against the pinned
+  canonical model commitment, Singapore coordinator identity, and recovered
+  transaction domain. Eligible hosts launch `--community-shard-worker --threads 1`.
+  Ineligible hosts keep `configured_worker_mode=auto`, fall back to
+  `resolved_worker_mode=full` (`--full-integer-worker`), and are reassessed on
+  later updates. Not all machines qualify.
+- **`full` (`--worker-mode full`)**: persists `configured_worker_mode=full`
+  across updates and passes `--full-integer-worker`. This loads the complete
+  deterministic integer model required for whole-job `/inference/run` routing
+  and `0x25` reward eligibility without announcing the residential machine as a
+  validator layer shard. Never substitute `--shard-range 0:32` for
+  `--full-integer-worker`: doing so publishes an overlapping shard that is
+  normally unreachable behind NAT.
+- **`shard` (`--worker-mode shard`)**: runs the same host-memory and offline
+  six-layer `--check-only` qualification before changing the service; failed qualification exits before stopping or
+  modifying the running node.
+
+Partial-shard worker readiness and submitted layer steps are distinct from
+completed whole-model jobs and rewards: multi-worker partial-shard rewards
+remain disabled, and this release does not claim faster per-node execution,
+complete six-range community coverage, or 100 online operators.
 
 The recovery candidate bundles the checkpoint-bound complete validator set:
 six rotated public identities and reward activation at block 137146. A
@@ -148,23 +200,29 @@ missing validator approval quorum. Absence means consensus rejects reward tx
 - An observer/router does not need a model or GPU. Size CPU, RAM, storage, and
   bandwidth from measured local usage before exposing it as a public service.
 - The current full-model worker target is Llama-2-7B Q4_K_M (about 4 GB on
-  disk). The release has not established a minimum-RAM figure; prove a complete
-  model load and inference on the target host while leaving OS/chain headroom.
-  More CPU cores can reduce latency. A GPU is optional and does not change
-  correctness or reward eligibility.
-- Pass the GGUF by absolute path. Capacity is advertised only after every model
-  layer loads, and the request/coordinator must carry the streamed BLAKE3 ID of
-  those exact artifact bytes. A matching filename or architecture shape is not
-  proof of identical weights. The coordinator independently recomputes every
-  accepted community result.
+  disk). For `--worker-mode full`, the release has not established a minimum-RAM
+  figure; prove a complete model load and inference on the target host while
+  leaving OS/chain headroom. Partial-shard worker qualification (`auto` or
+  `shard`) separately enforces a nominal 16 GB RAM floor, available-memory
+  headroom, and six-layer offline `--check-only` admission, and not every
+  machine is eligible. More CPU cores can reduce whole-model latency. A GPU is
+  optional and does not change correctness or reward eligibility.
+- Pass the GGUF by absolute path. Whole-model capacity is advertised only after
+  every model layer loads, and the request/coordinator must carry the streamed
+  BLAKE3 ID of those exact artifact bytes; partial-shard mode requires the exact
+  pinned canonical model commitment and loads only leased layers. A matching
+  filename or architecture shape is not proof of identical weights. The
+  coordinator independently recomputes every accepted community result.
 - No hardware tier guarantees work. Promotional jobs depend on coordinator
   availability and policy, exact-artifact capacity, assignment, and independent
   verification. Validator recomputation proves output agreement, not customer
   demand.
-  Payment additionally requires reward-protocol activation, validator-approval
-  collection, strict greater-than-two-thirds identity and active-stake
-  authorization, treasury funding, remaining block/epoch/worker/coordinator
-  promotional budget, and a successful mined `0x25` receipt.
+  Payment applies only to whole-model `0x25` jobs (multi-worker partial-shard
+  rewards remain disabled) and additionally requires reward-protocol activation,
+  validator-approval collection, strict greater-than-two-thirds identity and
+  active-stake authorization, treasury funding, remaining
+  block/epoch/worker/coordinator promotional budget, and a successful mined
+  `0x25` receipt.
 
 #### Download and verify the exact worker model
 
@@ -186,9 +244,15 @@ printf '%s  %s\n' \
   08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
   "$HOME/.arc-models/llama2-7b.gguf" | sha256sum -c -
 
-bash install.sh --version 0.8.26 \
+bash install.sh --version 0.8.27 \
   --model "$HOME/.arc-models/llama2-7b.gguf"
 ```
+
+The command above uses the default `--worker-mode auto`, which selects partial
+shards when the host qualifies or falls back to whole-model mode otherwise. Add
+`--worker-mode full` when configuring a dedicated whole-job worker for `0x25`
+reward eligibility, or `--worker-mode shard` when failed shard admission must
+abort before stopping an existing service.
 
 On macOS, replace the `sha256sum -c -` pipeline with:
 
@@ -319,7 +383,7 @@ fresh data directory it writes `genesis.network-hash`. Startup fails closed if
 an existing WAL has no marker or if the stored hash differs from the selected
 genesis. A reachable HTTP process is not permission to bypass that check.
 
-Do not point v0.8.26 at a v0.7.11-or-earlier data directory. For a stake-zero
+Do not point v0.8.27 at a v0.7.11-or-earlier data directory. For a stake-zero
 observer, stop the old service, back up its identity and data for forensics, and
 install with a fresh data directory (for example a new `--data-dir` path). Do
 not copy the old WAL into it. A validator may move state only through the
@@ -436,14 +500,14 @@ needed to diagnose a failed recovery.
 
 | Symptom | Safe check and action |
 |---|---|
-| `sudo authorization failed` | Install as the login user with `bash install.sh --version 0.8.26 --user-service`, or deliberately use `sudo bash install.sh --version 0.8.26 --system-service`. Do not mix the two scopes. |
+| `sudo authorization failed` | Install as the login user with `bash install.sh --version 0.8.27 --user-service`, or deliberately use `sudo bash install.sh --version 0.8.27 --system-service`. Do not mix the two scopes. |
 | `No systemd user manager is reachable` over SSH | Use the explicit system service command above, or install with `--no-service` and run the printed command under your own supervisor. `sudo loginctl enable-linger "$USER"` is an optional administrator decision for a user service that must start before login. |
 | Model file is unreadable | As the account that will run the node, use `test -r /absolute/path/to/model.gguf`. Move the model to a directory that account can traverse or correct only the specific file/directory ownership; do not make the model or identity world-writable. |
 | Port is already in use | On Linux inspect `ss -ltnp` for RPC and `ss -lunp` for P2P, then choose unused explicit values with `--port` and `--p2p-port`. Do not kill an unidentified process. |
 | Service starts but health is `degraded` | Read the matching user/system journal above, confirm peers and the selected genesis/checkpoint, and run `bash scripts/arc-diagnose.sh` from a reviewed checkout. `degraded` is not fixed by exposing RPC publicly or reusing an old WAL. |
-| Update says no existing installation | Run the updater from the same install scope and exact install directory recorded in `install.conf`. A `--no-auto-update` install intentionally has no retained updater. |
+| Update says no existing installation | Run the updater from the same install scope and exact install directory recorded in `install.conf`. Installs created with `--no-service` or `--no-auto-update` intentionally have no retained `arc-installer`; download, verify, and rerun `install.sh` manually. |
 | Legacy adoption rejects a service or PID | Do not rename or weaken files to bypass the check. Confirm that the service is the unmodified v0.7 default, that both `arc-updater` units are present or absent together, that `node.pid` still names the live ARC process, and that `~/.arc` plus its ancestors are not symlinks or group/world writable. Stop and preserve an unrecognized custom layout for manual review. |
-| Installer reports an incomplete release or checksum/signature failure | Stop. Confirm the exact v0.8.26 release contains every required platform asset and signed manifest. Never fall back to a desktop package, a moving URL, or an unsigned older binary. |
+| Installer reports an incomplete release or checksum/signature failure | Stop. Confirm the exact v0.8.27 release contains every required platform asset and signed manifest. Never fall back to a desktop package, a moving URL, or an unsigned older binary. |
 
 For a support report, share the operating system/architecture, release version,
 service scope, redacted journal error, local `/health` response, and the output
@@ -459,7 +523,7 @@ non-prerelease release, requires its complete bundle for the installed platform,
 refuses a version lower than the installed binary, verifies downloads, replaces
 files atomically, restarts the same service scope, and checks the saved custom
 RPC port. Before the first replacement it snapshots every managed binary, network
-file, runner, install config, identity file, service definition, and the active
+file, runner, install config, `worker-policy.conf`, identity file, service definition, and the active
 and enabled service/timer state. A copy, service-manager, or health failure
 restores that complete snapshot (or removes a newly introduced managed file)
 and returns the service and updater timer to their prior state. Existing model
@@ -470,31 +534,47 @@ WAL lacks the network marker or has the wrong genesis hash. Rollback is not
 state migration, so the operator must still select a fresh stake-zero data
 directory or an approved validator checkpoint migration before retrying.
 
-Run the same updater manually:
+For an install that kept the scheduled updater, choose the command matching
+its service scope.
+
+Linux user service, macOS LaunchAgent, or unprivileged adopted `system-user` bridge:
 
 ```bash
-# User systemd / macOS install
 "$HOME/.arc/bin/arc-installer" --update-only --install-dir "$HOME/.arc"
+```
 
-# Adopted v0.7 Linux system-user bridge (runs unprivileged; no sudo)
-"$HOME/.arc/bin/arc-installer" --update-only --install-dir "$HOME/.arc"
+Linux system service:
 
-# Linux system install
+```bash
 sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/arc-chain --system-service
 ```
 
-Those commands intentionally do not pin v0.8.26: update mode resolves the
-newest complete release and then refuses equality or downgrade. They are
-available only when the original install kept auto-update enabled; an install
-made with `--no-auto-update` does not install `arc-installer`.
+Those commands intentionally do not pin v0.8.27: update mode resolves the
+newest complete release and refuses any downgrade. When the resolved release
+matches the installed version, `--update-only` checks `worker-policy.conf`: if
+the policy revision, running installer SHA-256, configured mode, model path, and
+`run-arc-node` launcher already match—and any `auto` whole-model fallback still
+does not qualify for partial shards—it exits as a no-op (`Already up to date`).
+When `worker-policy.conf` is missing or stale, or when an `auto` whole-model
+fallback now passes host-memory and offline `--check-only` qualification,
+same-version `--update-only` verifies the signed release manifest and reconciles
+the launcher policy in place (promoting `auto` from `full` to `shard` when
+eligible). On an older installation whose scheduled `arc-installer` predates
+`worker-policy.conf`, the first scheduled update upgrades `arc-node` and
+replaces `arc-installer` with the signed new installer, and the next scheduled
+cycle (or manual `--update-only` run) reconciles the worker policy. `arc-installer`
+is available only when the install kept both a managed service and auto-update
+enabled; an install made with `--no-service` or `--no-auto-update` does not
+install `arc-installer` and must be updated or reconciled by manually rerunning
+a freshly downloaded and SHA-256-verified `install.sh`.
 
 Pinning is deterministic and never means “nearest available version”:
 
 ```bash
-bash install.sh --version 0.8.26
+bash install.sh --version 0.8.27
 ```
 
-If `v0.8.26` lacks any required asset or checksum, installation fails with the
+If `v0.8.27` lacks any required asset or checksum, installation fails with the
 missing filename. If a newer version is already installed, the command refuses
 to downgrade it.
 
@@ -507,7 +587,7 @@ the same release and the allowed-signers file from the protected source tag:
 - `arc-cli-windows-x86_64.exe`
 - `SHA256SUMS`
 - `SHA256SUMS.sig`
-- `release/arc-release-allowed-signers` from tag `v0.8.26`
+- `release/arc-release-allowed-signers` from tag `v0.8.27`
 
 Windows OpenSSH 8.1 or newer is required; `ssh -V` prints the installed
 version. First use that client to authenticate the exact manifest, then compare

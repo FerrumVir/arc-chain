@@ -523,22 +523,30 @@ request-success evidence.
 
 ## Releases and versions
 
-The candidate headless installer defaults `--worker-mode` to `auto`. With a
-model it qualifies the pinned community partial-shard mode through the node's
-offline `community-shard-worker --check-only` command. The qualification requires
-the desktop's nominal 16 GB floor, six admitted layers and a bounded working-set
-budget. Memory credit comes only from a matching managed worker that the
-transaction will stop. Explicit `full` persists; `shard` refuses failed
-qualification before stopping the old service; no model remains observer-only.
-The separate `worker-policy.conf` records configured and resolved modes, model,
-policy revision and the running installer's digest. Same-version updates
-reconcile missing or stale policy and reassess automatic whole-model fallbacks.
-The policy participates in service rollback. Root-owned staging streams bytes
-to the target user for user-owned installs, while that user's transaction
-snapshots stay in a separate private directory; the release staging directory
-remains private to the installer. Signed release verification,
-legacy migration fences and data preservation remain required. Installer
-regressions run in the remote release-contract gate for this candidate.
+Both the checked-in candidate version and the published release version are
+0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while
+validators remain on v0.8.26. The headless installer defaults `--worker-mode`
+to `auto`. With a model it qualifies the pinned community partial-shard mode
+through the node's offline `community-shard-worker --check-only` command. The
+qualification requires the desktop's nominal 16 GB floor, available-memory
+headroom, six admitted layers and a bounded working-set budget. Memory credit
+comes only from a matching managed worker that the transaction will stop.
+Ineligible `auto` hosts fall back to whole-model mode and reassess on later
+updates; explicit `full` persists; `shard` refuses failed qualification before
+stopping the old service; no model remains observer-only. The separate
+`worker-policy.conf` records configured and resolved modes, model, policy
+revision and the running installer's digest. Same-version `--update-only`
+reconciles missing or stale policy and can promote automatic whole-model
+fallbacks to `shard`, while unchanged policy is a no-op and downgrades remain
+refused. Older scheduled installers replace `arc-installer` with the signed new
+installer first and reconcile policy on the next scheduled cycle; `--no-service`
+and `--no-auto-update` installs have no `arc-installer` and must rerun a
+verified `install.sh` manually. The policy participates in service rollback.
+Root-owned staging streams bytes to the target user for user-owned installs,
+while that user's transaction snapshots stay in a separate private directory;
+the release staging directory remains private to the installer. Signed release
+verification, legacy migration fences and data preservation remain required.
+Installer regressions run in the remote release-contract gate for this release.
 
 The macOS bundle sealer reads the release version from the repository Tauri
 configuration and rejects mismatched app identity or version before modifying
@@ -554,14 +562,19 @@ packages. Archive and DMG verification use the same captured version.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published version at 0.8.26, the candidate at 0.8.27,
-  and the exact published installer digest. Active install links change only
-  after immutable publication is verified; historical version observations
-  remain dated. The contract checks the current-status heading link, separates
-  desktop partial shards from whole-model headless installs, and keeps partial
-  rewards disabled. Each active install guide must state that this update profile
-  refuses legacy v0.7 migration; a separately qualified cutover release with
-  authentic cutover and retirement evidence is required.
+- The doc contract test pins both the published version and the candidate at
+  0.8.27, pins the exact published installer digest, requires the
+  `desktop-update-existing-validators-v1` release profile, and keeps the actual
+  validator baseline at v0.8.26. Active install links change only after
+  immutable publication is verified; historical version observations remain
+  dated. The contract checks the current-status heading link, enforces headless
+  `--worker-mode` (`auto`, `full`, `shard`), same-version `worker-policy.conf`
+  reconciliation, and explicit `--worker-mode full` in the whole-job reward
+  walkthrough, fails if current docs claim `--model` is always whole-model, and
+  keeps partial-shard rewards disabled. Each active install guide must state
+  that this update profile refuses legacy v0.7 migration; a separately
+  qualified cutover release with authentic cutover and retirement evidence is
+  required.
 - JavaScript audit gates use `scripts/release/npm-audit-gate.py` and the
   dated `npm-audit-exceptions.json` policy; see the dependency audit policy in
   `scripts/release/EXISTING-CHAIN-UPDATE.md`. Every root advisory must match
