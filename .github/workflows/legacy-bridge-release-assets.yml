@@ -22,7 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.13' }}
+  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.27' }}
 
 jobs:
   pins:

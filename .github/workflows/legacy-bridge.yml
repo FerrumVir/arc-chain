@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt -p arc-legacy-bridge -- --check
       - name: clippy (deny warnings)
         run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
-      - name: Unit tests (real v0.8.13 signed manifest, local HTTP server)
+      - name: Unit tests (real v0.8.27 signed manifest, local HTTP server)
         run: cargo test -p arc-legacy-bridge --locked
 
   scripts:
@@ -117,7 +117,12 @@ jobs:
           retention-days: 14
 
   headless-linux:
-    name: v0.7.11 headless install consumes the bridge (systemd, real updater)
+    name: headless ${{ matrix.scenario }} consumes the bridge (systemd, real updater)
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario: [fresh, previous-bridge]
     needs: build-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -130,6 +135,8 @@ jobs:
           name: bridge-linux-x86_64
           path: dist
       - name: Run the acceptance
+        env:
+          ARC_BRIDGE_ACCEPTANCE_SCENARIO: ${{ matrix.scenario }}
         run: |
           chmod 0755 dist/arc-node-linux-x86_64
           bash tests/legacy-bridge/headless-v07-acceptance.sh dist/arc-node-linux-x86_64 evidence/headless
@@ -137,7 +144,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: evidence-headless-linux
+          name: evidence-headless-linux-${{ matrix.scenario }}
           path: evidence/
           if-no-files-found: warn
           retention-days: 30
@@ -198,7 +205,7 @@ jobs:
           mkdir -p "$out"
           pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er '.plugins.updater.pubkey')"
           curl -fsSL --retry 3 -o "$out/latest.json" \
-            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.13/latest.json
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.27/latest.json
           python3 - "$out/latest.json" <<'PY'
           import json, sys
           manifest = json.load(open(sys.argv[1], encoding="utf-8"))

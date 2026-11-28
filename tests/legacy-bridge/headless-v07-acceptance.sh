@@ -19,6 +19,13 @@ bridge_tag="v$bridge_version"
 node_version="$(jq -er '.node_release.version' "$pins")"
 node_sha256="$(jq -er --arg a "$asset" '.node_release.assets[$a].sha256' "$pins")"
 privacy_safe="$(jq -er '.node_release.worker_names_privacy_safe | if type == "boolean" then tostring else error("privacy flag must be boolean") end' "$pins")"
+scenario="${ARC_BRIDGE_ACCEPTANCE_SCENARIO:-fresh}"
+case "$scenario" in
+    fresh|previous-bridge) ;;
+    *) printf 'Unknown bridge acceptance scenario: %s\n' "$scenario" >&2; exit 1 ;;
+esac
+updater_from_version=0.7.7
+previous_executable_sha256="$legacy_node_sha256"
 
 export USER="${USER:-$(id -un)}"
 arc_dir="$HOME/.arc"
@@ -154,13 +161,55 @@ cp /etc/systemd/system/arc-node.service "$evidence/arc-node.service"
 seed="$(cat "$arc_dir/identity.seed")"
 [ -n "$seed" ] || fail "the v0.7 installer created no identity seed"
 
+if [ "$scenario" = previous-bridge ]; then
+    log "Run the immutable previous bridge before qualifying an existing-install update"
+    prior_tag=v0.7.14
+    prior_bridge_sha256=813cc6545dc3dfcc47fd697c8bcc5acfd21e99339f45e8547c31c735a752f29c
+    prior_node_sha256=d4b19c031cf5423a8ca5ce6ddf2f3f3819b08b00032b33d00e94bf7937523f99
+    mkdir -p "$state/releases/$prior_tag"
+    /usr/bin/curl -fsSL --retry 3 -o "$state/releases/$prior_tag/$asset" \
+        "https://github.com/FerrumVir/arc-chain/releases/download/$prior_tag/$asset"
+    [ "$(sha "$state/releases/$prior_tag/$asset")" = "$prior_bridge_sha256" ] \
+        || fail "the previous bridge differs from the immutable v0.7.14 launcher"
+    chmod 0755 "$state/releases/$prior_tag/$asset"
+    publish_latest "$prior_tag"
+    sudo systemctl start arc-updater.service
+    wait_health http://127.0.0.1:9944 60 || fail "the previous bridge did not start"
+    [ "$(cat "$arc_dir/version.txt")" = 0.7.14 ] || fail "the previous bridge update rolled back"
+    prior_exe="$(readlink "/proc/$(main_pid)/exe")"
+    [ "$prior_exe" = "$arc_dir/legacy-bridge/releases/v0.8.13/$asset" ] \
+        || fail "the fixture did not start the previous pinned node"
+    [ "$(sha "$prior_exe")" = "$prior_node_sha256" ] || fail "the previous pinned node differs"
+    mapfile -t prior_states < <(find "$arc_dir/legacy-bridge/nodes" -maxdepth 2 -name bridge-state.json -type f)
+    [ "${#prior_states[@]}" = 1 ] || fail "the previous bridge must create exactly one context"
+    prior_state="${prior_states[0]}"
+    prior_data="$(jq -er .node_data_dir "$prior_state")"
+    prior_keyfile="$(jq -er .node_keyfile "$prior_state")"
+    prior_address="$(jq -er .node_address "$prior_state")"
+    case "$prior_data" in
+        "$arc_dir"/legacy-bridge/nodes/headless-*/data) ;;
+        *) fail "the previous bridge used an unexpected data directory" ;;
+    esac
+    sudo systemctl stop arc-node
+    "$arc_dir/bin/arc-node" --legacy-bridge-compute off > "$evidence/prior-compute-off.txt"
+    prior_key_sha256="$(sha "$prior_keyfile")"
+    prior_genesis_sha256="$(sha "$prior_data/genesis.network-hash")"
+    [ -s "$prior_data/state.wal" ] || fail "the previous node has no persistent WAL to preserve"
+    [ "$(stat -c %s "$prior_data/state.wal")" -le 8388608 ] || fail "the isolated fixture WAL exceeds 8 MiB"
+    cp "$prior_data/state.wal" "$evidence/prior-bridge-state.wal"
+    printf 'preserve-existing-bridge-data\n' > "$prior_data/bridge-upgrade-preservation.txt"
+    cp "$prior_state" "$evidence/prior-bridge-state.json"
+    updater_from_version=0.7.14
+    previous_executable_sha256="$prior_bridge_sha256"
+fi
+
 log "Publish the bridge as Latest and run the real v0.7 updater"
 publish_latest "$bridge_tag"
 started=$(date +%s)
 sudo systemctl start arc-updater.service
 printf 'updater finished after %ss\n' "$(( $(date +%s) - started ))"
 cp "$arc_dir/auto-update.log" "$evidence/auto-update.after-bridge.log"
-grep -qF "new version available: 0.7.7 → $bridge_version" "$arc_dir/auto-update.log" \
+grep -qF "new version available: $updater_from_version → $bridge_version" "$arc_dir/auto-update.log" \
     || fail "the v0.7 updater did not see the bridge release"
 grep -qF "binary updated to v$bridge_version" "$arc_dir/auto-update.log" || fail "the v0.7 updater did not install the bridge"
 if grep -q 'ROLLED BACK' "$arc_dir/auto-update.log"; then
@@ -169,7 +218,7 @@ fi
 grep -q 'auto-update complete' "$arc_dir/auto-update.log"
 [ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ]
 [ "$(sha "$arc_dir/bin/arc-node")" = "$bridge_sha" ] || fail "bin/arc-node is not the bridge launcher"
-[ "$(sha "$arc_dir/bin/arc-node.prev")" = "$legacy_node_sha256" ] || fail "arc-node.prev is not v0.7.7"
+[ "$(sha "$arc_dir/bin/arc-node.prev")" = "$previous_executable_sha256" ] || fail "arc-node.prev does not preserve the previous executable"
 
 log "The running node is the pinned v0.8 binary, stake 0, fresh state"
 wait_health http://127.0.0.1:9944 60 || fail "the bridged node does not answer /health"
@@ -224,6 +273,27 @@ jq -e --slurpfile info "$evidence/node-info.json" '.node_address == ($info[0].va
     "$state_json" >/dev/null || fail "bridge-state address differs from /node/info"
 grep -q 'Your ARC node is upgrading to the new network' "$arc_dir/node.log"
 
+if [ "$scenario" = previous-bridge ]; then
+    log "The update preserves the existing bridge identity, state and compute choice"
+    [ "$node_data" = "$prior_data" ] || fail "the update replaced the existing bridge data directory"
+    [ "$state_json" = "$prior_state" ] || fail "the update replaced the existing bridge context"
+    [ "$(jq -er .node_address "$state_json")" = "$prior_address" ] || fail "the update changed the bridge identity"
+    [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "the update rewrote the existing private key"
+    [ "$(sha "$node_data/genesis.network-hash")" = "$prior_genesis_sha256" ] || fail "the update changed the persisted genesis binding"
+    [ "$(cat "$node_dir/compute-consent")" = no ] || fail "the update discarded the saved compute opt-out"
+    [ "$(cat "$node_data/bridge-upgrade-preservation.txt")" = preserve-existing-bridge-data ] || fail "the update discarded existing data"
+    python3 - "$evidence/prior-bridge-state.wal" "$node_data/state.wal" <<'PY'
+import sys
+from pathlib import Path
+before = Path(sys.argv[1]).read_bytes()
+with Path(sys.argv[2]).open("rb") as stream:
+    after = stream.read(len(before))
+if not before or before != after:
+    raise SystemExit("Existing bridge update discarded or rewrote the persisted WAL prefix")
+PY
+    cp "$state_json" "$evidence/updated-bridge-state.json"
+fi
+
 log "The v0.7 data is byte-identical to the moment systemd stopped v0.7"
 pre_bridge=""
 for snapshot in "$snapshots"/start-*.json; do
@@ -275,7 +345,11 @@ compute_status=$?
 validator_status=$?
 set -e
 [ "$compute_status" = 78 ] || fail "an unverified model was accepted (exit $compute_status)"
-[ ! -e "$node_dir/compute-consent" ] || fail "consent was recorded for an unverified model"
+if [ "$scenario" = previous-bridge ]; then
+    [ "$(cat "$node_dir/compute-consent")" = no ] || fail "an unverified model replaced the saved compute opt-out"
+else
+    [ ! -e "$node_dir/compute-consent" ] || fail "consent was recorded for an unverified model"
+fi
 [ "$validator_status" = 78 ] || fail "an explicit validator stake was not refused (exit $validator_status)"
 "$arc_dir/bin/arc-node" --legacy-bridge-compute off > "$evidence/compute-off.txt"
 [ "$(cat "$node_dir/compute-consent")" = no ]

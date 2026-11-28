@@ -1,62 +1,62 @@
 {
   "schema": "arc.legacy-bridge.pins.v1",
-  "bridge_version": "0.7.14",
+  "bridge_version": "0.7.15",
   "repository": "FerrumVir/arc-chain",
   "node_release": {
-    "tag": "v0.8.13",
-    "version": "0.8.13",
-    "commit": "aec8c9f36fef387dc073bcafbce40281b3108e51",
+    "tag": "v0.8.27",
+    "version": "0.8.27",
+    "commit": "cd6b059dc9ab606e32c42f9ba78169dffcdd809f",
     "manifest": {
       "name": "SHA256SUMS",
-      "sha256": "e54a643b31c22119e8ca328d58aec2f69b99ff87a62304e8ae73dff5a6b08264",
-      "size": 2737
+      "sha256": "04c45b2a2993d36abd40d7e974eb3afc160ba8543d5a9f63b943c1ea8f9cb467",
+      "size": 2730
     },
     "manifest_signature": {
       "name": "SHA256SUMS.sig",
-      "sha256": "35120491d2d1e3a978b55f83dfdb505937004017387d0da28f83a6f5a9cade73",
+      "sha256": "32e1e41c3d8b0fbbb871698d2917a322f57d7b2df23ca712b2d004ad0d2cf8a2",
       "size": 322
     },
     "worker_names_privacy_safe": true,
     "assets": {
       "arc-cli-linux-arm64": {
-        "sha256": "b12728495ebfd24d7da6edbe1ff24de9ff4950908de43dca493636f2546dad75",
+        "sha256": "61afe7dc95ad88c49d6d7919cebb3d4631b5f20eac8b6d357db70c44a020f636",
         "size": 3706968
       },
       "arc-cli-linux-x86_64": {
-        "sha256": "55dd2efc7f2e252a96b35d93b8c74efedd18959e6e168320d30c0270e10a06d5",
-        "size": 4624864
+        "sha256": "3ba0feb3066d93903b7aea09c471e0bfe6962f21f66df70fd6fbfb855b1703e0",
+        "size": 4624792
       },
       "arc-cli-macos-arm64": {
-        "sha256": "3dbfe6f743760ad81d29489ceeb0e39cfad7fd6979e35dc3b4fb0dda0e856310",
+        "sha256": "faa72244274fc422ff9836473ef45d11518e8e3e306f48eed1a6660fd614d4cf",
         "size": 3391152
       },
       "arc-cli-macos-x86_64": {
-        "sha256": "e9b109944666b93e6a24d5ed247f39a047784d9144273b3888b8f1017e7fb5cf",
+        "sha256": "587e30668027ea20e460f19eff5ec06821f28016229e0e4695defbb5bf48f577",
         "size": 4177040
       },
       "arc-cli-windows-x86_64.exe": {
-        "sha256": "5f89e92f24397d43365c0013a29f6aa9b5388a2bd78c151b71b7ceb981891df4",
-        "size": 4009984
+        "sha256": "48aea5cad77d66faaacc9abd49b6f621d07b024293028177d46088482ed6c826",
+        "size": 3998208
       },
       "arc-node-linux-arm64": {
-        "sha256": "c808c7df5643a6dec72eb63366d980867529a6c5fc40c8a889f84d06d937b3aa",
-        "size": 25169768
+        "sha256": "fae78c5319f522c9390aae920cb33510b33c3780825d8985868dc90e90282556",
+        "size": 26547080
       },
       "arc-node-linux-x86_64": {
-        "sha256": "d4b19c031cf5423a8ca5ce6ddf2f3f3819b08b00032b33d00e94bf7937523f99",
-        "size": 29381016
+        "sha256": "8a270ec667c3a399a8f5214eda308452917c06f11a666f596fb618ed62a611b9",
+        "size": 31148568
       },
       "arc-node-macos-arm64": {
-        "sha256": "9e1c180dd6cb28deee42e1c98ebac320cb7db0e35d4ac5bed715265d70c34933",
-        "size": 21861168
+        "sha256": "561f1ff28deb398db5b1ed8c89836392f672cf314c07b9d5b23b38b817605907",
+        "size": 23201760
       },
       "arc-node-macos-x86_64": {
-        "sha256": "2b2af9f1a698c819096047de5c61a4623b1fdd18522bc9e0e5151f01654fd24e",
-        "size": 26231756
+        "sha256": "62ce095fedacd68f27e9469e0a6c8e6055ecc157672a82e7d74e6004d7377fdf",
+        "size": 27897844
       },
       "arc-node-windows-x86_64.exe": {
-        "sha256": "615ae5675f1c92ed50ce5b4dfbd9fac5f7a44157735500891c3b6020addbaada",
-        "size": 26925568
+        "sha256": "216501d2ac9da3591ae3a5dc2e62ada355a3380cdabe62f9c0db259df0824e81",
+        "size": 28511744
       },
       "genesis.toml": {
         "sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",

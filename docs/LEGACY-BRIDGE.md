@@ -1,6 +1,43 @@
 # Legacy v0.7 bridge
 
-Roughly 130 ARC installs still run v0.7.x. They update only from GitHub's
+## Current candidate: v0.7.15
+
+The checked-in bridge candidate pins the owner-signed v0.8.27 node release
+and qualifies the v0.8.27 desktop manifest. The published global Latest is
+still v0.7.14, whose launcher pins v0.8.13. Candidate source is not evidence
+of publication or adoption. No historical installation estimate establishes
+how many independent operator machines are currently online.
+
+This update reaches a legacy headless installation when its existing daily
+updater next runs. It preserves an existing bridge's identity, data and saved
+compute choice. A consenting headless bridge continues whole-model inference;
+this repin does not add partial-shard selection to the launcher. A v0.7
+desktop reaches the new app through its existing local Settings update check.
+The v0.8.27 desktop can then use its automatic update and recovery paths and
+select partial inference where its saved compute choice and capacity permit.
+
+Before publishing, require the legacy workflow's Linux and Windows unit and
+desktop acceptance jobs, both headless scenarios, and the signed-asset
+handoff with `desktop_tag=v0.8.27`. The `previous-bridge` headless scenario
+first runs the immutable v0.7.14 launcher and its real v0.8.13 node, then uses
+the unmodified daily updater to consume the candidate. It verifies retention
+of the private-key bytes, public identity, context and data paths, saved
+compute opt-out, genesis binding and persisted WAL prefix. These isolated CI
+machines are not operators and cannot count toward deployed shard coverage.
+
+Publish v0.7.15 non-Latest first, verify its exact handoff digests, and qualify
+the canary before promoting that bridge to Latest. Never mark v0.8.27 Latest
+or treat its update attestation as authorization to migrate old chain state
+through `install.sh`. The bridge uses its existing separate preserved-data
+path; it does not supply missing cutover or validator-retirement evidence.
+
+The remaining sections document the published v0.7.14 rollout and its older
+pins. Their release commands are historical, not instructions to republish
+an immutable release or evidence that the new candidate has qualified.
+
+## Published v0.7.14 design and historical rollout
+
+Legacy ARC v0.7.x installs update only from GitHub's
 global "Latest" release, and v0.8 releases are deliberately never "Latest".
 Until the first bridge release, "Latest" was the desktop-only v0.7.11, so these
 installs were stranded: the headless ones failed their daily update with a 404,

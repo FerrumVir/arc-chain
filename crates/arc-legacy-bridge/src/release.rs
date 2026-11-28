@@ -213,8 +213,8 @@ mod tests {
     use crate::layout::test_support::TempDir;
     use std::collections::BTreeMap;
 
-    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS");
-    const SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS.sig");
+    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS");
+    const SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS.sig");
 
     fn stand_in_pins(platform: Platform) -> (Pins, BTreeMap<String, Vec<u8>>) {
         let mut pins = Pins::embedded().unwrap();

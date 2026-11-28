@@ -319,13 +319,13 @@ mod tests {
     use super::*;
     use crate::manifest;
 
-    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS");
-    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS.sig");
+    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS");
+    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.27/SHA256SUMS.sig");
 
     #[test]
     fn embedded_pins_parse_and_validate() {
         let pins = Pins::embedded().unwrap();
-        assert_eq!(pins.node_release.tag, "v0.8.13");
+        assert_eq!(pins.node_release.tag, "v0.8.27");
         assert!(pins.node_release.worker_names_privacy_safe);
         assert_eq!(pins.community_rpc_origins.len(), 6);
     }
@@ -371,12 +371,12 @@ mod tests {
 
     #[test]
     fn pins_reject_tampering() {
-        let text = EMBEDDED_PINS.replace("\"v0.8.13\"", "\"v0.8.9\"");
+        let text = EMBEDDED_PINS.replace("\"v0.8.27\"", "\"v0.8.9\"");
         assert!(
             Pins::parse(&text).is_err(),
             "tag/version mismatch must fail"
         );
-        let text = EMBEDDED_PINS.replace("\"0.7.14\"", "\"0.7.x\"");
+        let text = EMBEDDED_PINS.replace("\"0.7.15\"", "\"0.7.x\"");
         assert!(
             Pins::parse(&text).is_err(),
             "non-strict bridge version must fail"

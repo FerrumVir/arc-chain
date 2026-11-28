@@ -523,6 +523,17 @@ request-success evidence.
 
 ## Releases and versions
 
+The separate legacy bridge candidate is v0.7.15 and pins the signed v0.8.27
+node release. GitHub's published global Latest remains v0.7.14 until the
+candidate's legacy acceptance and handoff qualify and its publication is
+verified. Modern v0.8 releases must remain non-Latest. The headless acceptance
+runs both a fresh v0.7 install and an existing immutable v0.7.14 bridge; the
+latter checks that the v0.8.13-to-v0.8.27 update preserves the bridge identity,
+data directory, WAL prefix, genesis binding and saved compute opt-out. Legacy
+headless updaters pull on their existing schedule; v0.7 desktop app updates
+still require their local update check. Neither path supplies remote control
+or proves a count of active operators. Bridge compute choices are unchanged.
+
 Both the checked-in candidate version and the published release version are
 0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while
 validators remain on v0.8.26. The headless installer defaults `--worker-mode`
