@@ -460,7 +460,7 @@ fi
 if [ "$INSTALL_SERVICE" = false ]; then
     SERVICE_SCOPE=none
     if [ "$INSTALL_UPDATER" = true ]; then
-        warn "--no-service also disables scheduled auto-update; use the installed arc-installer manually."
+        warn "--no-service also disables scheduled auto-update; rerun this installer manually to update."
         INSTALL_UPDATER=false
     fi
 fi

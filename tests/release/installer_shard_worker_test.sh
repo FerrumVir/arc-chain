@@ -342,8 +342,9 @@ three_cycle_updater_reconciles_legacy_whole_worker_and_stamps_running_installer(
     old_installer="$sandbox/pre-shard-v26-installer.sh"
     {
         printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
-        printf 'cp %q %q\n' "$INSTALLER" "$sandbox/arc/bin/arc-installer"
-        printf 'chmod 700 %q\n' "$sandbox/arc/bin/arc-installer"
+        printf 'cp %q %q\n' "$INSTALLER" "$sandbox/arc/bin/arc-installer.next"
+        printf 'chmod 700 %q\n' "$sandbox/arc/bin/arc-installer.next"
+        printf 'mv %q %q\n' "$sandbox/arc/bin/arc-installer.next" "$sandbox/arc/bin/arc-installer"
         printf 'sed -i.bak '\''s/0\.8\.0/0.8.23/g'\'' %q %q %q\n' \
             "$sandbox/arc/bin/arc-node" "$sandbox/arc/bin/arc-cli" "$sandbox/arc/install.conf"
         printf 'rm -f %q.bak %q.bak %q.bak\n' \
@@ -392,7 +393,7 @@ three_cycle_updater_reconciles_legacy_whole_worker_and_stamps_running_installer(
         }
     assert_file_contains "$output" 'Reconciling headless worker launcher policy at v0\.8\.23' \
         'cycle 2 did not log same-version worker policy reconciliation' || return 1
-    assert_file_contains "$sandbox/preflight.log" 'community-shard-worker .*--max-working-set-bytes 7462505472 --max-resident-layers 6 --threads 1 --check-only' \
+    assert_file_contains "$sandbox/preflight.log" 'community-shard-worker .*--max-working-set-bytes 7462505984 --max-resident-layers 6 --threads 1 --check-only' \
         'cycle 2 did not run check-only preflight with min(visible-4GiB, visible/2) budget on 13.9GiB host' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--community-shard-worker' \
         'cycle 2 did not switch runner to --community-shard-worker' || return 1
@@ -492,7 +493,11 @@ observer_and_explicit_full_modes_persist_across_updates() {
     ARC_NODE_VERSION_UNDER_TEST=0.8.0
     invoke_shard_installer "$sandbox" Linux x86_64 \
         "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
-        --no-service >"$sandbox/observer-080.out" 2>&1 || return 1
+        --no-service >"$sandbox/observer-080.out" 2>&1 || {
+            cat "$sandbox/observer-080.out"
+            reset_shard_test_env
+            return 1
+        }
     assert_file_contains "$sandbox/arc/worker-policy.conf" '^resolved_worker_mode=observer$' \
         'observer install did not persist resolved_worker_mode=observer' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--community-shard-worker|--full-integer-worker|--model' \
@@ -500,7 +505,11 @@ observer_and_explicit_full_modes_persist_across_updates() {
     ARC_NODE_VERSION_UNDER_TEST=0.8.23
     invoke_shard_installer "$sandbox" Linux x86_64 \
         "$TEST_DIR/fixtures/release-v0.8.23.json" 0.8.23 \
-        --no-service >"$sandbox/observer-0823.out" 2>&1 || return 1
+        --no-service >"$sandbox/observer-0823.out" 2>&1 || {
+            cat "$sandbox/observer-0823.out"
+            reset_shard_test_env
+            return 1
+        }
     assert_file_contains "$sandbox/arc/worker-policy.conf" '^resolved_worker_mode=observer$' \
         'observer update changed resolved_worker_mode' || return 1
 
@@ -513,16 +522,23 @@ observer_and_explicit_full_modes_persist_across_updates() {
     ARC_NODE_VERSION_UNDER_TEST=0.8.0
     invoke_shard_installer "$sandbox" Linux x86_64 \
         "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
-        --no-service --model "$model_path" --worker-mode full >"$sandbox/full-080.out" 2>&1 || return 1
+        --no-service --model "$model_path" --worker-mode full >"$sandbox/full-080.out" 2>&1 || {
+            cat "$sandbox/full-080.out"
+            reset_shard_test_env
+            return 1
+        }
     assert_file_contains "$sandbox/arc/worker-policy.conf" '^configured_worker_mode=full$' \
         'explicit --worker-mode full was not persisted' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--full-integer-worker' \
         'explicit --worker-mode full did not emit --full-integer-worker' || return 1
-    INSTALLER_OVERRIDE_UNDER_TEST="$sandbox/arc/bin/arc-installer"
     ARC_NODE_VERSION_UNDER_TEST=0.8.23
     invoke_shard_installer "$sandbox" Linux x86_64 \
         "$TEST_DIR/fixtures/release-v0.8.23.json" 0.8.23 \
-        --no-service >"$sandbox/full-0823.out" 2>&1 || return 1
+        --no-service >"$sandbox/full-0823.out" 2>&1 || {
+            cat "$sandbox/full-0823.out"
+            reset_shard_test_env
+            return 1
+        }
     reset_shard_test_env
     assert_file_contains "$sandbox/arc/worker-policy.conf" '^configured_worker_mode=full$' \
         'update lost saved configured_worker_mode=full' || return 1
@@ -872,7 +888,7 @@ explicit_shard_mode_succeeds_end_to_end_with_early_qualification_helpers() {
             reset_shard_test_env
             return 1
         }
-    assert_file_contains "$sandbox/preflight.log" 'community-shard-worker .*--max-working-set-bytes 7462505472 --max-resident-layers 6 --threads 1 --check-only' \
+    assert_file_contains "$sandbox/preflight.log" 'community-shard-worker .*--max-working-set-bytes 7462505984 --max-resident-layers 6 --threads 1 --check-only' \
         'explicit --worker-mode shard did not reach binary --check-only preflight' || {
             reset_shard_test_env
             return 1
