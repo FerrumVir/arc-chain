@@ -1188,6 +1188,19 @@ fn first_stderr_line(stderr: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+fn ensure_regular_model_file(model: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(model).map_err(|error| {
+        exit::refused(format!("cannot inspect model {}: {error}", model.display()))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(exit::refused(format!(
+            "model path {} must be a regular file, not a symlink or directory",
+            model.display()
+        )));
+    }
+    Ok(())
+}
+
 fn try_qualify_shard(
     pins: &Pins,
     node_binary: &Path,
@@ -1201,14 +1214,6 @@ fn try_qualify_shard(
     let Some(pin) = pins.shard_worker.as_ref() else {
         return Err("the pinned release does not include a shard worker configuration".to_string());
     };
-    let metadata = fs::symlink_metadata(model)
-        .map_err(|error| format!("cannot inspect model {}: {error}", model.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(format!(
-            "model path {} must be a regular file, not a symlink or directory",
-            model.display()
-        ));
-    }
 
     let preflight_memory = measure_memory()?;
     let preflight_budget = qualify_host_memory(preflight_memory)?;
@@ -1293,6 +1298,7 @@ pub(crate) fn resolve_worker_role_with(
     preflight_timeout: Duration,
     measure_memory: impl FnMut() -> std::result::Result<HostMemory, String>,
 ) -> Result<WorkerLaunchRole> {
+    ensure_regular_model_file(model)?;
     match mode {
         WorkerModePreference::Full => Ok(WorkerLaunchRole::FullIntegerWorker {
             model: model.to_path_buf(),
@@ -2091,9 +2097,13 @@ Pages inactive: 2000.
 
     #[test]
     fn full_mode_and_off_compute_bypass_preflight_and_missing_pin_fails_closed_for_shard() {
+        use crate::layout::test_support::TempDir;
+
+        let temp = TempDir::new("shard-full-missing-pin");
+        let model = temp.path().join("model.gguf");
+        fs::write(&model, b"regular-model").unwrap();
         let mut pins = Pins::embedded().unwrap();
         pins.shard_worker = None;
-        let model = PathBuf::from("/nonexistent/model.gguf");
         let binary = PathBuf::from("/nonexistent/arc-node");
         let mut log = Log::stderr_only();
         let mut probe_calls = 0usize;
@@ -2163,6 +2173,31 @@ Pages inactive: 2000.
         .unwrap_err();
         assert_eq!(probe_calls, 0);
         assert_eq!(exit::code_for(&refused), exit::EX_CONFIG);
+
+        for mode in [
+            WorkerModePreference::Auto,
+            WorkerModePreference::Full,
+            WorkerModePreference::Shard,
+        ] {
+            let dir_err = resolve_worker_role_with(
+                mode,
+                &pins,
+                &binary,
+                temp.path(),
+                &mut log,
+                Duration::from_secs(1),
+                || {
+                    probe_calls += 1;
+                    Ok(HostMemory {
+                        visible_bytes: 16 * GIB,
+                        available_bytes: 8 * GIB,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert_eq!(probe_calls, 0);
+            assert_eq!(exit::code_for(&dir_err), exit::EX_CONFIG);
+        }
     }
 
     #[test]
@@ -2470,7 +2505,7 @@ Pages inactive: 2000.
         }
 
         #[test]
-        fn symlinked_model_is_rejected_before_spawning_header_check() {
+        fn symlinked_and_non_regular_models_are_rejected_for_all_modes_without_probe_or_spawn() {
             let temp = TempDir::new("shard-symlink-model");
             let real_model = temp.path().join("real.gguf");
             fs::write(&real_model, b"regular-model").unwrap();
@@ -2485,26 +2520,34 @@ Pages inactive: 2000.
 
             let pins = pins_with_shard();
             let mut log = Log::stderr_only();
-            let shard_err = resolve_worker_role_with(
-                WorkerModePreference::Shard,
-                &pins,
-                &script,
-                &link_model,
-                &mut log,
-                Duration::from_secs(5),
-                || {
-                    Ok(HostMemory {
-                        visible_bytes: 16 * GIB,
-                        available_bytes: 8 * GIB,
-                    })
-                },
-            )
-            .unwrap_err();
-            assert_eq!(exit::code_for(&shard_err), exit::EX_CONFIG);
-            assert!(
-                !sentinel.exists(),
-                "symlinked model must reject before spawn"
-            );
+            let mut probe_calls = 0usize;
+            for bad_model in [link_model.as_path(), temp.path()] {
+                for mode in [
+                    WorkerModePreference::Auto,
+                    WorkerModePreference::Full,
+                    WorkerModePreference::Shard,
+                ] {
+                    let err = resolve_worker_role_with(
+                        mode,
+                        &pins,
+                        &script,
+                        bad_model,
+                        &mut log,
+                        Duration::from_secs(5),
+                        || {
+                            probe_calls += 1;
+                            Ok(HostMemory {
+                                visible_bytes: 16 * GIB,
+                                available_bytes: 8 * GIB,
+                            })
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(exit::code_for(&err), exit::EX_CONFIG, "{mode:?}");
+                    assert_eq!(probe_calls, 0, "{mode:?} must reject before memory probe");
+                    assert!(!sentinel.exists(), "{mode:?} must reject before spawn");
+                }
+            }
         }
 
         #[test]

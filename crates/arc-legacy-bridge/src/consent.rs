@@ -170,6 +170,14 @@ pub fn verify_and_record_model(
     model: &Path,
     progress: impl FnMut(u64),
 ) -> Result<()> {
+    let caller_metadata =
+        fs::symlink_metadata(model).with_context(|| format!("cannot read {}", model.display()))?;
+    if caller_metadata.file_type().is_symlink() || !caller_metadata.file_type().is_file() {
+        return Err(exit::refused(format!(
+            "{} must be a regular file, not a symlink or directory",
+            model.display()
+        )));
+    }
     let model = crate::layout::canonical_or_lexical(model);
     let metadata =
         fs::symlink_metadata(&model).with_context(|| format!("cannot read {}", model.display()))?;
@@ -566,6 +574,35 @@ mod tests {
             let symlink_error = read_worker_mode(&layout).unwrap_err();
             assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_and_record_model_refuses_symlink_before_canonicalization() {
+        let temp = TempDir::new("consent-verify-symlink");
+        let model_body = b"exact pinned model bytes for direct symlink test".to_vec();
+        let real_model = temp.path().join("real.gguf");
+        let link_model = temp.path().join("link.gguf");
+        fs::write(&real_model, &model_body).unwrap();
+        std::os::unix::fs::symlink(&real_model, &link_model).unwrap();
+        let (layout, _) = headless(&temp, Some(link_model.clone()));
+        let pins = privacy_safe_pins(&model_body);
+
+        let symlink_error =
+            verify_and_record_model(&layout, &pins, &link_model, |_| {}).unwrap_err();
+        assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
+        assert!(!layout.model_record().exists());
+
+        let dir_error = verify_and_record_model(&layout, &pins, temp.path(), |_| {}).unwrap_err();
+        assert_eq!(exit::code_for(&dir_error), exit::EX_CONFIG);
+        assert!(!layout.model_record().exists());
+
+        verify_and_record_model(&layout, &pins, &real_model, |_| {}).unwrap();
+        assert!(layout.model_record().exists());
+        assert_eq!(
+            verified_model(&layout, &pins).unwrap(),
+            Some(crate::layout::canonical_or_lexical(&real_model))
+        );
     }
 
     #[cfg(unix)]
