@@ -24,14 +24,34 @@ COMMUNITY_VALIDATOR_ADDRESSES=(
     f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f
     f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b
 )
+SHARD_COORDINATOR_URL=https://149.28.153.31
+SHARD_COORDINATOR_ID=f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b
+SHARD_TRANSACTION_DOMAIN=3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f
+SHARD_EXPECTED_MODEL_ID=934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67
+GIB_BYTES=1073741824
+WORKER_MIN_NOMINAL_RAM_GB=16
+MARKETED_RAM_SIZES_GB=(
+    2 3 4 6 8 12 16 18 20 24 32 36 48 64 96 128 192 256 384 512 768 1024 1536 2048
+)
+MAX_RESERVED_RAM_PERCENT=15
+SHARD_RESERVE_RAM_BYTES=$((4 * GIB_BYTES))
+SHARD_MIN_EFFECTIVE_AVAILABLE_BYTES=$((6 * GIB_BYTES))
+SHARD_MAX_RECLAIMABLE_WORKER_BYTES=$((6 * GIB_BYTES))
+SHARD_REQUIRED_ADMITTED_LAYERS=6
+CURRENT_WORKER_POLICY_REVISION="arc-worker-policy-v1:${SHARD_COORDINATOR_URL}:${SHARD_COORDINATOR_ID}:${SHARD_TRANSACTION_DOMAIN}:${SHARD_EXPECTED_MODEL_ID}"
+RUNNING_INSTALLER_SOURCE="${BASH_SOURCE[0]:-}"
+RUNNING_INSTALLER_SHA256=""
+
 REQUESTED_VERSION="${ARC_NODE_VERSION:-}"
 ARG_INSTALL_DIR=""
 ARG_DATA_DIR=""
 ARG_MODEL_PATH=""
+ARG_WORKER_MODE=""
 ARG_RPC_PORT=""
 ARG_P2P_PORT=""
 ARG_SERVICE_SCOPE=""
 MODEL_WAS_SET=false
+WORKER_MODE_WAS_SET=false
 RPC_WAS_SET=false
 P2P_WAS_SET=false
 DATA_WAS_SET=false
@@ -43,6 +63,7 @@ UNINSTALL=false
 PURGE=false
 
 if [ "${ARC_MODEL_PATH+x}" = x ]; then MODEL_WAS_SET=true; fi
+if [ "${ARC_WORKER_MODE+x}" = x ]; then WORKER_MODE_WAS_SET=true; fi
 if [ "${ARC_RPC_PORT+x}" = x ]; then RPC_WAS_SET=true; fi
 if [ "${ARC_P2P_PORT+x}" = x ]; then P2P_WAS_SET=true; fi
 if [ "${ARC_NODE_DATA_DIR+x}" = x ]; then DATA_WAS_SET=true; fi
@@ -72,6 +93,7 @@ Options:
   --install-dir PATH     Program/config root (default: ~/.arc).
   --data-dir PATH        Dedicated absolute chain data dir (default: INSTALL_DIR/data).
   --model PATH           Optional local GGUF model. Omitted means observer/router.
+  --worker-mode MODE     Worker role with --model: auto, shard, or full (default: auto).
   --port PORT            RPC port (default: 9944).
   --p2p-port PORT        QUIC P2P port (default: RPC port + 1).
   --system-service       Linux system service (sudo/root required).
@@ -84,7 +106,7 @@ Options:
   -h, --help             Show this help.
 
 Environment equivalents:
-  ARC_NODE_VERSION, ARC_DIR, ARC_NODE_DATA_DIR, ARC_MODEL_PATH,
+  ARC_NODE_VERSION, ARC_DIR, ARC_NODE_DATA_DIR, ARC_MODEL_PATH, ARC_WORKER_MODE,
   ARC_RPC_PORT, ARC_P2P_PORT, ARC_INSTALL_SCOPE (auto/system/user).
 
 Windows Server is supported by release binaries but not by this shell script.
@@ -109,6 +131,8 @@ while [ "$#" -gt 0 ]; do
             need_value "$@"; ARG_DATA_DIR="$2"; DATA_WAS_SET=true; shift 2 ;;
         --model)
             need_value "$@"; ARG_MODEL_PATH="$2"; MODEL_WAS_SET=true; shift 2 ;;
+        --worker-mode)
+            need_value "$@"; ARG_WORKER_MODE="$2"; WORKER_MODE_WAS_SET=true; shift 2 ;;
         --port)
             need_value "$@"; ARG_RPC_PORT="$2"; RPC_WAS_SET=true; shift 2 ;;
         --p2p-port)
@@ -320,6 +344,7 @@ if [ "$UNINSTALL" = false ] && [ "$ARC_DIR_PREEXISTED" = true ] \
 fi
 
 CONFIG_FILE="$ARC_DIR/install.conf"
+WORKER_POLICY_FILE="$ARC_DIR/worker-policy.conf"
 SEED_FILE="$ARC_DIR/identity/validator-seed"
 KEY_FILE="$ARC_DIR/identity/validator-key.json"
 LEGACY_SEED_EVIDENCE="$ARC_DIR/identity/legacy-validator-seed.evidence"
@@ -328,6 +353,15 @@ SAVED_P2P_PORT=""
 SAVED_DATA_DIR=""
 SAVED_MODEL_PATH=""
 SAVED_SERVICE_SCOPE=""
+WORKER_POLICY_PRESENT=false
+SAVED_POLICY_REVISION=""
+SAVED_INSTALLER_SHA256=""
+SAVED_CONFIGURED_WORKER_MODE=""
+SAVED_RESOLVED_WORKER_MODE=""
+SAVED_POLICY_MODEL_PATH=""
+CONFIGURED_WORKER_MODE=auto
+RESOLVED_WORKER_MODE=observer
+SHARD_MAX_WORKING_SET_BYTES=0
 if [ -f "$CONFIG_FILE" ]; then
     [ ! -L "$CONFIG_FILE" ] || die "Refusing symlinked installer config: $CONFIG_FILE"
     while IFS='=' read -r key value; do
@@ -495,6 +529,15 @@ fi
 [ -z "$MODEL_PATH" ] || [ -f "$MODEL_PATH" ] \
     || die "Model file does not exist: $MODEL_PATH"
 
+REQUESTED_WORKER_MODE=""
+if [ "$WORKER_MODE_WAS_SET" = true ]; then
+    REQUESTED_WORKER_MODE="${ARG_WORKER_MODE:-${ARC_WORKER_MODE:-}}"
+    case "$REQUESTED_WORKER_MODE" in
+        auto|shard|full) ;;
+        *) die "Worker mode must be auto, shard, or full (got: $REQUESTED_WORKER_MODE)" ;;
+    esac
+fi
+
 as_root() {
     if [ "$CURRENT_UID" -eq 0 ]; then
         "$@"
@@ -545,6 +588,399 @@ portable_file_mode() {
     stat -c %a -- "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+strict_version() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+canonical_uint() {
+    local value="$1"
+    [ -n "$value" ] && [ "${#value}" -le 18 ] || return 1
+    case "$value" in
+        *[!0-9]*) return 1 ;;
+        0|[1-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+extract_version() {
+    sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+}
+
+version_compare() {
+    awk -v left="$1" -v right="$2" 'BEGIN {
+        split(left, a, "."); split(right, b, ".");
+        for (i = 1; i <= 3; i++) {
+            if ((a[i] + 0) > (b[i] + 0)) { print 1; exit }
+            if ((a[i] + 0) < (b[i] + 0)) { print -1; exit }
+        }
+        print 0
+    }'
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "sha256sum (Linux) or shasum (macOS) is required"
+    fi
+}
+
+launchd_service_pid() {
+    local label="$1" output
+    output="$(launchctl print "$LAUNCHD_DOMAIN/$label" 2>/dev/null)" || return 1
+    printf '%s\n' "$output" | awk '
+        $1 == "pid" {
+            if ($2 != "=" || $3 !~ /^[1-9][0-9]*$/ || ++count > 1) exit 2
+            pid = $3
+        }
+        END { if (count == 1) print pid }
+    '
+}
+
+capture_running_installer_sha256() {
+    local candidate_path="$RUNNING_INSTALLER_SOURCE"
+    if [ -z "$candidate_path" ] && [ -f "$0" ] && [ ! -L "$0" ]; then
+        candidate_path="$0"
+    fi
+    if [ -n "$candidate_path" ] && [ -f "$candidate_path" ] \
+        && [ ! -L "$candidate_path" ] && [ -r "$candidate_path" ]; then
+        RUNNING_INSTALLER_SHA256="$(sha256_file "$candidate_path")"
+        printf '%s\n' "$RUNNING_INSTALLER_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
+            || die "Could not compute SHA-256 of the running installer"
+    else
+        RUNNING_INSTALLER_SHA256=stdin-unpinned
+    fi
+}
+
+load_and_validate_worker_policy() {
+    local expected_uid policy_uid policy_mode policy_permissions
+    local line_no=0 raw_line key value
+    local seen_revision=false seen_installer=false seen_configured=false
+    local seen_resolved=false seen_model=false
+    WORKER_POLICY_PRESENT=false
+    SAVED_POLICY_REVISION=""
+    SAVED_INSTALLER_SHA256=""
+    SAVED_CONFIGURED_WORKER_MODE=""
+    SAVED_RESOLVED_WORKER_MODE=""
+    SAVED_POLICY_MODEL_PATH=""
+
+    if [ ! -e "$WORKER_POLICY_FILE" ] && [ ! -L "$WORKER_POLICY_FILE" ]; then
+        return 0
+    fi
+    [ ! -L "$WORKER_POLICY_FILE" ] \
+        || die "Refusing symlinked worker policy file: $WORKER_POLICY_FILE"
+    [ -f "$WORKER_POLICY_FILE" ] \
+        || die "Worker policy path is not a regular file: $WORKER_POLICY_FILE"
+
+    if [ "$SERVICE_SCOPE" = system ]; then expected_uid=0
+    else expected_uid="$TARGET_UID"
+    fi
+    policy_uid="$(portable_file_uid "$WORKER_POLICY_FILE")" \
+        || die "Could not inspect worker policy owner: $WORKER_POLICY_FILE"
+    [ "$policy_uid" -eq "$expected_uid" ] \
+        || die "Worker policy file has the wrong owner: $WORKER_POLICY_FILE"
+    policy_mode="$(portable_file_mode "$WORKER_POLICY_FILE")" \
+        || die "Could not inspect worker policy permissions: $WORKER_POLICY_FILE"
+    case "$policy_mode" in
+        ''|*[!0-7]*) die "Could not parse worker policy permissions: $WORKER_POLICY_FILE" ;;
+    esac
+    policy_permissions=$((8#$policy_mode))
+    [ $((policy_permissions & 0022)) -eq 0 ] \
+        || die "Worker policy file must not be group/world writable: $WORKER_POLICY_FILE"
+
+    while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+        line_no=$((line_no + 1))
+        case "$raw_line" in *$'\r'*) die "Worker policy file contains CR characters: $WORKER_POLICY_FILE" ;; esac
+        if [ "$line_no" -eq 1 ]; then
+            [ "$raw_line" = '# ARC worker policy v1' ] \
+                || die "Worker policy file has an unrecognized schema header: $WORKER_POLICY_FILE"
+            continue
+        fi
+        case "$raw_line" in
+            *=*)
+                key="${raw_line%%=*}"
+                value="${raw_line#*=}"
+                ;;
+            *) die "Malformed line in $WORKER_POLICY_FILE" ;;
+        esac
+        case "$key" in
+            policy_revision)
+                [ "$seen_revision" = false ] || die "Duplicate key '$key' in $WORKER_POLICY_FILE"
+                [ -n "$value" ] || die "Empty policy_revision in $WORKER_POLICY_FILE"
+                case "$value" in *[[:space:]]*) die "Invalid policy_revision in $WORKER_POLICY_FILE" ;; esac
+                SAVED_POLICY_REVISION="$value"
+                seen_revision=true
+                ;;
+            installer_sha256)
+                [ "$seen_installer" = false ] || die "Duplicate key '$key' in $WORKER_POLICY_FILE"
+                if [ "$value" != stdin-unpinned ] \
+                    && ! printf '%s\n' "$value" | grep -Eq '^[0-9a-f]{64}$'; then
+                    die "Invalid installer_sha256 in $WORKER_POLICY_FILE"
+                fi
+                SAVED_INSTALLER_SHA256="$value"
+                seen_installer=true
+                ;;
+            configured_worker_mode)
+                [ "$seen_configured" = false ] || die "Duplicate key '$key' in $WORKER_POLICY_FILE"
+                case "$value" in
+                    auto|shard|full) SAVED_CONFIGURED_WORKER_MODE="$value" ;;
+                    *) die "Invalid configured_worker_mode '$value' in $WORKER_POLICY_FILE" ;;
+                esac
+                seen_configured=true
+                ;;
+            resolved_worker_mode)
+                [ "$seen_resolved" = false ] || die "Duplicate key '$key' in $WORKER_POLICY_FILE"
+                case "$value" in
+                    observer|shard|full) SAVED_RESOLVED_WORKER_MODE="$value" ;;
+                    *) die "Invalid resolved_worker_mode '$value' in $WORKER_POLICY_FILE" ;;
+                esac
+                seen_resolved=true
+                ;;
+            model_path)
+                [ "$seen_model" = false ] || die "Duplicate key '$key' in $WORKER_POLICY_FILE"
+                case "$value" in
+                    ''|/*) SAVED_POLICY_MODEL_PATH="$value" ;;
+                    *) die "Invalid model_path in $WORKER_POLICY_FILE" ;;
+                esac
+                seen_model=true
+                ;;
+            *)
+                die "Unknown key '$key' in $WORKER_POLICY_FILE"
+                ;;
+        esac
+    done < "$WORKER_POLICY_FILE"
+
+    if [ "$seen_revision" != true ] || [ "$seen_installer" != true ] \
+        || [ "$seen_configured" != true ] || [ "$seen_resolved" != true ] \
+        || [ "$seen_model" != true ]; then
+        die "Incomplete worker policy file: $WORKER_POLICY_FILE"
+    fi
+    if [ "$SAVED_RESOLVED_WORKER_MODE" = observer ] && [ -n "$SAVED_POLICY_MODEL_PATH" ]; then
+        die "Inconsistent observer model_path in $WORKER_POLICY_FILE"
+    fi
+    if [ "$SAVED_RESOLVED_WORKER_MODE" != observer ] && [ -z "$SAVED_POLICY_MODEL_PATH" ]; then
+        die "Missing worker model_path in $WORKER_POLICY_FILE"
+    fi
+    WORKER_POLICY_PRESENT=true
+}
+
+nominal_ram_gb() {
+    local visible_bytes="$1" size_gb size_bytes tolerance
+    for size_gb in "${MARKETED_RAM_SIZES_GB[@]}"; do
+        size_bytes=$((size_gb * GIB_BYTES))
+        if [ "$visible_bytes" -gt "$size_bytes" ]; then
+            continue
+        fi
+        tolerance=$(((size_bytes / 100) * MAX_RESERVED_RAM_PERCENT))
+        if [ "$tolerance" -lt "$GIB_BYTES" ]; then
+            tolerance="$GIB_BYTES"
+        fi
+        if [ $((size_bytes - visible_bytes)) -le "$tolerance" ]; then
+            printf '%s\n' "$size_gb"
+            return 0
+        fi
+        break
+    done
+    printf '%s\n' $((visible_bytes / GIB_BYTES))
+}
+
+VISIBLE_RAM_BYTES=0
+AVAILABLE_RAM_BYTES=0
+EFFECTIVE_AVAILABLE_RAM_BYTES=0
+SHARD_QUALIFICATION_REASON=""
+
+measure_host_memory_bytes() {
+    local meminfo_path total_kib avail_kib vm_output
+    VISIBLE_RAM_BYTES=0
+    AVAILABLE_RAM_BYTES=0
+    case "$OS" in
+        Linux)
+            meminfo_path="${ARC_INSTALL_MEMINFO_PATH:-/proc/meminfo}"
+            [ -r "$meminfo_path" ] || return 1
+            total_kib="$(awk '
+                $1 == "MemTotal:" && $3 == "kB" { total = $2; count += 1 }
+                END { if (count != 1) exit 1; print total }
+            ' "$meminfo_path")" || return 1
+            avail_kib="$(awk '
+                $1 == "MemAvailable:" && $3 == "kB" { avail = $2; has_avail += 1 }
+                $1 == "MemFree:" && $3 == "kB" { mem_free = $2; has_free += 1 }
+                $1 == "Buffers:" && $3 == "kB" { buffers = $2 }
+                $1 == "Cached:" && $3 == "kB" { cached = $2 }
+                END {
+                    if (has_avail == 1) { print avail; exit 0 }
+                    if (has_free == 1) { print mem_free + buffers + cached; exit 0 }
+                    exit 1
+                }
+            ' "$meminfo_path")" || return 1
+            canonical_uint "$total_kib" && [ "$total_kib" -gt 0 ] || return 1
+            canonical_uint "$avail_kib" || return 1
+            VISIBLE_RAM_BYTES=$((total_kib * 1024))
+            AVAILABLE_RAM_BYTES=$((avail_kib * 1024))
+            ;;
+        Darwin)
+            VISIBLE_RAM_BYTES="$(sysctl -n hw.memsize 2>/dev/null)" || return 1
+            canonical_uint "$VISIBLE_RAM_BYTES" && [ "$VISIBLE_RAM_BYTES" -gt 0 ] || return 1
+            command -v vm_stat >/dev/null 2>&1 || return 1
+            vm_output="$(vm_stat 2>/dev/null)" || return 1
+            AVAILABLE_RAM_BYTES="$(printf '%s\n' "$vm_output" | awk '
+                NR == 1 {
+                    page_size = 4096
+                    if (match($0, /page size of [0-9]+ bytes/)) {
+                        snippet = substr($0, RSTART, RLENGTH)
+                        gsub(/[^0-9]/, "", snippet)
+                        if (snippet + 0 > 0) page_size = snippet + 0
+                    }
+                }
+                /^Pages (free|inactive|speculative):/ {
+                    val = $NF
+                    gsub(/[^0-9]/, "", val)
+                    pages += (val + 0)
+                    seen += 1
+                }
+                END {
+                    if (seen == 0) exit 1
+                    printf "%.0f\n", pages * page_size
+                }
+            ')" || return 1
+            canonical_uint "$AVAILABLE_RAM_BYTES" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+verified_managed_service_pid() {
+    local pid="" domain=""
+    case "$SERVICE_SCOPE" in
+        system)
+            if as_root systemctl is-active --quiet arc-node.service 2>/dev/null; then
+                pid="$(as_root systemctl show --property=MainPID --value arc-node.service 2>/dev/null || true)"
+            fi
+            ;;
+        system-user)
+            if systemctl is-active --quiet arc-node.service 2>/dev/null; then
+                pid="$(systemctl show --property=MainPID --value arc-node.service 2>/dev/null || true)"
+            fi
+            ;;
+        user)
+            if systemctl --user is-active --quiet arc-node.service 2>/dev/null; then
+                pid="$(systemctl --user show --property=MainPID --value arc-node.service 2>/dev/null || true)"
+            fi
+            ;;
+        launchd)
+            domain="user/$TARGET_UID"
+            if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+                domain="gui/$TARGET_UID"
+            fi
+            pid="$(LAUNCHD_DOMAIN="$domain" launchd_service_pid network.arc.node 2>/dev/null || true)"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    pid="${pid#MainPID=}"
+    pid="$(printf '%s' "$pid" | tr -d '[:space:]')"
+    canonical_uint "$pid" && [ "$pid" -gt 1 ] || return 1
+    printf '%s\n' "$pid"
+}
+
+reclaimable_managed_worker_bytes() {
+    local pid expected_uid process_uid rss_kib command_line padded_cmd reclaim_bytes
+    pid="$(verified_managed_service_pid)" || {
+        printf '0\n'
+        return 0
+    }
+    if [ "$TARGET_USER" = root ]; then expected_uid=0
+    else expected_uid="$TARGET_UID"
+    fi
+    process_uid="$(ps -p "$pid" -o uid= 2>/dev/null | tr -d '[:space:]')" || {
+        printf '0\n'
+        return 0
+    }
+    canonical_uint "$process_uid" && [ "$process_uid" -eq "$expected_uid" ] || {
+        printf '0\n'
+        return 0
+    }
+    rss_kib="$(ps -p "$pid" -o rss= 2>/dev/null | tr -d '[:space:]')" || {
+        printf '0\n'
+        return 0
+    }
+    canonical_uint "$rss_kib" || {
+        printf '0\n'
+        return 0
+    }
+    command_line="$(ps -ww -p "$pid" -o command= 2>/dev/null)" || {
+        printf '0\n'
+        return 0
+    }
+    case "$command_line" in
+        "$ARC_DIR/bin/arc-node "*) ;;
+        *)
+            printf '0\n'
+            return 0
+            ;;
+    esac
+    padded_cmd=" $command_line "
+    case "$padded_cmd" in
+        *" --data-dir $NODE_DATA_DIR "*) ;;
+        *)
+            printf '0\n'
+            return 0
+            ;;
+    esac
+    case "$padded_cmd" in
+        *" --full-integer-worker "*|*" --community-shard-worker "*) ;;
+        *)
+            printf '0\n'
+            return 0
+            ;;
+    esac
+    reclaim_bytes=$((rss_kib * 1024))
+    if [ "$reclaim_bytes" -gt "$SHARD_MAX_RECLAIMABLE_WORKER_BYTES" ]; then
+        reclaim_bytes="$SHARD_MAX_RECLAIMABLE_WORKER_BYTES"
+    fi
+    printf '%s\n' "$reclaim_bytes"
+}
+
+qualify_shard_host_memory() {
+    local nominal_gb reclaimable_bytes reserve_capped half_visible
+    SHARD_QUALIFICATION_REASON=""
+    SHARD_MAX_WORKING_SET_BYTES=0
+    if ! measure_host_memory_bytes; then
+        SHARD_QUALIFICATION_REASON="could not inspect host total and available memory"
+        return 1
+    fi
+    nominal_gb="$(nominal_ram_gb "$VISIBLE_RAM_BYTES")"
+    if [ "$nominal_gb" -lt "$WORKER_MIN_NOMINAL_RAM_GB" ]; then
+        SHARD_QUALIFICATION_REASON="nominal RAM ${nominal_gb} GB is below the ${WORKER_MIN_NOMINAL_RAM_GB} GB shard worker requirement (visible=${VISIBLE_RAM_BYTES} bytes)"
+        return 1
+    fi
+    if [ "$VISIBLE_RAM_BYTES" -le "$SHARD_RESERVE_RAM_BYTES" ]; then
+        SHARD_QUALIFICATION_REASON="visible RAM ${VISIBLE_RAM_BYTES} bytes leaves no working-set budget above the 4 GiB OS reserve"
+        return 1
+    fi
+    EFFECTIVE_AVAILABLE_RAM_BYTES="$AVAILABLE_RAM_BYTES"
+    if [ "$EFFECTIVE_AVAILABLE_RAM_BYTES" -lt "$SHARD_MIN_EFFECTIVE_AVAILABLE_BYTES" ]; then
+        reclaimable_bytes="$(reclaimable_managed_worker_bytes)"
+        EFFECTIVE_AVAILABLE_RAM_BYTES=$((AVAILABLE_RAM_BYTES + reclaimable_bytes))
+    fi
+    if [ "$EFFECTIVE_AVAILABLE_RAM_BYTES" -lt "$SHARD_MIN_EFFECTIVE_AVAILABLE_BYTES" ]; then
+        SHARD_QUALIFICATION_REASON="effective available RAM ${EFFECTIVE_AVAILABLE_RAM_BYTES} bytes is below the ${SHARD_MIN_EFFECTIVE_AVAILABLE_BYTES}-byte migration floor"
+        return 1
+    fi
+    reserve_capped=$((VISIBLE_RAM_BYTES - SHARD_RESERVE_RAM_BYTES))
+    half_visible=$((VISIBLE_RAM_BYTES / 2))
+    if [ "$reserve_capped" -lt "$half_visible" ]; then
+        SHARD_MAX_WORKING_SET_BYTES="$reserve_capped"
+    else
+        SHARD_MAX_WORKING_SET_BYTES="$half_visible"
+    fi
+    return 0
+}
+
 validate_install_root_marker() {
     local expected_uid marker_uid marker_mode marker_permissions
     [ ! -L "$INSTALL_ROOT_MARKER" ] \
@@ -574,6 +1010,24 @@ validate_install_root_marker() {
 install_root_as_owner() {
     if [ "$SERVICE_SCOPE" = system ]; then as_root "$@"
     else as_target "$@"
+    fi
+}
+
+transaction_crosses_user_boundary() {
+    [ "$1" != root ] && [ "$SERVICE_SCOPE" != system ] \
+        && [ "$CURRENT_UID" -eq 0 ] && [ "$TARGET_UID" -ne 0 ]
+}
+
+copy_to_install_owner() {
+    local source="$1" destination="$2" create_only="${3:-false}"
+    if transaction_crosses_user_boundary install; then
+        if [ "$create_only" = true ]; then
+            install_root_as_owner sh -c 'set -Ce; cat > "$1"' sh "$destination" < "$source"
+        else
+            install_root_as_owner sh -ce 'cat > "$1"' sh "$destination" < "$source"
+        fi
+    else
+        install_root_as_owner cp -- "$source" "$destination"
     fi
 }
 
@@ -2135,6 +2589,21 @@ if [ "$UNINSTALL" = false ]; then
     elif [ "$UPDATE_ONLY" = true ]; then
         die "--update-only requires an existing marked ARC installation in $ARC_DIR"
     fi
+    capture_running_installer_sha256
+    load_and_validate_worker_policy
+    if [ "$WORKER_MODE_WAS_SET" = true ]; then
+        CONFIGURED_WORKER_MODE="$REQUESTED_WORKER_MODE"
+    elif [ "$WORKER_POLICY_PRESENT" = true ]; then
+        CONFIGURED_WORKER_MODE="$SAVED_CONFIGURED_WORKER_MODE"
+    else
+        CONFIGURED_WORKER_MODE=auto
+    fi
+    if [ "$CONFIGURED_WORKER_MODE" = shard ] && [ -z "$MODEL_PATH" ]; then
+        die "--worker-mode shard requires --model /absolute/model.gguf"
+    fi
+    if [ "$WORKER_MODE_WAS_SET" = true ] && [ "$CONFIGURED_WORKER_MODE" = full ] && [ -z "$MODEL_PATH" ]; then
+        die "--worker-mode full requires --model /absolute/model.gguf"
+    fi
 else
     validate_install_root_marker
 fi
@@ -2385,6 +2854,7 @@ else
     fi
 fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arc-install.XXXXXX")"
+USER_TRANSACTION_TMP_DIR=""
 IDENTITY_CHECK_FILE=""
 cleanup() {
     local status=$?
@@ -2396,6 +2866,10 @@ cleanup() {
     fi
     if [ -n "$IDENTITY_CHECK_FILE" ]; then
         rm -f -- "$IDENTITY_CHECK_FILE"
+    fi
+    if [ -n "$USER_TRANSACTION_TMP_DIR" ]; then
+        as_target rm -rf -- "$USER_TRANSACTION_TMP_DIR" \
+            || warn "Private transaction snapshot cleanup failed: $USER_TRANSACTION_TMP_DIR"
     fi
     rm -rf -- "$TMP_DIR"
     if [ "$SERVICE_SCOPE" = system ]; then
@@ -2427,35 +2901,6 @@ fi
 NODE_ASSET="arc-node-$PLATFORM"
 CLI_ASSET="arc-cli-$PLATFORM"
 HEADLESS_CHANNEL_MINIMUM_VERSION=0.8.0
-
-strict_version() {
-    printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
-}
-
-canonical_uint() {
-    local value="$1"
-    [ -n "$value" ] && [ "${#value}" -le 18 ] || return 1
-    case "$value" in
-        *[!0-9]*) return 1 ;;
-        0|[1-9]*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-extract_version() {
-    sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
-}
-
-version_compare() {
-    awk -v left="$1" -v right="$2" 'BEGIN {
-        split(left, a, "."); split(right, b, ".");
-        for (i = 1; i <= 3; i++) {
-            if ((a[i] + 0) > (b[i] + 0)) { print 1; exit }
-            if ((a[i] + 0) < (b[i] + 0)) { print -1; exit }
-        }
-        print 0
-    }'
-}
 
 github_curl() {
     local url="$1"
@@ -2759,6 +3204,388 @@ top_level_json_bare() {
     printf '%s\n' "$value"
 }
 
+nested_object_json_bare() {
+    local json_file="$1" parent_key="$2" wanted_key="$3"
+    awk -v parent="$parent_key" -v wanted="$wanted_key" '
+        function fail() { failed = 1; exit 2 }
+        function emit(value) {
+            if (found) fail()
+            print value
+            found = 1
+        }
+        BEGIN {
+            mode = "before"
+            object_depth = 0
+            array_depth = 0
+            in_string = 0
+            escaped = 0
+            string_kind = ""
+            token = ""
+            token_had_escape = 0
+            top_key = ""
+            sub_key = ""
+            in_target_object = 0
+            saw_parent = 0
+            root_closed = 0
+            found = 0
+            failed = 0
+        }
+        {
+            line = $0 "\n"
+            for (i = 1; i <= length(line); i++) {
+                ch = substr(line, i, 1)
+                if (root_closed) {
+                    if (ch !~ /[[:space:]]/) fail()
+                    continue
+                }
+                if (in_string) {
+                    if (escaped) {
+                        token_had_escape = 1
+                        escaped = 0
+                        token = token ch
+                        continue
+                    }
+                    if (ch == "\\") {
+                        escaped = 1
+                        token_had_escape = 1
+                        continue
+                    }
+                    if (ch == "\"") {
+                        in_string = 0
+                        if (string_kind == "top_key") {
+                            if (token_had_escape) fail()
+                            top_key = token
+                            mode = "top_colon"
+                        } else if (string_kind == "top_value") {
+                            mode = "top_comma"
+                        } else if (string_kind == "sub_key") {
+                            if (token_had_escape) fail()
+                            sub_key = token
+                            mode = "sub_colon"
+                        } else if (string_kind == "sub_value") {
+                            if (sub_key == wanted) fail()
+                            mode = "sub_comma"
+                        }
+                        string_kind = ""
+                        token = ""
+                        token_had_escape = 0
+                        continue
+                    }
+                    token = token ch
+                    continue
+                }
+                if (mode == "before") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch != "{") fail()
+                    object_depth = 1
+                    mode = "top_key"
+                    continue
+                }
+                if (mode == "skip_nested") {
+                    if (ch == "\"") {
+                        in_string = 1
+                        string_kind = "skip"
+                        token = ""
+                        token_had_escape = 0
+                    } else if (ch == "{") {
+                        object_depth += 1
+                    } else if (ch == "}") {
+                        if (object_depth <= skip_floor_obj) fail()
+                        object_depth -= 1
+                        if (object_depth == skip_floor_obj && array_depth == 0) {
+                            mode = skip_return_mode
+                        }
+                    } else if (ch == "[") {
+                        array_depth += 1
+                    } else if (ch == "]") {
+                        if (array_depth <= 0) fail()
+                        array_depth -= 1
+                        if (object_depth == skip_floor_obj && array_depth == 0) {
+                            mode = skip_return_mode
+                        }
+                    }
+                    continue
+                }
+                if (mode == "top_key") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == "}") { object_depth = 0; root_closed = 1; continue }
+                    if (ch != "\"") fail()
+                    in_string = 1
+                    string_kind = "top_key"
+                    token = ""
+                    token_had_escape = 0
+                    continue
+                }
+                if (mode == "top_colon") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch != ":") fail()
+                    mode = "top_value"
+                    continue
+                }
+                if (mode == "top_value") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (top_key == parent) {
+                        if (saw_parent) fail()
+                        saw_parent = 1
+                        if (ch != "{") fail()
+                        object_depth = 2
+                        in_target_object = 1
+                        mode = "sub_key"
+                        continue
+                    }
+                    if (ch == "\"") {
+                        in_string = 1
+                        string_kind = "top_value"
+                        token = ""
+                        token_had_escape = 0
+                    } else if (ch == "{") {
+                        object_depth += 1
+                        skip_floor_obj = 1
+                        skip_return_mode = "top_comma"
+                        mode = "skip_nested"
+                    } else if (ch == "[") {
+                        array_depth += 1
+                        skip_floor_obj = 1
+                        skip_return_mode = "top_comma"
+                        mode = "skip_nested"
+                    } else {
+                        token = ch
+                        mode = "top_bare"
+                    }
+                    continue
+                }
+                if (mode == "top_bare") {
+                    if (ch == "," || ch == "}") {
+                        sub(/^[[:space:]]+/, "", token)
+                        sub(/[[:space:]]+$/, "", token)
+                        if (token == "" || token ~ /[[:space:]\"{}\[\],:]/) fail()
+                        token = ""
+                        if (ch == ",") mode = "top_key"
+                        else { object_depth = 0; root_closed = 1 }
+                    } else {
+                        token = token ch
+                    }
+                    continue
+                }
+                if (mode == "top_comma") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == ",") mode = "top_key"
+                    else if (ch == "}") { object_depth = 0; root_closed = 1 }
+                    else fail()
+                    continue
+                }
+                if (mode == "sub_key") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == "}") {
+                        object_depth = 1
+                        in_target_object = 0
+                        mode = "top_comma"
+                        continue
+                    }
+                    if (ch != "\"") fail()
+                    in_string = 1
+                    string_kind = "sub_key"
+                    token = ""
+                    token_had_escape = 0
+                    continue
+                }
+                if (mode == "sub_colon") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch != ":") fail()
+                    mode = "sub_value"
+                    continue
+                }
+                if (mode == "sub_value") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == "\"") {
+                        in_string = 1
+                        string_kind = "sub_value"
+                        token = ""
+                        token_had_escape = 0
+                    } else if (ch == "{") {
+                        if (sub_key == wanted) fail()
+                        object_depth += 1
+                        skip_floor_obj = 2
+                        skip_return_mode = "sub_comma"
+                        mode = "skip_nested"
+                    } else if (ch == "[") {
+                        if (sub_key == wanted) fail()
+                        array_depth += 1
+                        skip_floor_obj = 2
+                        skip_return_mode = "sub_comma"
+                        mode = "skip_nested"
+                    } else {
+                        token = ch
+                        mode = "sub_bare"
+                    }
+                    continue
+                }
+                if (mode == "sub_bare") {
+                    if (ch == "," || ch == "}") {
+                        sub(/^[[:space:]]+/, "", token)
+                        sub(/[[:space:]]+$/, "", token)
+                        if (token == "" || token ~ /[[:space:]\"{}\[\],:]/) fail()
+                        if (sub_key == wanted) emit(token)
+                        token = ""
+                        if (ch == ",") {
+                            mode = "sub_key"
+                        } else {
+                            object_depth = 1
+                            in_target_object = 0
+                            mode = "top_comma"
+                        }
+                    } else {
+                        token = token ch
+                    }
+                    continue
+                }
+                if (mode == "sub_comma") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == ",") mode = "sub_key"
+                    else if (ch == "}") {
+                        object_depth = 1
+                        in_target_object = 0
+                        mode = "top_comma"
+                    } else fail()
+                    continue
+                }
+            }
+        }
+        END {
+            if (failed || in_string || escaped || in_target_object || !root_closed \
+                || object_depth != 0 || array_depth != 0 || !saw_parent || !found) exit 2
+        }
+    ' "$json_file"
+}
+
+qualify_shard_binary_check_only() {
+    local node_binary="$1" preflight_json="$2" preflight_err="$3"
+    local report_mode report_model report_coordinator report_domain admitted_layers err_line
+    local preflight_executor=(command)
+    if [ ! -f "$MODEL_PATH" ] || [ -L "$MODEL_PATH" ] \
+        || ! as_target test -f "$MODEL_PATH" \
+        || ! as_target test -r "$MODEL_PATH"; then
+        SHARD_QUALIFICATION_REASON="target user $TARGET_USER cannot read regular model file $MODEL_PATH"
+        return 1
+    fi
+    if [ "$node_binary" = "$ARC_DIR/bin/arc-node" ]; then
+        preflight_executor=(as_target)
+    fi
+    if ! "${preflight_executor[@]}" "$node_binary" community-shard-worker \
+        --coordinator-url "$SHARD_COORDINATOR_URL" \
+        --coordinator-id "$SHARD_COORDINATOR_ID" \
+        --transaction-domain "$SHARD_TRANSACTION_DOMAIN" \
+        --expected-model-id "$SHARD_EXPECTED_MODEL_ID" \
+        --model-path "$MODEL_PATH" \
+        --worker-name arc-installer-preflight \
+        --max-working-set-bytes "$SHARD_MAX_WORKING_SET_BYTES" \
+        --max-resident-layers "$SHARD_REQUIRED_ADMITTED_LAYERS" \
+        --threads 1 \
+        --check-only > "$preflight_json" 2> "$preflight_err"; then
+        err_line="$(sed -n '1p' "$preflight_err" 2>/dev/null | tr -d '\r' || true)"
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only rejected the configuration${err_line:+: $err_line}"
+        return 1
+    fi
+    if [ ! -f "$preflight_json" ] || [ -L "$preflight_json" ] || [ ! -s "$preflight_json" ] \
+        || [ "$(wc -c < "$preflight_json" | tr -d ' ')" -gt 262144 ]; then
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only produced an invalid report file"
+        return 1
+    fi
+    report_mode="$(top_level_json_string "$preflight_json" mode)" || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only omitted top-level mode"
+        return 1
+    }
+    [ "$report_mode" = check-only ] || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only returned unexpected mode '$report_mode'"
+        return 1
+    }
+    report_model="$(top_level_json_string "$preflight_json" model_id)" || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only omitted model_id"
+        return 1
+    }
+    [ "$report_model" = "$SHARD_EXPECTED_MODEL_ID" ] || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only model_id mismatch"
+        return 1
+    }
+    report_coordinator="$(top_level_json_string "$preflight_json" coordinator_id)" || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only omitted coordinator_id"
+        return 1
+    }
+    [ "$report_coordinator" = "$SHARD_COORDINATOR_ID" ] || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only coordinator_id mismatch"
+        return 1
+    }
+    report_domain="$(top_level_json_string "$preflight_json" transaction_domain)" || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only omitted transaction_domain"
+        return 1
+    }
+    [ "$report_domain" = "$SHARD_TRANSACTION_DOMAIN" ] || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only transaction_domain mismatch"
+        return 1
+    }
+    admitted_layers="$(nested_object_json_bare "$preflight_json" admission admitted_max_resident_layers)" || {
+        SHARD_QUALIFICATION_REASON="community-shard-worker --check-only omitted canonical admission.admitted_max_resident_layers"
+        return 1
+    }
+    if ! canonical_uint "$admitted_layers" \
+        || [ "$admitted_layers" -lt "$SHARD_REQUIRED_ADMITTED_LAYERS" ]; then
+        SHARD_QUALIFICATION_REASON="admitted_max_resident_layers=${admitted_layers} is below the required ${SHARD_REQUIRED_ADMITTED_LAYERS}-layer network tile width"
+        return 1
+    fi
+    return 0
+}
+
+worker_policy_is_reconciled() {
+    local runner_path="$ARC_DIR/bin/run-arc-node"
+    [ "$WORKER_POLICY_PRESENT" = true ] || return 1
+    [ "$RUNNING_INSTALLER_SHA256" != stdin-unpinned ] || return 1
+    [ "$SAVED_INSTALLER_SHA256" = "$RUNNING_INSTALLER_SHA256" ] || return 1
+    [ "$SAVED_POLICY_REVISION" = "$CURRENT_WORKER_POLICY_REVISION" ] || return 1
+    [ "$SAVED_CONFIGURED_WORKER_MODE" = "$CONFIGURED_WORKER_MODE" ] || return 1
+    [ "$SAVED_POLICY_MODEL_PATH" = "$MODEL_PATH" ] || return 1
+    [ -f "$runner_path" ] && [ ! -L "$runner_path" ] && [ -x "$runner_path" ] || return 1
+    case "$SAVED_RESOLVED_WORKER_MODE" in
+        observer)
+            [ -z "$MODEL_PATH" ] || return 1
+            grep -Fq -- '--community-mode' "$runner_path" || return 1
+            ! grep -Fq -- '--full-integer-worker' "$runner_path" || return 1
+            ! grep -Fq -- '--community-shard-worker' "$runner_path" || return 1
+            ! grep -Fq -- '--model' "$runner_path" || return 1
+            ;;
+        full)
+            [ -n "$MODEL_PATH" ] || return 1
+            grep -Fq -- '--community-mode' "$runner_path" || return 1
+            grep -Fq -- '--full-integer-worker' "$runner_path" || return 1
+            ! grep -Fq -- '--community-shard-worker' "$runner_path" || return 1
+            if [ "$CONFIGURED_WORKER_MODE" = auto ] \
+                && [ -f "$ARC_DIR/bin/arc-node" ] && [ ! -L "$ARC_DIR/bin/arc-node" ] \
+                && [ -x "$ARC_DIR/bin/arc-node" ]; then
+                if qualify_shard_host_memory \
+                    && qualify_shard_binary_check_only "$ARC_DIR/bin/arc-node" \
+                        "$TMP_DIR/reassess-shard-check-only.json" \
+                        "$TMP_DIR/reassess-shard-check-only.err"; then
+                    return 1
+                fi
+            fi
+            ;;
+        shard)
+            [ -n "$MODEL_PATH" ] || return 1
+            grep -Fq -- '--community-shard-worker' "$runner_path" || return 1
+            grep -Fq -- "$SHARD_COORDINATOR_URL" "$runner_path" || return 1
+            grep -Fq -- "$SHARD_COORDINATOR_ID" "$runner_path" || return 1
+            grep -Fq -- "$SHARD_TRANSACTION_DOMAIN" "$runner_path" || return 1
+            grep -Fq -- "$SHARD_EXPECTED_MODEL_ID" "$runner_path" || return 1
+            ! grep -Fq -- '--full-integer-worker' "$runner_path" || return 1
+            ! grep -Fq -- '--community-mode' "$runner_path" || return 1
+            ! grep -Fq -- '--community-rpc-url' "$runner_path" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 select_headless_channel_version() {
     local releases_url="$API_ROOT/releases?per_page=100"
     local tag candidate_version comparison candidate_metadata
@@ -2905,8 +3732,11 @@ if [ -n "$INSTALLED_VERSION" ]; then
     fi
     if [ "$UPDATE_ONLY" = true ] && [ "$COMPARISON" -eq 0 ] \
         && [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
-        ok "Already up to date at v$INSTALLED_VERSION"
-        exit 0
+        if worker_policy_is_reconciled; then
+            ok "Already up to date at v$INSTALLED_VERSION"
+            exit 0
+        fi
+        info "Reconciling headless worker launcher policy at v$INSTALLED_VERSION"
     fi
 fi
 
@@ -2949,16 +3779,6 @@ printf '%s\n' "$RESOLVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
     || die "Signed release manifest targets the wrong source commit"
 [ "$(grep -Ec '^# ' "$TMP_DIR/SHA256SUMS")" -eq 4 ] \
     || die "Signed release manifest contains unexpected metadata fields"
-
-sha256_file() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{print $1}'
-    else
-        die "sha256sum (Linux) or shasum (macOS) is required"
-    fi
-}
 
 verify_file() {
     local file="$1"
@@ -3163,7 +3983,7 @@ publish_legacy_retirement_file() {
     parent="$(dirname -- "$destination")"
     staged="$(install_root_as_owner mktemp "$parent/.arc-retirement.new.XXXXXX")" \
         || die "Could not reserve $label"
-    if ! install_root_as_owner cp -- "$source" "$staged" \
+    if ! copy_to_install_owner "$source" "$staged" \
         || ! install_root_as_owner chmod 600 "$staged"; then
         install_root_as_owner rm -f -- "$staged" || true
         die "Could not stage $label"
@@ -3646,7 +4466,7 @@ atomic_copy() {
         fi
         as_root mv -f -- "$staged" "$destination" || return 1
     else
-        install_root_as_owner cp -- "$source" "$staged" || return 1
+        copy_to_install_owner "$source" "$staged" true || return 1
         install_root_as_owner chmod "$mode" "$staged" || return 1
         install_root_as_owner mv -f -- "$staged" "$destination" || return 1
     fi
@@ -3695,6 +4515,15 @@ snapshot_transaction_path() {
     done
     local index="${#TRANSACTION_PATHS[@]}"
     local backup="$TMP_DIR/transaction-backup-$index"
+
+    if transaction_crosses_user_boundary "$executor"; then
+        if [ -z "$USER_TRANSACTION_TMP_DIR" ]; then
+            USER_TRANSACTION_TMP_DIR="$(install_root_as_owner mktemp -d \
+                "$ARC_DIR/.install-backup.XXXXXX")" \
+                || die "Could not create private transaction snapshots as $TARGET_USER"
+        fi
+        backup="$USER_TRANSACTION_TMP_DIR/transaction-backup-$index"
+    fi
 
     if run_transaction_executor "$executor" test -L "$path"; then
         die "Refusing symlinked managed install path: $path"
@@ -3828,6 +4657,7 @@ begin_install_transaction() {
     snapshot_transaction_path "$ARC_DIR/node.env"
     snapshot_transaction_path "$ARC_DIR/bin/run-arc-node"
     snapshot_transaction_path "$CONFIG_FILE"
+    snapshot_transaction_path "$WORKER_POLICY_FILE"
 
     case "$SERVICE_SCOPE" in
         system)
@@ -3886,18 +4716,6 @@ transactional_copy() {
 remove_transaction_path() {
     local path="$1" executor="${2:-install}"
     run_transaction_executor "$executor" rm -f -- "$path"
-}
-
-launchd_service_pid() {
-    local label="$1" output
-    output="$(launchctl print "$LAUNCHD_DOMAIN/$label" 2>/dev/null)" || return 1
-    printf '%s\n' "$output" | awk '
-        $1 == "pid" {
-            if ($2 != "=" || $3 !~ /^[1-9][0-9]*$/ || ++count > 1) exit 2
-            pid = $3
-        }
-        END { if (count == 1) print pid }
-    '
 }
 
 stop_launchd_node_gracefully() {
@@ -4312,10 +5130,40 @@ commit_install_transaction() {
     TRANSACTION_ACTIVE=false
 }
 
+qualify_shard_worker_preflight() {
+    qualify_shard_binary_check_only "$TMP_DIR/$NODE_ASSET" \
+        "$TMP_DIR/shard-worker-check-only.json" \
+        "$TMP_DIR/shard-worker-check-only.err"
+}
+
+resolve_worker_runtime_mode() {
+    if [ -z "$MODEL_PATH" ]; then
+        if [ "$CONFIGURED_WORKER_MODE" = shard ]; then
+            die "--worker-mode shard requires --model /absolute/model.gguf"
+        fi
+        RESOLVED_WORKER_MODE=observer
+        return 0
+    fi
+    if [ "$CONFIGURED_WORKER_MODE" = full ]; then
+        RESOLVED_WORKER_MODE=full
+        return 0
+    fi
+    if qualify_shard_host_memory && qualify_shard_worker_preflight; then
+        RESOLVED_WORKER_MODE=shard
+        return 0
+    fi
+    if [ "$CONFIGURED_WORKER_MODE" = shard ]; then
+        die "Shard worker preflight failed: $SHARD_QUALIFICATION_REASON"
+    fi
+    warn "Partial-shard preflight did not qualify ($SHARD_QUALIFICATION_REASON); falling back to whole-model worker mode"
+    RESOLVED_WORKER_MODE=full
+}
+
 if [ "$SERVICE_SCOPE" = system ]; then PROGRAM_MODE=755; CONFIG_MODE=644
 else PROGRAM_MODE=700; CONFIG_MODE=600
 fi
 verify_legacy_v07_network_retirement
+resolve_worker_runtime_mode
 begin_install_transaction
 create_legacy_retirement_intent
 if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
@@ -4415,14 +5263,37 @@ NODE_ARGS=(
     --eth-rpc-port 0
     --data-dir "$NODE_DATA_DIR"
     --validator-key-file "$KEY_FILE"
-    --community-mode
 )
-for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
-    NODE_ARGS+=(--community-rpc-url "$origin")
-done
-if [ -n "$MODEL_PATH" ]; then
-    NODE_ARGS+=(--model "$MODEL_PATH" --full-integer-worker)
-fi
+case "$RESOLVED_WORKER_MODE" in
+    observer)
+        NODE_ARGS+=(--community-mode)
+        for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
+            NODE_ARGS+=(--community-rpc-url "$origin")
+        done
+        ;;
+    full)
+        NODE_ARGS+=(--community-mode)
+        for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
+            NODE_ARGS+=(--community-rpc-url "$origin")
+        done
+        NODE_ARGS+=(--model "$MODEL_PATH" --full-integer-worker)
+        ;;
+    shard)
+        NODE_ARGS+=(
+            --threads 1
+            --community-shard-worker
+            --community-shard-coordinator-url "$SHARD_COORDINATOR_URL"
+            --community-shard-coordinator-id "$SHARD_COORDINATOR_ID"
+            --community-shard-transaction-domain "$SHARD_TRANSACTION_DOMAIN"
+            --community-shard-expected-model-id "$SHARD_EXPECTED_MODEL_ID"
+            --community-shard-max-working-set-bytes "$SHARD_MAX_WORKING_SET_BYTES"
+            --model "$MODEL_PATH"
+        )
+        ;;
+    *)
+        rollback_and_die "Unexpected resolved worker mode: $RESOLVED_WORKER_MODE"
+        ;;
+esac
 
 {
     printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
@@ -4442,6 +5313,16 @@ transactional_copy "$TMP_DIR/run-arc-node" "$ARC_DIR/bin/run-arc-node" "$PROGRAM
     printf 'service_scope=%s\n' "$SERVICE_SCOPE"
 } > "$TMP_DIR/install.conf"
 transactional_copy "$TMP_DIR/install.conf" "$CONFIG_FILE" "$CONFIG_MODE" root
+
+{
+    printf '%s\n' '# ARC worker policy v1'
+    printf 'policy_revision=%s\n' "$CURRENT_WORKER_POLICY_REVISION"
+    printf 'installer_sha256=%s\n' "$RUNNING_INSTALLER_SHA256"
+    printf 'configured_worker_mode=%s\n' "$CONFIGURED_WORKER_MODE"
+    printf 'resolved_worker_mode=%s\n' "$RESOLVED_WORKER_MODE"
+    printf 'model_path=%s\n' "$MODEL_PATH"
+} > "$TMP_DIR/worker-policy.conf"
+transactional_copy "$TMP_DIR/worker-policy.conf" "$WORKER_POLICY_FILE" "$CONFIG_MODE" root
 
 systemd_escape() {
     local value="$1"
@@ -4801,6 +5682,10 @@ printf '  Service:     %s\n' "$SERVICE_SCOPE"
 printf '  Identity:    %s (preserved on upgrades; key material never printed)\n' "$KEY_FILE"
 if [ -z "$MODEL_PATH" ]; then
     printf '  Inference:   observer/router only; rerun with --model /absolute/model.gguf to serve local inference\n'
+elif [ "$RESOLVED_WORKER_MODE" = shard ]; then
+    printf '  Model:       %s\n' "$MODEL_PATH"
+    printf '  Worker mode: partial-shard (%s, configured=%s)\n' "$SHARD_COORDINATOR_URL" "$CONFIGURED_WORKER_MODE"
 else
     printf '  Model:       %s\n' "$MODEL_PATH"
+    printf '  Worker mode: full-integer-worker (configured=%s)\n' "$CONFIGURED_WORKER_MODE"
 fi

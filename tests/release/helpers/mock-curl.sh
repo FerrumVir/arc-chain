@@ -66,11 +66,30 @@ render_fake_binary() {
         printf 'fi\n'
         if [ "$program" = arc-node ]; then
             descriptor_output="{\"status\":\"VERIFIED_DESCRIPTOR_QUORUM\",\"manifest_hash\":\"$(printf '%064d' 1)\",\"signing_hash\":\"$(printf '%064d' 8)\",\"network_genesis_hash\":\"$(printf '%064d' 3)\",\"recovery_domain\":\"$(printf '%064d' 2)\",\"recovery_epoch\":1,\"validator_set_id\":1,\"source_height\":137145,\"transition_height\":137146,\"validator_count\":6,\"verified_signature_count\":5,\"signed_stake\":33333334,\"total_stake\":40000000}"
-            # shellcheck disable=SC2016 # Generate this literal command gate.
+            # shellcheck disable=SC2016
             printf 'if [ "${1:-}:${2:-}" = "recovery:verify-descriptor" ]; then\n'
             printf "    printf '%%s\\n' '%s'\n" "$descriptor_output"
             printf '    exit 0\n'
             printf 'fi\n'
+            # shellcheck disable=SC2016
+            printf '%s\n' \
+                'if [ "${1:-}" = "operator" ]; then' \
+                '    printf "error: unrecognized subcommand '\''operator'\''\n" >&2' \
+                '    exit 2' \
+                'fi' \
+                'if [ "${1:-}" = "community-shard-worker" ]; then' \
+                '    [ -z "${ARC_TEST_SHARD_PREFLIGHT_LOG:-}" ] || printf "exec_user=%s bin=%s %s\n" "${MOCK_EXECUTING_AS_USER:-${MOCK_CURRENT_USER:-installer}}" "$0" "$*" >>"$ARC_TEST_SHARD_PREFLIGHT_LOG"' \
+                '    shift; model_path=""; coordinator_id=""; domain=""; expected_model=""; budget=0; check_only=false' \
+                '    while [ "$#" -gt 0 ]; do case "$1" in --model-path) model_path="$2"; shift 2 ;; --coordinator-id) coordinator_id="$2"; shift 2 ;; --transaction-domain) domain="$2"; shift 2 ;; --expected-model-id) expected_model="$2"; shift 2 ;; --max-working-set-bytes) budget="$2"; shift 2 ;; --check-only) check_only=true; shift ;; --coordinator-url|--worker-name|--max-resident-layers|--threads) shift 2 ;; *) exit 61 ;; esac; done' \
+                '    [ "$check_only" = true ] || exit 62' \
+                '    if [ -n "${MOCK_SHARD_CHECK_RAW_OUTPUT:-}" ]; then printf "%s\n" "$MOCK_SHARD_CHECK_RAW_OUTPUT"; exit "${MOCK_SHARD_CHECK_EXIT_CODE:-0}"; fi' \
+                '    [ -f "$model_path" ] || { printf "missing model\n" >&2; exit 63; }' \
+                '    if [ "$(sed -n '\''1p'\'' "$model_path")" != "ARC_MOCK_CANONICAL_SHARD_MODEL_V1" ]; then printf "model commitment mismatch\n" >&2; exit 64; fi' \
+                '    if [ -n "${MOCK_SHARD_ADMITTED_LAYERS:-}" ]; then admitted="$MOCK_SHARD_ADMITTED_LAYERS"; elif [ "$budget" -lt 536870912 ]; then printf "working set budget below minimum\n" >&2; exit 65; elif [ "$budget" -lt 5843224785 ]; then admitted=5; else admitted=6; fi' \
+                '    report_model="${MOCK_SHARD_REPORT_MODEL_ID:-$expected_model}"' \
+                '    printf '\''{"mode":"check-only","model_id":"%s","coordinator_id":"%s","transaction_domain":"%s","n_layers":32,"admission":{"protocol_max_resident_layers":16,"requested_max_resident_layers":6,"admitted_max_resident_layers":%s}}\n'\'' "$report_model" "$coordinator_id" "$domain" "$admitted"' \
+                '    exit "${MOCK_SHARD_CHECK_EXIT_CODE:-0}"' \
+                'fi'
             printf 'sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '\''{print $1}'\''; else shasum -a 256 "$1" | awk '\''{print $1}'\''; fi; }\n'
             # shellcheck disable=SC2016 # Generate the mock retirement CLI literally.
             printf 'if [ "${1:-}:${2:-}" = "legacy-retirement:create-intent" ]; then\n'
@@ -141,7 +160,11 @@ render_asset() {
                 'stake = 5_000_000' >"$destination"
             ;;
         install.sh)
-            printf '#!/usr/bin/env bash\n# release v%s\nexit 0\n' "$version" >"$destination"
+            if [ -n "${MOCK_INSTALL_SH_SOURCE_FILE:-}" ]; then
+                cp "$MOCK_INSTALL_SH_SOURCE_FILE" "$destination"
+            else
+                printf '#!/usr/bin/env bash\nprintf '\''stub-installer %s\\n'\'' >/dev/null\nexit 0\n' "$version" >"$destination"
+            fi
             chmod +x "$destination"
             ;;
         arc-cutover-policy.json)

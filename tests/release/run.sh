@@ -39,7 +39,9 @@ for test_file in \
     "$TEST_DIR/release_assembly_test.sh" \
     "$TEST_DIR/release_manifest_signature_test.sh" \
     "$TEST_DIR/signing_key_backup_behavior_test.sh" \
-    "$TEST_DIR/installer_behavior_test.sh"
+    "$TEST_DIR/installer_behavior_test.sh" \
+    "$TEST_DIR/installer_shard_worker_test.sh" \
+    "$TEST_DIR/installer_user_transaction_test.sh"
 do
     printf '# %s\n' "${test_file##*/}"
     /bin/bash "$test_file" || status=1

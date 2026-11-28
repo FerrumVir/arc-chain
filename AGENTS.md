@@ -523,6 +523,23 @@ request-success evidence.
 
 ## Releases and versions
 
+The candidate headless installer defaults `--worker-mode` to `auto`. With a
+model it qualifies the pinned community partial-shard mode through the node's
+offline `community-shard-worker --check-only` command. The qualification requires
+the desktop's nominal 16 GB floor, six admitted layers and a bounded working-set
+budget. Memory credit comes only from a matching managed worker that the
+transaction will stop. Explicit `full` persists; `shard` refuses failed
+qualification before stopping the old service; no model remains observer-only.
+The separate `worker-policy.conf` records configured and resolved modes, model,
+policy revision and the running installer's digest. Same-version updates
+reconcile missing or stale policy and reassess automatic whole-model fallbacks.
+The policy participates in service rollback. Root-owned staging streams bytes
+to the target user for user-owned installs, while that user's transaction
+snapshots stay in a separate private directory; the release staging directory
+remains private to the installer. Signed release verification,
+legacy migration fences and data preservation remain required. Installer
+regressions run in the remote release-contract gate for this candidate.
+
 The macOS bundle sealer reads the release version from the repository Tauri
 configuration and rejects mismatched app identity or version before modifying
 packages. Archive and DMG verification use the same captured version.

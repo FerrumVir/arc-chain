@@ -29,6 +29,12 @@ All notable changes to ARC Chain are tracked here. This project follows
 - One deadline wrapper prevents cancelled or replaced callbacks from running
   stale checks or clearing a newer wait. Seventeen regressions and a reference
   model cover delayed delivery, disable, dispose and same-clock replacement.
+- Headless installs select partial shards automatically when the pinned model,
+  nominal RAM floor and offline admission report qualify. Explicit full mode
+  remains available, and automatic fallback is reassessed on later updates.
+- Same-version updates reconcile stale launcher policy after the installer
+  replaces itself. Policy, launcher and service changes roll back together if
+  activation fails; existing identity and chain data remain preserved.
 
 ## v0.8.26 - Release-preparation snapshot (2026-11-27)
 
