@@ -1,3 +1,4 @@
+import { UpdateDeadline } from "../src/lib/update-deadline";
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -101,7 +102,254 @@ class FakeTimers implements UpdateTimers {
   }
 }
 
+function updateCheckHarness() {
+  const timers = new FakeTimers();
+  const callbacks: Array<() => void> = [];
+  let checks = 0;
+  const controller = createUpdateController(
+    {
+      supported: true,
+      now: timers.now,
+      check: async () => {
+        checks += 1;
+        return null;
+      },
+      prepareRelaunch: async () => {},
+      beginHandoff: async () => {},
+      abortRelaunch: async () => {},
+      relaunch: async () => {},
+    },
+    { startupDelayMs: 10, intervalMs: 10_000 },
+    {
+      setTimeout: (callback, delay) => {
+        callbacks.push(callback);
+        return timers.setTimeout(callback, delay);
+      },
+      clearTimeout: timers.clearTimeout,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    },
+  );
+  return { controller, timers, callbacks, checks: () => checks };
+}
+
+function retryDeadlineHarness(kind: "check" | "busy" | "reconciliation") {
+  const timers = new FakeTimers();
+  const callbacks: Array<{ callback: () => void; delay: number }> = [];
+  let attempts = 0;
+  const reconciling = "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
+  const prepare = async () => {
+    attempts += 1;
+    if (kind === "reconciliation") throw new Error(reconciling);
+    return { status: "busy" as const, reason: "inference active", activeJobs: 1 };
+  };
+  const controller = createUpdateController(
+    {
+      supported: true,
+      now: timers.now,
+      check: async () => {
+        if (kind === "check") {
+          attempts += 1;
+          throw new Error("offline");
+        }
+        return { version: "0.8.27", download: async () => {}, install: async () => {} };
+      },
+      tryPrepareAutoUpdateRelaunch: prepare,
+      prepareRelaunch: async () => { await prepare(); },
+      beginHandoff: async () => {},
+      abortRelaunch: async () => {},
+      relaunch: async () => {},
+    },
+    { startupDelayMs: 10, intervalMs: 1_000_000, retryDelaysMs: [20, 40, 80], busyRetryMs: 20 },
+    {
+      setTimeout: (callback, delay) => {
+        callbacks.push({ callback, delay });
+        return timers.setTimeout(callback, delay);
+      },
+      clearTimeout: timers.clearTimeout,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    },
+  );
+  const flush = async () => {
+    await timers.advanceBy(0);
+    await timers.advanceBy(0);
+  };
+  return {
+    controller, timers, callbacks, flush, attempts: () => attempts,
+    retryDelay: kind === "reconciliation" ? UPDATE_RECONCILIATION_RETRY_MS : 20,
+    async start() {
+      controller.setAutoChecksEnabled(true);
+      if (kind !== "check") controller.setAutoInstallEnabled(true);
+      await timers.advanceBy(10);
+      await flush();
+    },
+  };
+}
+
 test.describe("UpdateController", () => {
+  for (const kind of ["check", "busy", "reconciliation"] as const) {
+    test(`${kind} retry deadline recovers once and ignores stale delivery`, async () => {
+      const h = retryDeadlineHarness(kind);
+      await h.start();
+      expect(h.attempts()).toBe(1);
+      const original = h.callbacks.find((item) => item.delay === h.retryDelay)!.callback;
+      await h.timers.skipWithoutFiring(h.retryDelay);
+      h.controller.signal("tick");
+      await h.flush();
+      expect(h.attempts()).toBe(2);
+      original();
+      await h.flush();
+      expect(h.attempts()).toBe(2);
+      await h.timers.skipWithoutFiring(kind === "check" ? 40 : h.retryDelay);
+      h.controller.signal("tick");
+      await h.flush();
+      expect(h.attempts()).toBe(3);
+      h.controller.dispose();
+    });
+
+    test(`${kind} retry deadline cannot replace a reenabled wait`, async () => {
+      const h = retryDeadlineHarness(kind);
+      await h.start();
+      const original = h.callbacks.find((item) => item.delay === h.retryDelay)!.callback;
+      if (kind === "check") {
+        h.controller.setAutoChecksEnabled(false);
+        h.controller.setAutoChecksEnabled(true);
+        await h.timers.advanceBy(10);
+      } else {
+        h.controller.setAutoInstallEnabled(false);
+        h.controller.setAutoInstallEnabled(true);
+      }
+      await h.flush();
+      expect(h.attempts()).toBe(2);
+      original();
+      await h.flush();
+      expect(h.attempts()).toBe(2);
+      await h.timers.skipWithoutFiring(h.retryDelay);
+      h.controller.signal("tick");
+      await h.flush();
+      expect(h.attempts()).toBe(3);
+      h.controller.dispose();
+    });
+  }
+
+  for (const stop of ["disable", "dispose"] as const) {
+    test(`a failed-check retry cannot run after ${stop}`, async () => {
+      const h = retryDeadlineHarness("check");
+      await h.start();
+      const original = h.callbacks.find((item) => item.delay === h.retryDelay)!.callback;
+      if (stop === "disable") h.controller.setAutoChecksEnabled(false);
+      else h.controller.dispose();
+      original();
+      await h.flush();
+      expect(h.attempts()).toBe(1);
+      h.controller.dispose();
+    });
+  }
+
+  test("a manual reconciliation deadline recovers while automatic checks are off", async () => {
+    const h = retryDeadlineHarness("reconciliation");
+    await h.controller.checkForUpdates("manual");
+    await h.controller.installAvailableUpdate();
+    expect(h.attempts()).toBe(1);
+    const original = h.callbacks.find((item) => item.delay === h.retryDelay)!.callback;
+    await h.timers.skipWithoutFiring(h.retryDelay);
+    h.controller.signal("tick");
+    await h.flush();
+    expect(h.attempts()).toBe(2);
+    original();
+    await h.flush();
+    expect(h.attempts()).toBe(2);
+    h.controller.dispose();
+  });
+
+  test("native tick recovers a suspended startup check exactly once", async () => {
+    const h = updateCheckHarness();
+    h.controller.setAutoChecksEnabled(true);
+    const originalStartup = h.callbacks[0];
+    await h.timers.skipWithoutFiring(11);
+    h.controller.signal("tick");
+    await h.timers.advanceBy(0);
+    expect(h.checks()).toBe(1);
+
+    originalStartup();
+    await h.timers.advanceBy(10);
+    expect(h.checks()).toBe(1);
+    h.controller.dispose();
+  });
+
+  for (const stop of ["disable", "dispose"] as const) {
+    test(`a queued startup callback cannot check after ${stop}`, async () => {
+      const h = updateCheckHarness();
+      h.controller.setAutoChecksEnabled(true);
+      const originalStartup = h.callbacks[0];
+      if (stop === "disable") h.controller.setAutoChecksEnabled(false);
+      else h.controller.dispose();
+      originalStartup();
+      await h.timers.advanceBy(11);
+      h.controller.signal("tick");
+      expect(h.checks()).toBe(0);
+      h.controller.dispose();
+    });
+  }
+
+  test("a previous startup callback cannot consume a reenabled deadline", async () => {
+    const h = updateCheckHarness();
+    h.controller.setAutoChecksEnabled(true);
+    const originalStartup = h.callbacks[0];
+    h.controller.setAutoChecksEnabled(false);
+    h.controller.setAutoChecksEnabled(true);
+    originalStartup();
+    await h.timers.advanceBy(0);
+    expect(h.checks()).toBe(0);
+    await h.timers.advanceBy(10);
+    expect(h.checks()).toBe(1);
+    h.controller.dispose();
+  });
+
+  test("an overdue interval ignores its late callback after native tick recovery", async () => {
+    const h = updateCheckHarness();
+    h.controller.setAutoChecksEnabled(true);
+    const originalInterval = h.callbacks[1];
+    await h.timers.advanceBy(10);
+    await h.timers.skipWithoutFiring(10_000);
+    h.controller.signal("tick");
+    await h.timers.advanceBy(0);
+    expect(h.checks()).toBe(2);
+    originalInterval();
+    await h.timers.advanceBy(0);
+    expect(h.checks()).toBe(2);
+    h.controller.dispose();
+  });
+
+  for (const stop of ["disable", "dispose"] as const) {
+    test(`a queued interval callback cannot check after ${stop}`, async () => {
+      const h = updateCheckHarness();
+      h.controller.setAutoChecksEnabled(true);
+      const originalInterval = h.callbacks[1];
+      if (stop === "disable") h.controller.setAutoChecksEnabled(false);
+      else h.controller.dispose();
+      originalInterval();
+      await h.timers.advanceBy(20_000);
+      expect(h.checks()).toBe(0);
+      h.controller.dispose();
+    });
+  }
+
+  test("a previous interval callback cannot replace a reenabled deadline", async () => {
+    const h = updateCheckHarness();
+    h.controller.setAutoChecksEnabled(true);
+    const originalInterval = h.callbacks[1];
+    h.controller.setAutoChecksEnabled(false);
+    h.controller.setAutoChecksEnabled(true);
+    originalInterval();
+    await h.timers.advanceBy(0);
+    expect(h.checks()).toBe(0);
+    await h.timers.advanceBy(10_000);
+    expect(h.checks()).toBe(2);
+    h.controller.dispose();
+  });
+
   test("checks after startup and periodically only while enabled", async () => {
     const timers = new FakeTimers();
     let checkCalls = 0;
@@ -1862,5 +2110,85 @@ test.describe("UpdateController", () => {
     expect(PLAIN_COPY.updates.wrongLocation).toMatch(/^ARC can't update itself/);
     expect(PLAIN_COPY.updates.wrongLocation).toContain("Quit ARC");
     expect(PLAIN_COPY.updates.wrongLocation).toContain("Applications folder");
+  });
+});
+
+
+test.describe("UpdateDeadline", () => {
+  test("matches a reference model through delayed, repeated and cancelled callbacks", () => {
+    for (let seed = 1; seed <= 128; seed += 1) {
+      let random = seed;
+      const next = () => { random = (Math.imul(random, 1664525) + 1013904223) >>> 0; return random; };
+      let now = 0;
+      let nextId = 0;
+      let active: { id: number; dueAt: number } | null = null;
+      const delivered: number[] = [];
+      const expected: number[] = [];
+      const callbacks: Array<{ id: number; callback: () => void }> = [];
+      const deadline = new UpdateDeadline({
+        setTimeout: (callback) => {
+          callbacks.push({ id: nextId, callback });
+          return nextId;
+        },
+        clearTimeout: () => {},
+      }, () => now);
+      for (let step = 0; step < 64; step += 1) {
+        const action = next() % 5;
+        if (action === 0 || callbacks.length === 0) {
+          const id = ++nextId;
+          active = { id, dueAt: now + 3 };
+          deadline.schedule(() => delivered.push(id), 3);
+        } else if (action === 1) {
+          active = null;
+          deadline.clear();
+        } else if (action === 2) {
+          now += 4;
+          if (active && active.dueAt <= now) {
+            expected.push(active.id);
+            active = null;
+          }
+          deadline.runOverdue(now);
+        } else {
+          const captured = callbacks[next() % callbacks.length];
+          if (active?.id === captured.id) {
+            expected.push(active.id);
+            active = null;
+          }
+          captured.callback();
+        }
+        expect(delivered, `seed=${seed}, step=${step}`).toEqual(expected);
+        expect(deadline.pending).toBe(active !== null);
+      }
+    }
+  });
+
+  test("a callback may schedule its successor without a stale delivery clearing it", () => {
+    let now = 0;
+    const callbacks: Array<() => void> = [];
+    const delivered: number[] = [];
+    const deadline = new UpdateDeadline({
+      setTimeout: (callback) => { callbacks.push(callback); return callbacks.length; },
+      clearTimeout: () => {},
+    }, () => now);
+    deadline.schedule(() => {
+      delivered.push(1);
+      deadline.schedule(() => delivered.push(2), 5);
+    }, 5);
+    now = 5;
+    deadline.runOverdue(now);
+    callbacks[0]();
+    expect(delivered).toEqual([1]);
+    expect(deadline.pending).toBe(true);
+    now = 10;
+    deadline.runOverdue(now);
+    callbacks[1]();
+    expect(delivered).toEqual([1, 2]);
+    expect(deadline.pending).toBe(false);
+  });
+
+  test("controller scheduling stays inside the deadline wrapper", () => {
+    const source = fs.readFileSync(path.resolve(__dirnameHere, "../src/lib/update-controller.ts"), "utf8");
+    const controller = source.slice(source.indexOf("export class UpdateController"));
+    expect(controller, "Use UpdateDeadline so cancellation fences and native ticks cover every timer.").not.toMatch(/\.(?:setTimeout|setInterval|clearTimeout|clearInterval)\s*\(/);
   });
 });

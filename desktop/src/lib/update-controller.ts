@@ -1,3 +1,4 @@
+import { UpdateDeadline, type UpdateDeadlineTimers } from "./update-deadline";
 import type { AutoUpdatePrepareResult } from "./types";
 import { PLAIN_COPY } from "./plain-copy";
 import { isStartupReconciliationInProgress } from "./start-failure";
@@ -73,9 +74,7 @@ export interface UpdateSchedule {
 
 type UpdateCheckSource = "automatic" | "manual" | "retry";
 
-export interface UpdateTimers {
-  setTimeout: (callback: () => void, delayMs: number) => unknown;
-  clearTimeout: (handle: unknown) => void;
+export interface UpdateTimers extends UpdateDeadlineTimers {
   setInterval: (callback: () => void, delayMs: number) => unknown;
   clearInterval: (handle: unknown) => void;
 }
@@ -119,15 +118,12 @@ export class UpdateController {
   private checkInFlight: Promise<UpdateSnapshot> | null = null;
   private automaticCheckRequestedInFlight = false;
   private installInFlight: Promise<UpdateSnapshot> | null = null;
-  private startupTimer: unknown | null = null;
-  private intervalTimer: unknown | null = null;
-  private retryTimer: unknown | null = null;
-  private autoInstallRetryTimer: unknown | null = null;
-  private intervalDueAt: number | null = null;
-  private retryDueAt: number | null = null;
-  private autoInstallRetryDueAt: number | null = null;
+  private readonly startupCheck: UpdateDeadline;
+  private readonly intervalCheck: UpdateDeadline;
+  private readonly retryCheck: UpdateDeadline;
+  private readonly autoInstallRetry: UpdateDeadline;
+  private readonly reconciliationRetry: UpdateDeadline;
   private lastCheckStartedAt: number | null = null;
-  private reconciliationRetryTimer: unknown | null = null;
   private reconciliationWaitManual = false;
   private automaticFailureCount = 0;
   private autoInstallDeferralCount = 0;
@@ -143,8 +139,13 @@ export class UpdateController {
   constructor(
     private readonly runtime: UpdateRuntime,
     schedule: UpdateSchedule = {},
-    private readonly timers: UpdateTimers = BROWSER_TIMERS,
+    timers: UpdateTimers = BROWSER_TIMERS,
   ) {
+    this.startupCheck = new UpdateDeadline(timers, () => this.now());
+    this.intervalCheck = new UpdateDeadline(timers, () => this.now());
+    this.retryCheck = new UpdateDeadline(timers, () => this.now());
+    this.autoInstallRetry = new UpdateDeadline(timers, () => this.now());
+    this.reconciliationRetry = new UpdateDeadline(timers, () => this.now());
     this.startupDelayMs =
       schedule.startupDelayMs ?? UPDATE_STARTUP_DELAY_MS;
     this.intervalMs = schedule.intervalMs ?? UPDATE_CHECK_INTERVAL_MS;
@@ -174,8 +175,8 @@ export class UpdateController {
 
     if (!enabled || !this.runtime.supported) return;
 
-    this.startupTimer = this.timers.setTimeout(() => {
-      this.startupTimer = null;
+    this.startupCheck.schedule(() => {
+      if (!this.autoChecksEnabled || !this.runtime.supported) return;
       void this.checkForUpdates("automatic");
     }, this.startupDelayMs);
 
@@ -183,24 +184,24 @@ export class UpdateController {
   }
 
   private scheduleIntervalCheck(): void {
-    this.intervalDueAt = this.now() + this.intervalMs;
-    this.intervalTimer = this.timers.setTimeout(() => {
-      this.intervalTimer = null;
+    this.intervalCheck.schedule(() => {
+      if (!this.autoChecksEnabled || !this.runtime.supported) return;
       this.runIntervalCheck();
     }, this.intervalMs);
   }
 
   private runIntervalCheck(): void {
     this.scheduleIntervalCheck();
-    if (this.retryTimer !== null) return;
+    if (this.retryCheck.pending) return;
     this.automaticFailureCount = 0;
     void this.checkForUpdates("automatic");
   }
 
   signal(signal: UpdateSignal): void {
-    if (!this.autoChecksEnabled || !this.runtime.supported) return;
-    if (this.snapshot.restartRequired) return;
+    if (!this.runtime.supported || this.snapshot.restartRequired) return;
     const now = this.now();
+    if (this.reconciliationWaitManual) this.reconciliationRetry.runOverdue(now);
+    if (!this.autoChecksEnabled) return;
     this.runOverdue(now);
     if (signal === "tick" || this.candidate !== null) return;
     if (
@@ -213,32 +214,11 @@ export class UpdateController {
   }
 
   private runOverdue(now: number): void {
-    if (
-      this.autoInstallRetryTimer !== null &&
-      this.autoInstallRetryDueAt !== null &&
-      this.autoInstallRetryDueAt <= now
-    ) {
-      const fire = this.autoInstallRetryFire;
-      this.clearAutoInstallRetryTimer();
-      fire?.();
-    }
-    if (
-      this.retryTimer !== null &&
-      this.retryDueAt !== null &&
-      this.retryDueAt <= now
-    ) {
-      this.clearRetryTimer();
-      void this.checkForUpdates("retry");
-    }
-    if (
-      this.intervalTimer !== null &&
-      this.intervalDueAt !== null &&
-      this.intervalDueAt <= now
-    ) {
-      this.timers.clearTimeout(this.intervalTimer);
-      this.intervalTimer = null;
-      this.runIntervalCheck();
-    }
+    this.startupCheck.runOverdue(now);
+    this.autoInstallRetry.runOverdue(now);
+    this.retryCheck.runOverdue(now);
+    this.reconciliationRetry.runOverdue(now);
+    this.intervalCheck.runOverdue(now);
   }
 
   setAutoInstallEnabled(enabled: boolean): void {
@@ -252,7 +232,7 @@ export class UpdateController {
 
     if (
       !next &&
-      this.reconciliationRetryTimer !== null &&
+      this.reconciliationRetry.pending &&
       !this.reconciliationWaitManual
     ) {
       this.clearReconciliationRetryTimer();
@@ -762,54 +742,22 @@ export class UpdateController {
   }
 
   private clearTimers(): void {
-    if (this.startupTimer !== null) {
-      this.timers.clearTimeout(this.startupTimer);
-      this.startupTimer = null;
-    }
-    if (this.intervalTimer !== null) {
-      this.timers.clearTimeout(this.intervalTimer);
-      this.intervalTimer = null;
-    }
-    this.intervalDueAt = null;
+    this.startupCheck.clear();
+    this.intervalCheck.clear();
     this.clearRetryTimer();
     this.clearAutoInstallRetryTimer();
   }
 
   private clearRetryTimer(): void {
-    if (this.retryTimer !== null) {
-      this.timers.clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
-    this.retryDueAt = null;
+    this.retryCheck.clear();
   }
 
   private clearAutoInstallRetryTimer(): void {
-    if (this.autoInstallRetryTimer !== null) {
-      this.timers.clearTimeout(this.autoInstallRetryTimer);
-      this.autoInstallRetryTimer = null;
-    }
-    this.autoInstallRetryDueAt = null;
-    this.autoInstallRetryFire = null;
-  }
-
-  private autoInstallRetryFire: (() => void) | null = null;
-
-  private setAutoInstallRetry(fire: () => void, delayMs: number): void {
-    this.autoInstallRetryDueAt = this.now() + delayMs;
-    this.autoInstallRetryFire = fire;
-    this.autoInstallRetryTimer = this.timers.setTimeout(() => {
-      this.autoInstallRetryTimer = null;
-      this.autoInstallRetryDueAt = null;
-      this.autoInstallRetryFire = null;
-      fire();
-    }, delayMs);
+    this.autoInstallRetry.clear();
   }
 
   private clearReconciliationRetryTimer(): void {
-    if (this.reconciliationRetryTimer !== null) {
-      this.timers.clearTimeout(this.reconciliationRetryTimer);
-      this.reconciliationRetryTimer = null;
-    }
+    this.reconciliationRetry.clear();
     this.reconciliationWaitManual = false;
   }
 
@@ -831,11 +779,10 @@ export class UpdateController {
     automatic: boolean,
   ): UpdateSnapshot {
     this.showWaitingForLastSession(version);
-    if (this.reconciliationRetryTimer === null) {
+    if (!this.reconciliationRetry.pending) {
       this.reconciliationWaitManual = !automatic;
-      this.reconciliationRetryTimer = this.timers.setTimeout(() => {
+      this.reconciliationRetry.schedule(() => {
         const manual = this.reconciliationWaitManual;
-        this.reconciliationRetryTimer = null;
         this.reconciliationWaitManual = false;
         if (this.candidate !== candidate) return;
         if (manual) void this.startInstall(null);
@@ -859,7 +806,7 @@ export class UpdateController {
   private scheduleAutoInstallRetry(candidate: UpdateCandidate): void {
     if (
       !this.autoInstallEnabled ||
-      this.autoInstallRetryTimer !== null ||
+      this.autoInstallRetry.pending ||
       this.candidate !== candidate
     ) {
       return;
@@ -867,7 +814,7 @@ export class UpdateController {
     const delayMs = this.retryDelaysMs[this.autoInstallDeferralCount];
     if (delayMs === undefined) return;
     this.autoInstallDeferralCount += 1;
-    this.setAutoInstallRetry(() => {
+    this.autoInstallRetry.schedule(() => {
       void this.installAutomatically(candidate);
     }, delayMs);
   }
@@ -875,25 +822,23 @@ export class UpdateController {
   private scheduleBusyInstallRetry(candidate: UpdateCandidate): void {
     if (
       !this.autoInstallEnabled ||
-      this.autoInstallRetryTimer !== null ||
+      this.autoInstallRetry.pending ||
       this.candidate !== candidate
     ) {
       return;
     }
-    this.setAutoInstallRetry(() => {
+    this.autoInstallRetry.schedule(() => {
       void this.installAutomatically(candidate);
     }, this.busyRetryMs);
   }
 
   private scheduleAutomaticRetry(): void {
-    if (!this.autoChecksEnabled || this.retryTimer !== null) return;
+    if (!this.autoChecksEnabled || this.retryCheck.pending) return;
     const delayMs = this.retryDelaysMs[this.automaticFailureCount];
     if (delayMs === undefined) return;
     this.automaticFailureCount += 1;
-    this.retryDueAt = this.now() + delayMs;
-    this.retryTimer = this.timers.setTimeout(() => {
-      this.retryTimer = null;
-      this.retryDueAt = null;
+    this.retryCheck.schedule(() => {
+      if (!this.autoChecksEnabled || !this.runtime.supported) return;
       void this.checkForUpdates("retry");
     }, delayMs);
   }

@@ -21,7 +21,15 @@ case "$command_name" in
         printf 'Mem:             16           1          15\n'
         ;;
     sysctl)
-        printf '17179869184\n'
+        printf '%s\n' "${MOCK_SYSCTL_MEMSIZE:-17179869184}"
+        ;;
+    vm_stat)
+        printf 'Mach Virtual Memory Statistics: (page size of %s bytes)\n' "${MOCK_VM_STAT_PAGE_SIZE:-4096}"
+        printf 'Pages free:                             %s.\n' "${MOCK_VM_STAT_FREE_PAGES:-3145728}"
+        printf 'Pages active:                           %s.\n' "${MOCK_VM_STAT_ACTIVE_PAGES:-262144}"
+        printf 'Pages inactive:                         %s.\n' "${MOCK_VM_STAT_INACTIVE_PAGES:-0}"
+        printf 'Pages speculative:                      %s.\n' "${MOCK_VM_STAT_SPECULATIVE_PAGES:-0}"
+        printf 'Pages purgeable:                        %s.\n' "${MOCK_VM_STAT_PURGEABLE_PAGES:-0}"
         ;;
     openssl)
         if [ "${1:-}" = rand ]; then
@@ -83,6 +91,24 @@ case "$command_name" in
         ;;
     stat)
         last_argument="${!#}"
+        if [ "${MOCK_ROOT_OWNED_ANCESTORS:-false}" = true ] && [ -n "${MOCK_ROOT_OWNED_PREFIX:-}" ]; then
+            case "${MOCK_ROOT_OWNED_PREFIX}/" in
+                "${last_argument%/}/"*)
+                    case " $* " in
+                        *' %u '*)
+                            printf '0\n'
+                            exit 0
+                            ;;
+                        *' %a '*|*' %Lp '*)
+                            if [ "${last_argument%/}" != "${MOCK_ROOT_OWNED_PREFIX%/}" ]; then
+                                printf '755\n'
+                                exit 0
+                            fi
+                            ;;
+                    esac
+                    ;;
+            esac
+        fi
         if [ -n "${MOCK_ROOT_OWNED_PREFIX:-}" ]; then
             case " $* :$last_argument" in
                 *' %u '*":${MOCK_ROOT_OWNED_PREFIX}"|*' %u '*":${MOCK_ROOT_OWNED_PREFIX}/"*)
@@ -95,19 +121,64 @@ case "$command_name" in
             *' -c %u -- '*'.arc-chain-install-root '*|*' -f %u '*'.arc-chain-install-root '*)
                 printf '%s\n' "${MOCK_INSTALL_MARKER_UID:-${MOCK_TARGET_UID:-1000}}"
                 ;;
+            *' -c %u -- '*'worker-policy.conf '*|*' -f %u '*'worker-policy.conf '*)
+                printf '%s\n' "${MOCK_WORKER_POLICY_UID:-${MOCK_TARGET_UID:-1000}}"
+                ;;
             *) /usr/bin/stat "$@" ;;
         esac
         ;;
     runuser)
         [ "${1:-}" = -u ] && [ "$#" -ge 4 ] || exit 2
+        runuser_target="${2:-}"
         shift 2
         [ "${1:-}" = -- ] || exit 2
         shift
+        [ -z "${ARC_TEST_AS_TARGET_LOG:-}" ] \
+            || printf 'runuser %s %s\n' "$runuser_target" "$*" >>"$ARC_TEST_AS_TARGET_LOG"
+        if [ "${MOCK_CURRENT_UID:-1000}" -eq 0 ] && [ "${MOCK_TARGET_UID:-1000}" -ne 0 ]; then
+            case "${1:-}" in
+                "${TMPDIR:-/tmp}"/arc-install.*)
+                    printf 'runuser: permission denied traversing 0700 root TMP_DIR: %s\n' "$1" >&2
+                    exit 126
+                    ;;
+            esac
+            if [ -n "${MOCK_TARGET_UNREADABLE_PATH:-}" ]; then
+                for runuser_arg in "$@"; do
+                    if [ "$runuser_arg" = "$MOCK_TARGET_UNREADABLE_PATH" ]; then
+                        exit 1
+                    fi
+                done
+            fi
+        fi
+        export MOCK_EXECUTING_AS_USER="$runuser_target"
         "$@"
         ;;
     sudo)
         printf '%s %s\n' "$command_name" "$*" >>"${MOCK_SERVICE_LOG:?MOCK_SERVICE_LOG is required}"
         if [ "${1:-}" = -v ]; then exit 0; fi
+        if [ "${1:-}" = -u ] && [ "$#" -ge 3 ]; then
+            sudo_target="${2:-}"
+            shift 2
+            [ "${1:-}" != -- ] || shift
+            [ -z "${ARC_TEST_AS_TARGET_LOG:-}" ] \
+                || printf 'sudo -u %s %s\n' "$sudo_target" "$*" >>"$ARC_TEST_AS_TARGET_LOG"
+            if [ "${MOCK_CURRENT_UID:-1000}" -eq 0 ] && [ "${MOCK_TARGET_UID:-1000}" -ne 0 ]; then
+                case "${1:-}" in
+                    "${TMPDIR:-/tmp}"/arc-install.*)
+                        printf 'sudo: permission denied traversing 0700 root TMP_DIR: %s\n' "$1" >&2
+                        exit 126
+                        ;;
+                esac
+                if [ -n "${MOCK_TARGET_UNREADABLE_PATH:-}" ]; then
+                    for sudo_arg in "$@"; do
+                        if [ "$sudo_arg" = "$MOCK_TARGET_UNREADABLE_PATH" ]; then
+                            exit 1
+                        fi
+                    done
+                fi
+            fi
+            export MOCK_EXECUTING_AS_USER="$sudo_target"
+        fi
         if [ "${MOCK_SUDO_EXECUTE:-false}" = true ]; then
             "$@"
         else
@@ -345,6 +416,12 @@ case "$command_name" in
         ;;
     ps)
         case " $* " in
+            *' -axo pid=,uid=,rss=,command='*)
+                if [ -n "${MOCK_PS_RSS_ROWS:-}" ]; then
+                    printf '%s\n' "$MOCK_PS_RSS_ROWS"
+                fi
+                exit 0
+                ;;
             *' -axo pid=,uid=,command='*)
                 if [ -n "${MOCK_PS_ALL_ROWS:-}" ]; then
                     while read -r mock_pid mock_uid mock_command; do
@@ -356,9 +433,39 @@ case "$command_name" in
                 exit 0
                 ;;
             *' -o uid='*)
+                if [ -n "${MOCK_PS_EXPECT_PID:-}" ]; then
+                    requested_pid=""
+                    prev_arg=""
+                    for arg in "$@"; do
+                        if [ "$prev_arg" = -p ]; then requested_pid="$arg"; fi
+                        prev_arg="$arg"
+                    done
+                    [ "$requested_pid" = "$MOCK_PS_EXPECT_PID" ] || exit 1
+                fi
                 printf '%s\n' "${MOCK_PS_UID:-${MOCK_TARGET_UID:-1000}}"
                 ;;
+            *' -o rss='*)
+                if [ -n "${MOCK_PS_EXPECT_PID:-}" ]; then
+                    requested_pid=""
+                    prev_arg=""
+                    for arg in "$@"; do
+                        if [ "$prev_arg" = -p ]; then requested_pid="$arg"; fi
+                        prev_arg="$arg"
+                    done
+                    [ "$requested_pid" = "$MOCK_PS_EXPECT_PID" ] || exit 1
+                fi
+                printf '%s\n' "${MOCK_PS_PID_RSS:-0}"
+                ;;
             *' -o command='*)
+                if [ -n "${MOCK_PS_EXPECT_PID:-}" ]; then
+                    requested_pid=""
+                    prev_arg=""
+                    for arg in "$@"; do
+                        if [ "$prev_arg" = -p ]; then requested_pid="$arg"; fi
+                        prev_arg="$arg"
+                    done
+                    [ "$requested_pid" = "$MOCK_PS_EXPECT_PID" ] || exit 1
+                fi
                 if [ -n "${MOCK_PS_COMMAND:-}" ]; then
                     printf '%s\n' "$MOCK_PS_COMMAND"
                 else

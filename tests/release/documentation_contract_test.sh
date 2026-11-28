@@ -38,7 +38,7 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.26
+CANDIDATE_VERSION=0.8.27
 CANDIDATE_SNAPSHOT_DATE=2026-11-27
 PUBLISHED_VERSION=0.8.26
 PUBLISHED_INSTALLER_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
@@ -589,7 +589,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
         -name '*.spec.ts' | wc -l | tr -d ' ')"
     assert_equals 35 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '464 tests in' \
+    require_literal "$DESKTOP_README" '484 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
     require_literal "$DESKTOP_README" '35 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
@@ -603,7 +603,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '464 tests in 35 files' "$playwright_inventory" \
+        assert_equals '484 tests in 35 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 

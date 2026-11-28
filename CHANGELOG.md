@@ -18,6 +18,24 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.27 - Release-preparation snapshot (2026-11-27)
+
+> **Candidate note:** This entry records the v0.8.27 release-preparation
+> snapshot. It does not claim publication, deployment, or 100 active operators.
+
+- Native ticks recover overdue desktop startup, periodic and retry waits when
+  the webview suspends its timers, including manual shutdown reconciliation
+  while automatic checks are disabled.
+- One deadline wrapper prevents cancelled or replaced callbacks from running
+  stale checks or clearing a newer wait. Seventeen regressions and a reference
+  model cover delayed delivery, disable, dispose and same-clock replacement.
+- Headless installs select partial shards automatically when the pinned model,
+  nominal RAM floor and offline admission report qualify. Explicit full mode
+  remains available, and automatic fallback is reassessed on later updates.
+- Same-version updates reconcile stale launcher policy after the installer
+  replaces itself. Policy, launcher and service changes roll back together if
+  activation fails; existing identity and chain data remain preserved.
+
 ## v0.8.26 - Release-preparation snapshot (2026-11-27)
 
 > **Candidate note:** This entry records the v0.8.26 release-preparation

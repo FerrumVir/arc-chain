@@ -307,6 +307,14 @@ Integrated workers retry exhausted transient connection failures with bounded,
 cancellable backoff while retaining lease fences. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
+All desktop update schedules use the `UpdateDeadline` wrapper for wall-clock
+deadlines and callback identity. Native ticks recover suspended startup,
+periodic, failed-check, install and shutdown-reconciliation waits exactly once.
+A manual reconciliation wait still recovers with automatic checks disabled.
+Disabling, disposing or replacing a schedule invalidates its queued callbacks.
+Focused regressions and a reference-model check exercise stale delivery,
+same-clock replacement and callbacks scheduling successors without a browser
+or node. A source check prevents controller timers bypassing the wrapper.
 The desktop derives partial-worker mode from existing compute consent and typed
 release pins, preserving managed identity and update rollback. The release pins
 Singapore's verified coordinator identity, recovered domain and canonical model.
@@ -515,6 +523,23 @@ request-success evidence.
 
 ## Releases and versions
 
+The candidate headless installer defaults `--worker-mode` to `auto`. With a
+model it qualifies the pinned community partial-shard mode through the node's
+offline `community-shard-worker --check-only` command. The qualification requires
+the desktop's nominal 16 GB floor, six admitted layers and a bounded working-set
+budget. Memory credit comes only from a matching managed worker that the
+transaction will stop. Explicit `full` persists; `shard` refuses failed
+qualification before stopping the old service; no model remains observer-only.
+The separate `worker-policy.conf` records configured and resolved modes, model,
+policy revision and the running installer's digest. Same-version updates
+reconcile missing or stale policy and reassess automatic whole-model fallbacks.
+The policy participates in service rollback. Root-owned staging streams bytes
+to the target user for user-owned installs, while that user's transaction
+snapshots stay in a separate private directory; the release staging directory
+remains private to the installer. Signed release verification,
+legacy migration fences and data preservation remain required. Installer
+regressions run in the remote release-contract gate for this candidate.
+
 The macOS bundle sealer reads the release version from the repository Tauri
 configuration and rejects mismatched app identity or version before modifying
 packages. Archive and DMG verification use the same captured version.
@@ -524,12 +549,12 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.26 entry is a release-preparation
+- `CHANGELOG.md` is newest first. Its v0.8.27 entry is a release-preparation
   snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published and candidate versions at 0.8.26
+- The doc contract test pins the published version at 0.8.26, the candidate at 0.8.27,
   and the exact published installer digest. Active install links change only
   after immutable publication is verified; historical version observations
   remain dated. The contract checks the current-status heading link, separates

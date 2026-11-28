@@ -65,12 +65,13 @@ new_sandbox() {
     : >"$sandbox/node-args.log"
     : >"$sandbox/service.log"
     : >"$sandbox/owner.log"
+    printf 'MemTotal:       16777216 kB\nMemAvailable:   12582912 kB\n' >"$sandbox/proc-meminfo"
 
     mock_bin="$sandbox/bin"
     cp "$TEST_DIR/helpers/mock-curl.sh" "$mock_bin/curl"
     cp "$TEST_DIR/helpers/mock-platform-command.sh" "$mock_bin/platform-command"
     chmod +x "$mock_bin/curl" "$mock_bin/platform-command"
-    for command_name in uname sleep free sysctl openssl ssh-keygen hostname id getent chown stat runuser sudo systemctl launchctl ps; do
+    for command_name in uname sleep free sysctl vm_stat openssl ssh-keygen hostname id getent chown stat runuser sudo systemctl launchctl ps; do
         ln -s platform-command "$mock_bin/$command_name"
     done
     NEW_SANDBOX="$sandbox"
@@ -1676,6 +1677,7 @@ invoke_installer() {
         ARC_INSTALL_TEST_FAIL_AFTER_COPY="${ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST:-}" \
         ARC_INSTALL_TEST_FAIL_AFTER_LEGACY_MARKER_FSYNC="${ARC_INSTALL_TEST_FAIL_AFTER_LEGACY_MARKER_FSYNC_UNDER_TEST:-}" \
         ARC_HEALTH_TIMEOUT="${ARC_HEALTH_TIMEOUT_UNDER_TEST:-180}" \
+        ARC_INSTALL_MEMINFO_PATH="${ARC_INSTALL_MEMINFO_PATH_UNDER_TEST:-$sandbox/proc-meminfo}" \
         ARC_TEST_NODE_ARGS_LOG="$sandbox/node-args.log" \
         TMPDIR="$sandbox/tmp" \
         NO_COLOR=1 \
@@ -2510,6 +2512,7 @@ legacy-evidence|$sandbox/arc/identity/legacy-validator-seed.evidence
 node-env|$sandbox/arc/node.env
 runner|$sandbox/arc/bin/run-arc-node
 install-config|$sandbox/arc/install.conf
+worker-policy|$sandbox/arc/worker-policy.conf
 install-root-marker|$sandbox/arc/.arc-chain-install-root
 node-unit|$sandbox/home/.config/systemd/user/arc-node.service
 updater-unit|$sandbox/home/.config/systemd/user/arc-node-update.service
