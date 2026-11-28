@@ -86,5 +86,12 @@
     "sha256": "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
     "size": 4081004224,
     "url": "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf"
+  },
+  "shard_worker": {
+    "coordinator_url": "https://149.28.153.31",
+    "coordinator_id": "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+    "transaction_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+    "expected_model_id": "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+    "required_admitted_layers": 6
   }
 }

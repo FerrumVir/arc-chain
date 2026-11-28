@@ -538,7 +538,19 @@ Linux, Windows and the opt-in macOS leg. These are release qualification gates,
 not evidence that operator machines have adopted the candidate. Legacy
 headless updaters pull on their existing schedule; v0.7 desktop app updates
 still require their local update check. Neither path supplies remote control
-or proves a count of active operators. Bridge compute choices are unchanged.
+or proves a count of active operators. Bridge compute consent choices are
+unchanged: absent consent, saved opt-outs and v0.7 desktops remain observers.
+For consenting headless nodes with a verified model, the bridge defaults to
+`auto` worker mode (persisted separately in `compute-worker-mode` so
+`BridgeState` keeps its v0.7.14 schema): when optional `shard_worker` pins
+(derived from the tag's `install.sh` by `pin-release.py`) are present, it
+checks fresh host memory (16 GB nominal floor, 6 GiB available, 4 GiB OS
+reserve, half-visible cap), runs a bounded 10-second
+`community-shard-worker --check-only` preflight requiring at least 6 admitted
+layers, rechecks memory after preflight, and launches `--community-shard-worker`
+(rewards disabled) without whole-model flags; `auto` falls back to
+`--full-integer-worker`, explicit `full` bypasses preflight, and explicit
+`shard` fails closed.
 Rollback and original-binary preservation classify exact version output and
 reject every bridge executable, including an older bridge version. An existing
 preserved original is never replaced by a later updater's previous binary.

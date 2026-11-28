@@ -10,6 +10,7 @@ use crate::exit;
 use crate::layout::Layout;
 use crate::pins::Pins;
 use crate::release::VerifiedRelease;
+use crate::shard_policy::WorkerLaunchRole;
 
 pub const RELATIVE_MODEL_AUTODISCOVERY: &[&str] = &["llama2-7b.gguf", "llama-2-7b.Q4_K_M.gguf"];
 pub const HOME_MODEL_AUTODISCOVERY: &[&str] = &[
@@ -26,6 +27,7 @@ pub struct LaunchPlan {
     pub cwd: PathBuf,
     pub home: PathBuf,
     pub community: bool,
+    pub shard_worker: bool,
     pub compute_model: Option<PathBuf>,
 }
 
@@ -35,6 +37,17 @@ pub fn plan(
     pins: &Pins,
     release: &VerifiedRelease,
     compute: &Compute,
+) -> LaunchPlan {
+    let role = WorkerLaunchRole::from_compute(compute);
+    plan_for_role(layout, invocation, pins, release, &role)
+}
+
+pub fn plan_for_role(
+    layout: &Layout,
+    invocation: &LegacyInvocation,
+    pins: &Pins,
+    release: &VerifiedRelease,
+    role: &WorkerLaunchRole,
 ) -> LaunchPlan {
     let community = pins.node_release.worker_names_privacy_safe;
     let mut args: Vec<OsString> = vec![
@@ -57,30 +70,64 @@ pub fn plan(
         "--validator-key-file".into(),
         layout.keyfile().into_os_string(),
     ];
-    if community {
-        args.push("--community-mode".into());
-        for origin in &pins.community_rpc_origins {
-            args.push("--community-rpc-url".into());
-            args.push(origin.into());
-        }
-    } else {
+    let mut shard_worker = false;
+    let compute_model = if !community {
         args.push("--no-community".into());
-    }
-    let compute_model = match compute {
-        Compute::On(model) if community => Some(model.clone()),
-        _ => None,
+        None
+    } else {
+        match role {
+            WorkerLaunchRole::Observer(_) => {
+                args.push("--community-mode".into());
+                for origin in &pins.community_rpc_origins {
+                    args.push("--community-rpc-url".into());
+                    args.push(origin.into());
+                }
+                None
+            }
+            WorkerLaunchRole::FullIntegerWorker { model, .. } => {
+                args.push("--community-mode".into());
+                for origin in &pins.community_rpc_origins {
+                    args.push("--community-rpc-url".into());
+                    args.push(origin.into());
+                }
+                args.push("--model".into());
+                args.push(model.clone().into_os_string());
+                args.push("--full-integer-worker".into());
+                Some(model.clone())
+            }
+            WorkerLaunchRole::CommunityShardWorker {
+                model,
+                pin,
+                max_working_set_bytes,
+                ..
+            } => {
+                shard_worker = true;
+                args.push("--threads".into());
+                args.push("1".into());
+                args.push("--community-shard-worker".into());
+                args.push("--community-shard-coordinator-url".into());
+                args.push(pin.coordinator_url.as_str().into());
+                args.push("--community-shard-coordinator-id".into());
+                args.push(pin.coordinator_id.as_str().into());
+                args.push("--community-shard-transaction-domain".into());
+                args.push(pin.transaction_domain.as_str().into());
+                args.push("--community-shard-expected-model-id".into());
+                args.push(pin.expected_model_id.as_str().into());
+                args.push("--community-shard-max-working-set-bytes".into());
+                args.push(max_working_set_bytes.to_string().into());
+                args.push("--model".into());
+                args.push(model.clone().into_os_string());
+                Some(model.clone())
+            }
+        }
     };
-    if let Some(model) = &compute_model {
-        args.push("--model".into());
-        args.push(model.clone().into_os_string());
-        args.push("--full-integer-worker".into());
-    }
     LaunchPlan {
         program: release.node.clone(),
         args,
         cwd: layout.node_dir.clone(),
         home: layout.node_home(),
         community,
+        shard_worker,
         compute_model,
     }
 }
@@ -114,6 +161,9 @@ fn command_for(plan: &LaunchPlan) -> Command {
         .args(&plan.args)
         .current_dir(&plan.cwd)
         .env("HOME", &plan.home);
+    if plan.shard_worker {
+        command.env_remove("ARC_COMMUNITY_RPC_URLS");
+    }
     command
 }
 
@@ -342,5 +392,89 @@ mod tests {
         assert!(is_autodiscovery_path(
             &plan.home.join(".arc-models").join("llama2-7b.gguf")
         ));
+    }
+
+    #[test]
+    fn community_shard_worker_plan_emits_exclusive_shard_flags_and_respects_privacy_gate() {
+        use crate::pins::ShardWorkerPin;
+
+        let temp = TempDir::new("launch-shard");
+        let (layout, invocation, release) = fixture(&temp);
+        let pin = ShardWorkerPin {
+            coordinator_url: "https://149.28.153.31".to_string(),
+            coordinator_id: "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"
+                .to_string(),
+            transaction_domain: "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f"
+                .to_string(),
+            expected_model_id: "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67"
+                .to_string(),
+            required_admitted_layers: 6,
+        };
+        let role = WorkerLaunchRole::CommunityShardWorker {
+            model: PathBuf::from("/models/llama.gguf"),
+            pin: Box::new(pin.clone()),
+            max_working_set_bytes: 8 * 1024 * 1024 * 1024,
+            admitted_max_resident_layers: 6,
+        };
+
+        let mut safe_pins = Pins::embedded().unwrap();
+        safe_pins.node_release.worker_names_privacy_safe = true;
+        let shard_plan = plan_for_role(&layout, &invocation, &safe_pins, &release, &role);
+        assert!(shard_plan.community);
+        assert!(shard_plan.shard_worker);
+        assert_eq!(
+            shard_plan.compute_model,
+            Some(PathBuf::from("/models/llama.gguf"))
+        );
+        let args = strings(&shard_plan);
+        assert_eq!(value_after(&args, "--stake").as_deref(), Some("0"));
+        assert_eq!(value_after(&args, "--threads").as_deref(), Some("1"));
+        assert!(args.contains(&"--community-shard-worker".to_string()));
+        assert_eq!(
+            value_after(&args, "--community-shard-coordinator-url").as_deref(),
+            Some(pin.coordinator_url.as_str())
+        );
+        assert_eq!(
+            value_after(&args, "--community-shard-coordinator-id").as_deref(),
+            Some(pin.coordinator_id.as_str())
+        );
+        assert_eq!(
+            value_after(&args, "--community-shard-transaction-domain").as_deref(),
+            Some(pin.transaction_domain.as_str())
+        );
+        assert_eq!(
+            value_after(&args, "--community-shard-expected-model-id").as_deref(),
+            Some(pin.expected_model_id.as_str())
+        );
+        assert_eq!(
+            value_after(&args, "--community-shard-max-working-set-bytes").as_deref(),
+            Some("8589934592")
+        );
+        assert_eq!(
+            value_after(&args, "--model").as_deref(),
+            Some("/models/llama.gguf")
+        );
+        for forbidden in [
+            "--community-mode",
+            "--community-rpc-url",
+            "--no-community",
+            "--full-integer-worker",
+            "--community",
+            "--validator-seed",
+            "--shard-range",
+        ] {
+            assert!(!args.contains(&forbidden.to_string()), "{forbidden}");
+        }
+
+        let mut unsafe_pins = Pins::embedded().unwrap();
+        unsafe_pins.node_release.worker_names_privacy_safe = false;
+        let unsafe_plan = plan_for_role(&layout, &invocation, &unsafe_pins, &release, &role);
+        assert!(!unsafe_plan.community);
+        assert!(!unsafe_plan.shard_worker);
+        assert_eq!(unsafe_plan.compute_model, None);
+        let args = strings(&unsafe_plan);
+        assert!(args.contains(&"--no-community".to_string()));
+        assert!(!args.contains(&"--community-shard-worker".to_string()));
+        assert!(!args.contains(&"--model".to_string()));
     }
 }

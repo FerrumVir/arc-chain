@@ -53,5 +53,86 @@ class ReleaseMetadataTests(unittest.TestCase):
                 PIN_RELEASE.release_metadata("v0.8.27")
 
 
+class ShardWorkerPinExtractionTests(unittest.TestCase):
+    SAMPLE_INSTALL_SH = "\n".join(
+        [
+            "SHARD_COORDINATOR_URL=https://149.28.153.31",
+            "SHARD_COORDINATOR_ID=f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+            "SHARD_TRANSACTION_DOMAIN=3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+            "SHARD_EXPECTED_MODEL_ID=934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+            "SHARD_REQUIRED_ADMITTED_LAYERS=6",
+        ]
+    ) + "\n"
+
+    def test_extracts_valid_shard_pin_from_sample_and_repo_install_sh(self):
+        parsed = PIN_RELEASE.parse_shard_worker_pin(self.SAMPLE_INSTALL_SH, "v0.8.27")
+        self.assertEqual(
+            parsed,
+            {
+                "coordinator_url": "https://149.28.153.31",
+                "coordinator_id": "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+                "transaction_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+                "expected_model_id": "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+                "required_admitted_layers": 6,
+            },
+        )
+        repo_install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        repo_parsed = PIN_RELEASE.parse_shard_worker_pin(repo_install, "worktree")
+        self.assertEqual(repo_parsed, parsed)
+
+    def test_rejects_missing_or_duplicate_shard_assignments(self):
+        for var in (
+            "SHARD_COORDINATOR_URL",
+            "SHARD_COORDINATOR_ID",
+            "SHARD_TRANSACTION_DOMAIN",
+            "SHARD_EXPECTED_MODEL_ID",
+            "SHARD_REQUIRED_ADMITTED_LAYERS",
+        ):
+            missing = "\n".join(
+                line for line in self.SAMPLE_INSTALL_SH.splitlines() if not line.startswith(f"{var}=")
+            ) + "\n"
+            with self.assertRaisesRegex(ValueError, var):
+                PIN_RELEASE.parse_shard_worker_pin(missing, "v0.8.27")
+
+            duplicate = self.SAMPLE_INSTALL_SH + f"{var}=extra\n"
+            with self.assertRaisesRegex(ValueError, var):
+                PIN_RELEASE.parse_shard_worker_pin(duplicate, "v0.8.27")
+
+    def test_rejects_invalid_coordinator_urls_digests_and_layer_floors(self):
+        for bad_url in (
+            "http://149.28.153.31",
+            "https://149.28.153.31/",
+            "https://149.28.153.31/api",
+            "https://149.28.153.31?x=1",
+            "https://149.28.153.31#frag",
+            "https://user@149.28.153.31",
+            "https://user:pass@149.28.153.31",
+            "https://149.28.153.31:0",
+            "https://149.28.153.31:0443",
+            "https://999.28.153.31",
+        ):
+            tampered = self.SAMPLE_INSTALL_SH.replace("https://149.28.153.31", bad_url)
+            with self.assertRaisesRegex(ValueError, "SHARD_COORDINATOR_URL", msg=bad_url):
+                PIN_RELEASE.parse_shard_worker_pin(tampered, "v0.8.27")
+
+        for field, original in (
+            ("SHARD_COORDINATOR_ID", "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"),
+            ("SHARD_TRANSACTION_DOMAIN", "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f"),
+            ("SHARD_EXPECTED_MODEL_ID", "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67"),
+        ):
+            for bad_digest in ("0" * 64, "a" * 63, "A" * 64):
+                tampered = self.SAMPLE_INSTALL_SH.replace(original, bad_digest)
+                with self.assertRaisesRegex(ValueError, field, msg=f"{field}={bad_digest}"):
+                    PIN_RELEASE.parse_shard_worker_pin(tampered, "v0.8.27")
+
+        for bad_layers in ("0", "1", "5", "06", "six"):
+            tampered = self.SAMPLE_INSTALL_SH.replace(
+                "SHARD_REQUIRED_ADMITTED_LAYERS=6",
+                f"SHARD_REQUIRED_ADMITTED_LAYERS={bad_layers}",
+            )
+            with self.assertRaisesRegex(ValueError, "SHARD_REQUIRED_ADMITTED_LAYERS", msg=bad_layers):
+                PIN_RELEASE.parse_shard_worker_pin(tampered, "v0.8.27")
+
+
 if __name__ == "__main__":
     unittest.main()

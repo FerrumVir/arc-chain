@@ -64,6 +64,71 @@ pub fn read_consent(layout: &Layout) -> Result<Option<bool>> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkerModePreference {
+    #[default]
+    Auto,
+    Shard,
+    Full,
+}
+
+impl WorkerModePreference {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "shard" => Ok(Self::Shard),
+            "full" => Ok(Self::Full),
+            _ => Err(exit::usage(format!(
+                "worker mode must be auto, shard, or full, not {value:?}"
+            ))),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Shard => "shard",
+            Self::Full => "full",
+        }
+    }
+}
+
+pub fn read_worker_mode(layout: &Layout) -> Result<WorkerModePreference> {
+    let path = layout.worker_mode_file();
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(exit::refused(format!(
+                    "{} must be a regular file, not a link or directory",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkerModePreference::Auto);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    match text.trim() {
+        "auto" => Ok(WorkerModePreference::Auto),
+        "shard" => Ok(WorkerModePreference::Shard),
+        "full" => Ok(WorkerModePreference::Full),
+        _ => Err(exit::refused(format!(
+            "{} must contain exactly auto, shard, or full",
+            path.display()
+        ))),
+    }
+}
+
+pub fn write_worker_mode(layout: &Layout, mode: WorkerModePreference) -> Result<()> {
+    let contents = format!("{}\n", mode.label());
+    write_atomic(&layout.worker_mode_file(), contents.as_bytes())
+}
+
 pub fn write_consent(layout: &Layout, yes: bool) -> Result<()> {
     let answer: &[u8] = if yes { b"yes\n" } else { b"no\n" };
     write_atomic(&layout.consent_file(), answer)
@@ -456,5 +521,46 @@ mod tests {
         assert!(read_consent(&layout).is_err());
         fs::write(layout.consent_file(), b"yes").unwrap();
         assert_eq!(read_consent(&layout).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn worker_mode_defaults_to_auto_round_trips_and_never_touches_consent() {
+        let temp = TempDir::new("worker-mode");
+        let (layout, _) = headless(&temp, None);
+        let default_mode = read_worker_mode(&layout).unwrap();
+        assert_eq!(default_mode, WorkerModePreference::Auto);
+
+        for (raw, expected) in [
+            ("auto", WorkerModePreference::Auto),
+            ("shard", WorkerModePreference::Shard),
+            ("full", WorkerModePreference::Full),
+        ] {
+            let parsed = WorkerModePreference::parse(raw).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.label(), raw);
+            write_worker_mode(&layout, parsed).unwrap();
+            assert_eq!(read_worker_mode(&layout).unwrap(), expected);
+        }
+
+        assert_eq!(read_consent(&layout).unwrap(), None);
+        assert!(!layout.consent_file().exists());
+        assert!(!layout.model_record().exists());
+
+        let usage_error = WorkerModePreference::parse("partial").unwrap_err();
+        assert_eq!(exit::code_for(&usage_error), exit::EX_USAGE);
+
+        fs::write(layout.worker_mode_file(), b"partial\n").unwrap();
+        let config_error = read_worker_mode(&layout).unwrap_err();
+        assert_eq!(exit::code_for(&config_error), exit::EX_CONFIG);
+
+        #[cfg(unix)]
+        {
+            let target = temp.path().join("other-mode");
+            fs::write(&target, b"shard\n").unwrap();
+            fs::remove_file(layout.worker_mode_file()).unwrap();
+            std::os::unix::fs::symlink(&target, layout.worker_mode_file()).unwrap();
+            let symlink_error = read_worker_mode(&layout).unwrap_err();
+            assert_eq!(exit::code_for(&symlink_error), exit::EX_CONFIG);
+        }
     }
 }

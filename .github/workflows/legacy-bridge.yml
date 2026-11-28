@@ -64,7 +64,7 @@ jobs:
       - name: ShellCheck and Python syntax
         run: |
           shellcheck -S warning tests/legacy-bridge/headless-v07-acceptance.sh tests/legacy-bridge/fake-github/curl
-          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py tests/legacy-bridge/fetch_release_metadata.py tests/legacy-bridge/test_desktop_harness.py
+          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py tests/legacy-bridge/fetch_release_metadata.py tests/legacy-bridge/worker_startup_readiness.py tests/legacy-bridge/test_desktop_harness.py
       - name: Offline privacy boolean parsing under errexit (no node)
         run: python3 tests/legacy-bridge/test_privacy_flag.py -v
       - name: Release metadata authentication boundaries

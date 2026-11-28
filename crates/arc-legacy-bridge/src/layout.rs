@@ -73,6 +73,10 @@ impl Layout {
         self.node_dir.join("compute-model.json")
     }
 
+    pub fn worker_mode_file(&self) -> PathBuf {
+        self.node_dir.join("compute-worker-mode")
+    }
+
     pub fn is_excluded_top_level(&self, name: &str) -> bool {
         self.legacy_data_dir_is_root
             && (DESKTOP_EXCLUDED_TOP_LEVEL.contains(&name)

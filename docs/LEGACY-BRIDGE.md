@@ -10,11 +10,23 @@ how many independent operator machines are currently online.
 
 This update reaches a legacy headless installation when its existing daily
 updater next runs. It preserves an existing bridge's identity, data and saved
-compute choice. A consenting headless bridge continues whole-model inference;
-this repin does not add partial-shard selection to the launcher. A v0.7
-desktop reaches the new app through its existing local Settings update check.
-The v0.8.27 desktop can then use its automatic update and recovery paths and
-select partial inference where its saved compute choice and capacity permit.
+compute choice. Absent consent, saved compute opt-outs and v0.7 desktop
+installations remain observer-only. For already-consenting headless bridges with
+a verified model, the launcher defaults to `--worker-mode auto`: when the
+compiled pins include `shard_worker` (derived from the pinned release's
+`install.sh` via `pin-release.py --write`) and the host passes fresh memory
+qualification (nominal 16 GB floor, 6 GiB available, 4 GiB OS reserve,
+half-visible cap) and a bounded `community-shard-worker --check-only` preflight
+(at least 6 admitted layers) plus a post-preflight memory recheck, it starts
+the node with `--community-shard-worker` (rewards disabled). Otherwise `auto`
+falls back to `--full-integer-worker`. Operators can persist an explicit
+override in `compute-worker-mode` (`--legacy-bridge-worker-mode auto|shard|full`
+or `--legacy-bridge-compute on --worker-mode ...`) without mutating
+`BridgeState`'s v0.7.14 schema or saved compute consent: `full` bypasses
+preflight, and `shard` fails closed on failed qualification. A v0.7 desktop
+reaches the new app through its existing local Settings update check. The
+v0.8.27 desktop can then use its automatic update and recovery paths and select
+partial inference where its saved compute choice and capacity permit.
 
 Before publishing, require the legacy workflow's Linux and Windows unit and
 desktop acceptance jobs, the opt-in macOS desktop leg, both headless scenarios, and the signed-asset
@@ -308,8 +320,9 @@ Operator commands (all read the bridge's own files):
 
 ```bash
 ~/.arc/bin/arc-node --legacy-bridge-status
-~/.arc/bin/arc-node --legacy-bridge-compute on --download-model     # or --model /path/to/model.gguf
+~/.arc/bin/arc-node --legacy-bridge-compute on --download-model     # or --model /path/to/model.gguf [--worker-mode auto|shard|full]
 ~/.arc/bin/arc-node --legacy-bridge-compute off
+~/.arc/bin/arc-node --legacy-bridge-worker-mode auto|shard|full
 ~/.arc/bin/arc-node --legacy-bridge-verify-archive --hash
 ~/.arc/bin/arc-node --legacy-bridge-rollback
 ```
