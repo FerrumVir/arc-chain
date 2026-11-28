@@ -324,6 +324,32 @@ def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
     return unreadable
 
 
+def bridge_identity(state_path: Path) -> dict[str, str]:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return {
+        "address": state["node_address"],
+        "data": state["node_data_dir"],
+        "key_sha256": sha256(Path(state["node_keyfile"])),
+        "genesis_sha256": sha256(Path(state["node_data_dir"]) / "genesis.network-hash"),
+    }
+
+
+def previous_bridge_payload(asset: str, evidence: Path) -> tuple[str, bytes]:
+    previous = json.loads((HERE / "previous-release.json").read_text(encoding="utf-8"))
+    assert previous["schema"] == "arc.legacy-bridge.previous-release.v1"
+    tag = previous["bridge_tag"]
+    assert tag == "v0.7.14" and previous["node_tag"] == "v0.8.13"
+    expected = previous["assets"][asset]
+    assert 0 < expected["size"] <= 4 * 1024 * 1024
+    url = f"https://github.com/{REPO}/releases/download/{tag}/{asset}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        payload = response.read(expected["size"] + 1)
+    assert len(payload) == expected["size"], "previous bridge size differs from the immutable release"
+    assert hashlib.sha256(payload).hexdigest() == expected["sha256"], "previous bridge digest differs"
+    (evidence / "previous-release.json").write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+    return tag, payload
+
+
 def run(args: argparse.Namespace) -> None:
     evidence: Path = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
@@ -349,6 +375,8 @@ def run(args: argparse.Namespace) -> None:
     threading.Thread(target=github.serve_forever, daemon=True).start()
     github.releases["v0.7.7"] = {asset: args.legacy_node.read_bytes()}
     github.releases["v0.7.11"] = {"latest.json": b"{}"}
+    previous_tag, previous_payload = previous_bridge_payload(asset, evidence)
+    github.releases[previous_tag] = {asset: previous_payload}
     bridge_tag = "v" + pins["bridge_version"]
     github.releases[bridge_tag] = {asset: args.bridge.read_bytes()}
     config = {"rpc_port": 9944, "p2p_port": 9945, "data_dir": "~/.arc", "role": "worker", "model_path": None}
@@ -376,6 +404,21 @@ def run(args: argparse.Namespace) -> None:
         report["stranded_error"] = str(error)
         assert "returned HTTP 404" in str(error)
     snapshot_tree.write_json(evidence / "v07-data.before.json", {"entries": snapshot_tree.snapshot(arc, True)})
+
+    print("== an existing bridge install creates the identity and data retained across upgrades")
+    github.latest = previous_tag
+    start_node(node, github.base, "0.7.11", config)
+    wait_health(node.rpc_port, 240)
+    previous_info = http_json(node.rpc_port, "/node/info")
+    assert previous_info["version"] == "0.8.13" and previous_info["stake"] == 0
+    previous_states = list((arc / "legacy-bridge").glob("nodes/desktop-*/bridge-state.json"))
+    assert len(previous_states) == 1
+    previous_state_path = previous_states[0]
+    node.stop()
+    original_identity = bridge_identity(previous_state_path)
+    preserved_data = Path(original_identity["data"]) / "bridge-upgrade-preservation.txt"
+    preserved_data.write_bytes(b"preserve existing bridge data\n")
+    report["previous_bridge_identity"] = original_identity
 
     print("== the bridge is Latest: the next start installs it and the node joins as v0.8 stake 0")
     github.latest = bridge_tag
@@ -410,6 +453,7 @@ def run(args: argparse.Namespace) -> None:
     assert state["legacy_kind"] == "desktop" and state["stake"] == 0
     assert state["community_registration"] is privacy_safe, state
     assert state["compute"].startswith("off: the updated ARC desktop app asks")
+    assert states[0] == previous_state_path, "upgrade replaced the bridge context"
     assert (states[0].parent / "data" / "genesis.network-hash").is_file()
     assert not (arc / "genesis.network-hash").exists(), "v0.8 initialized the v0.7 data directory"
     log_text = (evidence / "desktop-node.log").read_text(encoding="utf-8", errors="replace")
@@ -447,6 +491,30 @@ def run(args: argparse.Namespace) -> None:
     after_restart = snapshot_tree.snapshot(arc, True)
     assert after_restart == before, "the v0.7 data changed across a restart"
     node.stop()
+    assert bridge_identity(states[0]) == original_identity, "upgrade changed the existing bridge identity or genesis"
+    assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+
+    print("== the previous node reopens upgraded data after the desktop kills its child")
+    github.latest = previous_tag
+    start_node(node, github.base, "0.7.11", config)
+    wait_health(node.rpc_port, 120)
+    rollback_info = http_json(node.rpc_port, "/node/info")
+    assert rollback_info["version"] == "0.8.13" and rollback_info["stake"] == 0
+    node.stop()
+    assert bridge_identity(states[0]) == original_identity, "rollback changed the bridge identity or genesis"
+    assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+    report["previous_bridge_rollback"] = rollback_info
+
+    github.latest = bridge_tag
+    start_node(node, github.base, "0.7.11", config)
+    wait_health(node.rpc_port, 120)
+    recovered_info = http_json(node.rpc_port, "/node/info")
+    assert recovered_info["version"] == pins["node_release"]["version"] and recovered_info["stake"] == 0
+    node.stop()
+    assert bridge_identity(states[0]) == original_identity, "recovery changed the bridge identity or genesis"
+    assert preserved_data.read_bytes() == b"preserve existing bridge data\n"
+    assert snapshot_tree.snapshot(arc, True) == before, "rollback and recovery changed v0.7 data"
+    report["bridge_rollback_recovery"] = recovered_info
     report["fake_github_requests"] = github.requests
     (evidence / "desktop-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     github.shutdown()

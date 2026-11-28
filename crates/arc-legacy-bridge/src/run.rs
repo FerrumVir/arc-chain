@@ -21,6 +21,8 @@ use crate::state::{self, BridgeState, STATE_SCHEMA};
 pub const PRESERVED_DIR_NAME: &str = "preserved";
 pub const PRESERVED_BINARY_NAME: &str = "arc-node.before-bridge";
 pub const ROLLED_BACK_MARKER: &str = "ROLLED-BACK";
+const VERSION_LINE_PREFIX: &str = "arc-node ";
+const BRIDGE_VERSION_MARKER: &str = " (ARC legacy bridge; starts arc-node ";
 
 pub fn main_entry(args: Vec<OsString>) -> i32 {
     let rest: Vec<OsString> = args.into_iter().skip(1).collect();
@@ -54,7 +56,7 @@ pub fn version_line() -> String {
         .map(|pins| pins.node_release.version)
         .unwrap_or_else(|_| "unknown".to_string());
     format!(
-        "arc-node {} (ARC legacy bridge; starts arc-node {node})",
+        "{VERSION_LINE_PREFIX}{}{BRIDGE_VERSION_MARKER}{node})",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -185,6 +187,86 @@ fn announce(log: &mut Log, record: &BridgeState, pins: &Pins, next: &str) {
     log.info("------------------------------------------------------------");
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedNodeVersion {
+    version: String,
+    parsed: (u64, u64, u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedBridgeVersion {
+    version: String,
+    target_node: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CandidateBinaryVersion {
+    ArcNode(ParsedNodeVersion),
+    LegacyBridge(ParsedBridgeVersion),
+}
+
+impl CandidateBinaryVersion {
+    fn pre_bridge_version(&self, own: (u64, u64, u64)) -> Option<&str> {
+        match self {
+            Self::ArcNode(node) if node.parsed < own => Some(&node.version),
+            Self::ArcNode(_) | Self::LegacyBridge(_) => None,
+        }
+    }
+
+    fn describe_for_log(&self) -> String {
+        match self {
+            Self::ArcNode(node) => format!("arc-node {}", node.version),
+            Self::LegacyBridge(bridge) => {
+                let version = &bridge.version;
+                let target = &bridge.target_node;
+                format!("ARC legacy bridge {version} (starts arc-node {target})")
+            }
+        }
+    }
+}
+
+fn own_bridge_version() -> (u64, u64, u64) {
+    parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0))
+}
+
+fn parse_candidate_version(stdout: &str) -> Option<CandidateBinaryVersion> {
+    let line = stdout
+        .strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
+    let rest = line.strip_prefix(VERSION_LINE_PREFIX)?;
+    if let Some(parsed) = parse_version(rest) {
+        return Some(CandidateBinaryVersion::ArcNode(ParsedNodeVersion {
+            version: rest.to_string(),
+            parsed,
+        }));
+    }
+    let (version, target_with_close) = rest.split_once(BRIDGE_VERSION_MARKER)?;
+    let target_node = target_with_close.strip_suffix(')')?;
+    if parse_version(version).is_none() {
+        return None;
+    }
+    if target_node != "unknown" && parse_version(target_node).is_none() {
+        return None;
+    }
+    Some(CandidateBinaryVersion::LegacyBridge(ParsedBridgeVersion {
+        version: version.to_string(),
+        target_node: target_node.to_string(),
+    }))
+}
+
+fn probe_candidate_version(candidate: &Path) -> Option<CandidateBinaryVersion> {
+    if !candidate.is_file() {
+        return None;
+    }
+    let output = quiet_command(candidate).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    parse_candidate_version(stdout)
+}
+
 fn preserve_previous_binary(layout: &Layout, log: &mut Log) {
     let previous = layout.root.join("bin").join("arc-node.prev");
     let preserved_dir = layout.bridge_dir.join(PRESERVED_DIR_NAME);
@@ -192,6 +274,23 @@ fn preserve_previous_binary(layout: &Layout, log: &mut Log) {
     if fs::symlink_metadata(&preserved).is_ok() || !previous.is_file() {
         return;
     }
+    let own = own_bridge_version();
+    let Some(candidate) = probe_candidate_version(&previous) else {
+        log.info(&format!(
+            "not keeping {} for rollback because it did not report an earlier pre-bridge arc-node version",
+            previous.display()
+        ));
+        return;
+    };
+    let Some(version) = candidate.pre_bridge_version(own) else {
+        let described = candidate.describe_for_log();
+        log.info(&format!(
+            "not keeping {} for rollback because it is {described}, not a pre-bridge arc-node earlier than {}",
+            previous.display(),
+            env!("CARGO_PKG_VERSION")
+        ));
+        return;
+    };
     let result = layout::ensure_private_dir(&preserved_dir).and_then(|()| {
         fs::copy(&previous, &preserved)
             .map(|_| ())
@@ -199,7 +298,7 @@ fn preserve_previous_binary(layout: &Layout, log: &mut Log) {
     });
     match result {
         Ok(()) => log.info(&format!(
-            "kept a copy of the pre-bridge binary for rollback: {}",
+            "kept a copy of pre-bridge arc-node {version} for rollback: {}",
             preserved.display()
         )),
         Err(error) => log.warn(&format!("could not keep the pre-bridge binary: {error:#}")),
@@ -501,29 +600,20 @@ fn rollback(launcher: &Path, root: &Path) -> Result<i32> {
             .join(PRESERVED_BINARY_NAME),
         root.join("bin").join("arc-node.prev"),
     ];
-    let own = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
+    let own = own_bridge_version();
     let mut chosen: Option<(PathBuf, String)> = None;
     for candidate in candidates {
-        if !candidate.is_file() {
-            continue;
-        }
-        let Ok(output) = quiet_command(&candidate).arg("--version").output() else {
+        let Some(probed) = probe_candidate_version(&candidate) else {
             continue;
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let version = stdout
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or_default()
-            .to_string();
-        if output.status.success() && parse_version(&version).is_some_and(|parsed| parsed < own) {
-            chosen = Some((candidate, version));
+        if let Some(version) = probed.pre_bridge_version(own) {
+            chosen = Some((candidate, version.to_string()));
             break;
         }
     }
     let Some((previous, version)) = chosen else {
         return Err(exit::refused(
-            "no earlier arc-node binary is available to roll back to; see docs/LEGACY-BRIDGE.md to reinstall one",
+            "no earlier pre-bridge arc-node binary is available to roll back to; see docs/LEGACY-BRIDGE.md to reinstall one",
         ));
     };
     layout::ensure_private_dir(&bridge_dir)?;
@@ -645,5 +735,330 @@ mod tests {
         ] {
             assert!(help.contains(command), "{command}");
         }
+    }
+
+    #[test]
+    fn candidate_version_parsing_classifies_nodes_bridges_and_rejects_malformed() {
+        let v077 = parse_candidate_version("arc-node 0.7.7\n").unwrap();
+        assert_eq!(
+            v077,
+            CandidateBinaryVersion::ArcNode(ParsedNodeVersion {
+                version: "0.7.7".to_string(),
+                parsed: (0, 7, 7),
+            })
+        );
+        assert_eq!(v077.pre_bridge_version((0, 7, 14)), Some("0.7.7"));
+        assert_eq!(v077.pre_bridge_version((0, 7, 15)), Some("0.7.7"));
+
+        let v0711 = parse_candidate_version("arc-node 0.7.11\r\n").unwrap();
+        assert_eq!(v0711.pre_bridge_version((0, 7, 15)), Some("0.7.11"));
+
+        let same_node = parse_candidate_version("arc-node 0.7.15\n").unwrap();
+        assert_eq!(same_node.pre_bridge_version((0, 7, 15)), None);
+
+        let newer_node = parse_candidate_version("arc-node 0.8.27\n").unwrap();
+        assert_eq!(newer_node.pre_bridge_version((0, 7, 15)), None);
+
+        let older_bridge = parse_candidate_version(
+            "arc-node 0.7.14 (ARC legacy bridge; starts arc-node 0.8.13)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            older_bridge,
+            CandidateBinaryVersion::LegacyBridge(ParsedBridgeVersion {
+                version: "0.7.14".to_string(),
+                target_node: "0.8.13".to_string(),
+            })
+        );
+        assert_eq!(older_bridge.pre_bridge_version((0, 7, 15)), None);
+
+        let unknown_bridge = parse_candidate_version(
+            "arc-node 0.7.13 (ARC legacy bridge; starts arc-node unknown)\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unknown_bridge,
+            CandidateBinaryVersion::LegacyBridge(ParsedBridgeVersion {
+                version: "0.7.13".to_string(),
+                target_node: "unknown".to_string(),
+            })
+        );
+        assert_eq!(unknown_bridge.pre_bridge_version((0, 7, 14)), None);
+
+        let current_line = version_line();
+        let current_bridge = parse_candidate_version(&current_line).unwrap();
+        let pinned_node = Pins::embedded().unwrap().node_release.version;
+        assert_eq!(
+            current_bridge,
+            CandidateBinaryVersion::LegacyBridge(ParsedBridgeVersion {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                target_node: pinned_node,
+            })
+        );
+        assert_eq!(current_bridge.pre_bridge_version((0, 7, 99)), None);
+
+        for malformed in [
+            "",
+            "\n",
+            "arc-node 0.7.7 extra\n",
+            "arc-node 0.7.7 \n",
+            " arc-node 0.7.7\n",
+            "arc-node  0.7.7\n",
+            "arc-node v0.7.7\n",
+            "arc-node 0.07.7\n",
+            "arc-cli 0.7.7\n",
+            "arc-node 0.7.7\nsecond-line\n",
+            "arc-node 0.7.7\n\n",
+            "arc-node 0.7.7 (custom wrapper)\n",
+            "arc-node 0.7.14 (ARC legacy bridge; starts arc-node 0.8.13) trailing\n",
+            "arc-node 0.7.14 (ARC legacy bridge; starts arc-node 0.8.13\n",
+            "arc-node 0.7.14 (ARC legacy bridge; starts arc-node bad)\n",
+            "arc-node bad (ARC legacy bridge; starts arc-node 0.8.13)\n",
+            "arc-node 0.7.14 (ARC legacy bridge; starts arc-node 0.8.13)\narc-node 0.7.7\n",
+            "arc-node 0.7.7\narc-node 0.7.14 (ARC legacy bridge; starts arc-node 0.8.13)\n",
+        ] {
+            let parsed = parse_candidate_version(malformed);
+            assert_eq!(parsed, None, "{malformed:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    mod rollback_preservation_tests {
+        use super::*;
+        use crate::layout::test_support::{TempDir, fake_arc_dir};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn headless_layout(temp: &TempDir) -> Layout {
+            let root = temp.path().join(".arc");
+            let launcher = fake_arc_dir(&root);
+            fs::create_dir_all(root.join("data")).unwrap();
+            let invocation = argv::LegacyInvocation {
+                kind: LegacyKind::Headless,
+                rpc: "127.0.0.1:9944".parse().unwrap(),
+                p2p_port: 9945,
+                data_dir: root.join("data"),
+                seeds_file: None,
+                genesis: None,
+                model: None,
+                community_mode: true,
+            };
+            let cwd = temp.path();
+            let layout = layout::resolve(&launcher, &invocation, cwd).unwrap();
+            layout::prepare(&layout).unwrap();
+            layout
+        }
+
+        fn older_bridge_version_string() -> String {
+            let (major, minor, patch) = own_bridge_version();
+            assert!(patch > 0);
+            format!("{major}.{minor}.{}", patch - 1)
+        }
+
+        fn older_bridge_version_line() -> String {
+            let older = older_bridge_version_string();
+            format!("{VERSION_LINE_PREFIX}{older}{BRIDGE_VERSION_MARKER}0.8.13)")
+        }
+
+        fn write_fake_binary(path: &Path, version_output: &str, exit_code: i32) -> Vec<u8> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let escaped = version_output.replace('\'', "'\"'\"'");
+            let script = format!("#!/bin/sh\nprintf '%s\\n' '{escaped}'\nexit {exit_code}\n");
+            let _ = fs::remove_file(path);
+            fs::write(path, script.as_bytes()).unwrap();
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+            script.into_bytes()
+        }
+
+        fn preserved_path(layout: &Layout) -> PathBuf {
+            layout
+                .bridge_dir
+                .join(PRESERVED_DIR_NAME)
+                .join(PRESERVED_BINARY_NAME)
+        }
+
+        fn previous_path(layout: &Layout) -> PathBuf {
+            layout.root.join("bin").join("arc-node.prev")
+        }
+
+        fn kept_launcher_path(layout: &Layout) -> PathBuf {
+            let name = format!("arc-node-bridge-{}", env!("CARGO_PKG_VERSION"));
+            layout.bridge_dir.join(name)
+        }
+
+        fn marker_path(layout: &Layout) -> PathBuf {
+            layout.bridge_dir.join(ROLLED_BACK_MARKER)
+        }
+
+        fn staging_path(layout: &Layout) -> PathBuf {
+            layout.root.join("bin").join(".arc-node.rollback")
+        }
+
+        #[test]
+        fn preserve_previous_binary_keeps_genuine_v07_and_never_replaces_it() {
+            let temp = TempDir::new("run-preserve-genuine");
+            let layout = headless_layout(&temp);
+            let mut log = Log::stderr_only();
+            let previous = previous_path(&layout);
+            let preserved = preserved_path(&layout);
+
+            let original_v077 = write_fake_binary(&previous, "arc-node 0.7.7", 0);
+            preserve_previous_binary(&layout, &mut log);
+            assert_eq!(fs::read(&preserved).unwrap(), original_v077);
+
+            write_fake_binary(&previous, &older_bridge_version_line(), 0);
+            preserve_previous_binary(&layout, &mut log);
+            assert_eq!(fs::read(&preserved).unwrap(), original_v077);
+
+            write_fake_binary(&previous, "arc-node 0.7.11", 0);
+            preserve_previous_binary(&layout, &mut log);
+            assert_eq!(fs::read(&preserved).unwrap(), original_v077);
+        }
+
+        #[test]
+        fn preserve_previous_binary_rejects_older_bridge_and_malformed_previous() {
+            let temp = TempDir::new("run-preserve-reject");
+            let layout = headless_layout(&temp);
+            let log_path = layout.log_file();
+            let mut log = Log::with_file(&log_path);
+            let previous = previous_path(&layout);
+            let preserved_dir = layout.bridge_dir.join(PRESERVED_DIR_NAME);
+            let preserved = preserved_path(&layout);
+
+            let older_bridge = older_bridge_version_line();
+            let rejected = [
+                (older_bridge.as_str(), 0),
+                ("arc-node 0.8.27", 0),
+                ("arc-node 0.7.7 extra", 0),
+                ("arc-node 0.7.7", 1),
+            ];
+            for (output, status) in rejected {
+                write_fake_binary(&previous, output, status);
+                preserve_previous_binary(&layout, &mut log);
+                assert!(!preserved.exists(), "{output} (status {status})");
+                assert!(!preserved_dir.exists(), "{output} (status {status})");
+            }
+            let log_text = fs::read_to_string(&log_path).unwrap();
+            assert!(log_text.contains("ARC legacy bridge"), "{log_text}");
+        }
+
+        #[test]
+        fn rollback_refuses_older_bridge_without_replacing_launcher_or_writing_marker() {
+            let temp = TempDir::new("run-rollback-refuse-bridge");
+            let layout = headless_layout(&temp);
+            let launcher_bytes = write_fake_binary(&layout.launcher, &version_line(), 0);
+            let older_bridge = older_bridge_version_line();
+            let previous = previous_path(&layout);
+            write_fake_binary(&previous, &older_bridge, 0);
+
+            let expected = CandidateBinaryVersion::LegacyBridge(ParsedBridgeVersion {
+                version: older_bridge_version_string(),
+                target_node: "0.8.13".to_string(),
+            });
+            assert_eq!(probe_candidate_version(&previous), Some(expected));
+
+            let error = rollback(&layout.launcher, &layout.root).unwrap_err();
+            assert_eq!(exit::code_for(&error), exit::EX_CONFIG);
+            assert_eq!(fs::read(&layout.launcher).unwrap(), launcher_bytes);
+            assert!(!marker_path(&layout).exists());
+            assert!(!kept_launcher_path(&layout).exists());
+            assert!(!staging_path(&layout).exists());
+
+            write_fake_binary(&preserved_path(&layout), &older_bridge, 0);
+            let error = rollback(&layout.launcher, &layout.root).unwrap_err();
+            assert_eq!(exit::code_for(&error), exit::EX_CONFIG);
+            assert_eq!(fs::read(&layout.launcher).unwrap(), launcher_bytes);
+            assert!(!marker_path(&layout).exists());
+            assert!(!kept_launcher_path(&layout).exists());
+            assert!(!staging_path(&layout).exists());
+        }
+
+        #[test]
+        fn rollback_restores_genuine_previous_fallback_when_preserved_is_missing() {
+            let temp = TempDir::new("run-rollback-fallback-missing");
+            let layout = headless_layout(&temp);
+            let launcher_bytes = write_fake_binary(&layout.launcher, &version_line(), 0);
+            let previous = previous_path(&layout);
+            let v077_bytes = write_fake_binary(&previous, "arc-node 0.7.7", 0);
+
+            let code = rollback(&layout.launcher, &layout.root).unwrap();
+            assert_eq!(code, EX_OK);
+            assert_eq!(fs::read(&layout.launcher).unwrap(), v077_bytes);
+            let kept = kept_launcher_path(&layout);
+            assert_eq!(fs::read(&kept).unwrap(), launcher_bytes);
+            assert!(!staging_path(&layout).exists());
+            let marker = marker_path(&layout);
+            let contents = fs::read_to_string(&marker).unwrap();
+            assert!(contents.contains("to arc-node 0.7.7 at "), "{contents}");
+        }
+
+        #[test]
+        fn rollback_skips_bridge_in_preserved_and_restores_genuine_previous() {
+            let temp = TempDir::new("run-rollback-fallback-bridge-preserved");
+            let layout = headless_layout(&temp);
+            let launcher_bytes = write_fake_binary(&layout.launcher, &version_line(), 0);
+            let preserved = preserved_path(&layout);
+            let previous = previous_path(&layout);
+            write_fake_binary(&preserved, &older_bridge_version_line(), 0);
+            let v0711_bytes = write_fake_binary(&previous, "arc-node 0.7.11", 0);
+
+            let code = rollback(&layout.launcher, &layout.root).unwrap();
+            assert_eq!(code, EX_OK);
+            assert_eq!(fs::read(&layout.launcher).unwrap(), v0711_bytes);
+            let kept = kept_launcher_path(&layout);
+            assert_eq!(fs::read(&kept).unwrap(), launcher_bytes);
+            assert!(!staging_path(&layout).exists());
+            let marker = marker_path(&layout);
+            let contents = fs::read_to_string(&marker).unwrap();
+            assert!(contents.contains("to arc-node 0.7.11 at "), "{contents}");
+        }
+
+        #[test]
+        fn rollback_prefers_preserved_original_over_bridge_previous() {
+            let temp = TempDir::new("run-rollback-prefer-preserved");
+            let layout = headless_layout(&temp);
+            let mut log = Log::stderr_only();
+            let launcher_bytes = write_fake_binary(&layout.launcher, &version_line(), 0);
+            let previous = previous_path(&layout);
+            let preserved = preserved_path(&layout);
+
+            let v077_bytes = write_fake_binary(&previous, "arc-node 0.7.7", 0);
+            preserve_previous_binary(&layout, &mut log);
+            assert_eq!(fs::read(&preserved).unwrap(), v077_bytes);
+
+            write_fake_binary(&previous, &older_bridge_version_line(), 0);
+            preserve_previous_binary(&layout, &mut log);
+            assert_eq!(fs::read(&preserved).unwrap(), v077_bytes);
+
+            let code = rollback(&layout.launcher, &layout.root).unwrap();
+            assert_eq!(code, EX_OK);
+            assert_eq!(fs::read(&layout.launcher).unwrap(), v077_bytes);
+            assert_eq!(fs::read(&preserved).unwrap(), v077_bytes);
+            let kept = kept_launcher_path(&layout);
+            assert_eq!(fs::read(&kept).unwrap(), launcher_bytes);
+            assert!(!staging_path(&layout).exists());
+            let marker = marker_path(&layout);
+            let contents = fs::read_to_string(&marker).unwrap();
+            assert!(contents.contains("to arc-node 0.7.7 at "), "{contents}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_is_refused_on_windows_without_touching_files() {
+        use crate::layout::test_support::{TempDir, fake_arc_dir};
+
+        let temp = TempDir::new("run-rollback-windows");
+        let root = temp.path().join(".arc");
+        let launcher = fake_arc_dir(&root);
+        let before = fs::read(&launcher).unwrap();
+
+        let error = rollback(&launcher, &root).unwrap_err();
+        assert_eq!(exit::code_for(&error), exit::EX_CONFIG);
+        assert_eq!(fs::read(&launcher).unwrap(), before);
+        let marker = root.join(BRIDGE_DIR_NAME).join(ROLLED_BACK_MARKER);
+        assert!(!marker.exists());
     }
 }

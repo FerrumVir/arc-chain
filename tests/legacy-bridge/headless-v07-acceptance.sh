@@ -327,6 +327,33 @@ grep -q "reusing the verified $node_tag release cache" "$arc_dir/legacy-bridge/b
 python3 "$here/snapshot_tree.py" snapshot --root "$arc_dir/data" --out "$evidence/v07-data.after-restart.json"
 python3 "$here/snapshot_tree.py" compare "$pre_bridge" "$evidence/v07-data.after-restart.json"
 
+if [ "$scenario" = previous-bridge ]; then
+    log "The previous bridge reopens the upgraded data and the real updater recovers again"
+    sudo systemctl stop arc-node
+    install -m 0755 "$state/releases/$prior_tag/$asset" "$arc_dir/bin/arc-node"
+    printf '0.7.14\n' > "$arc_dir/version.txt"
+    sudo systemctl start arc-node
+    wait_health http://127.0.0.1:9944 30 || fail "the previous bridge cannot reopen upgraded data"
+    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.previous-bridge-rollback.json"
+    jq -e --arg address "$prior_address" '.version == "0.8.13" and (.validator | ltrimstr("0x")) == $address' \
+        "$evidence/node-info.previous-bridge-rollback.json" >/dev/null || fail "rollback changed the identity or node version"
+    [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "rollback rewrote the private key"
+    [ "$(cat "$node_dir/compute-consent")" = no ] || fail "rollback discarded the saved compute opt-out"
+    [ "$(sha "$arc_dir/legacy-bridge/preserved/arc-node.before-bridge")" = "$legacy_node_sha256" ] \
+        || fail "the second-generation bridge replaced the original rollback binary"
+    sudo systemctl start arc-updater.service
+    wait_health http://127.0.0.1:9944 30 || fail "the updater did not recover after rollback"
+    [ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ] || fail "recovery rolled back again"
+    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.after-rollback-recovery.json"
+    jq -e --arg address "$prior_address" --arg version "$node_version" \
+        '.version == $version and (.validator | ltrimstr("0x")) == $address' \
+        "$evidence/node-info.after-rollback-recovery.json" >/dev/null || fail "recovery changed the identity or node version"
+    [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "recovery rewrote the private key"
+    [ "$(cat "$node_data/bridge-upgrade-preservation.txt")" = preserve-existing-bridge-data ] \
+        || fail "rollback and recovery discarded existing data"
+    cp "$arc_dir/auto-update.log" "$evidence/auto-update.after-rollback-recovery.log"
+fi
+
 log "A corrupted cached binary is detected and replaced, never executed"
 sudo systemctl stop arc-node
 printf 'x' >> "$arc_dir/legacy-bridge/releases/$node_tag/$asset"
@@ -388,6 +415,42 @@ jq -e --argjson g "$expected_generation" '.archive_generation == $g' "$state_jso
 if [ "$expected_generation" = 2 ]; then
     grep -q 'the v0.7 data changed since archive record 1' "$arc_dir/legacy-bridge/bridge.log" \
         || fail "the bridge did not log that v0.7 changed its data after the rollback"
+fi
+
+if [ "$scenario" = previous-bridge ]; then
+    log "An opted-in existing worker must pass the unmodified updater's real health deadline"
+    available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+    [ "$available_kib" -ge 12582912 ] || fail "compute upgrade qualification needs a remote runner with 12 GiB available memory"
+    disk_kib="$(df -Pk "$arc_dir" | awk 'END {print $4}')"
+    [ "$disk_kib" -ge 10485760 ] || fail "compute upgrade qualification needs 10 GiB free disk"
+    sudo systemctl stop arc-node
+    install -m 0755 "$state/releases/$prior_tag/$asset" "$arc_dir/bin/arc-node"
+    printf '0.7.14\n' > "$arc_dir/version.txt"
+    "$arc_dir/bin/arc-node" --legacy-bridge-compute on --download-model > "$evidence/prior-compute-on.txt" 2>&1
+    [ "$(cat "$node_dir/compute-consent")" = yes ] || fail "the fixture did not retain explicit compute opt-in"
+    model_choice_sha256="$(sha "$node_dir/compute-model.json")"
+    started=$(date +%s)
+    sudo systemctl start arc-node
+    wait_health http://127.0.0.1:9944 600 || fail "the previous opted-in worker did not become healthy"
+    printf '%s\n' "$(( $(date +%s) - started ))" > "$evidence/prior-compute-start-seconds.txt"
+    tr '\0' '\n' < "/proc/$(main_pid)/cmdline" > "$evidence/prior-compute.argv"
+    grep -qx -- --full-integer-worker "$evidence/prior-compute.argv" || fail "the previous node was not an opted-in worker"
+    started=$(date +%s)
+    sudo systemctl start arc-updater.service
+    printf '%s\n' "$(( $(date +%s) - started ))" > "$evidence/compute-update-seconds.txt"
+    cp "$arc_dir/auto-update.log" "$evidence/auto-update.compute.log"
+    [ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ] || fail "the real 30-second updater rolled back the opted-in worker"
+    /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.compute.json"
+    jq -e --arg address "$prior_address" --arg version "$node_version" \
+        '.version == $version and (.validator | ltrimstr("0x")) == $address' \
+        "$evidence/node-info.compute.json" >/dev/null || fail "the opted-in update changed identity or version"
+    tr '\0' '\n' < "/proc/$(main_pid)/cmdline" > "$evidence/updated-compute.argv"
+    grep -qx -- --full-integer-worker "$evidence/updated-compute.argv" || fail "the update removed the worker role"
+    grep -qx -- --model "$evidence/updated-compute.argv" || fail "the update removed the model"
+    [ "$(cat "$node_dir/compute-consent")" = yes ] || fail "the update discarded the compute opt-in"
+    [ "$(sha "$node_dir/compute-model.json")" = "$model_choice_sha256" ] || fail "the update changed the chosen model"
+    [ "$(sha "$prior_keyfile")" = "$prior_key_sha256" ] || fail "the opted-in update changed the private key"
+    sudo systemctl stop arc-node
 fi
 
 log "PASS: v0.7.11 headless install bridged to $node_tag at stake 0; v0.7 data untouched"

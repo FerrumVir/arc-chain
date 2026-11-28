@@ -529,10 +529,19 @@ candidate's legacy acceptance and handoff qualify and its publication is
 verified. Modern v0.8 releases must remain non-Latest. The headless acceptance
 runs both a fresh v0.7 install and an existing immutable v0.7.14 bridge; the
 latter checks that the v0.8.13-to-v0.8.27 update preserves the bridge identity,
-data directory, WAL prefix, genesis binding and saved compute opt-out. Legacy
+data directory, WAL prefix, genesis binding and saved compute opt-out. It also
+reopens upgraded data with the previous node, recovers through the real updater,
+and qualifies an explicitly opted-in worker against the old 30-second health
+deadline on a remote runner with enough memory. Desktop acceptance exercises
+the same bridge-to-bridge rollback after its normal child-kill lifecycle on
+Linux, Windows and the opt-in macOS leg. These are release qualification gates,
+not evidence that operator machines have adopted the candidate. Legacy
 headless updaters pull on their existing schedule; v0.7 desktop app updates
 still require their local update check. Neither path supplies remote control
 or proves a count of active operators. Bridge compute choices are unchanged.
+Rollback and original-binary preservation classify exact version output and
+reject every bridge executable, including an older bridge version. An existing
+preserved original is never replaced by a later updater's previous binary.
 
 Both the checked-in candidate version and the published release version are
 0.8.27. v0.8.27 ships under `desktop-update-existing-validators-v1`, while

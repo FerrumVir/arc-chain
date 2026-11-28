@@ -17,13 +17,23 @@ The v0.8.27 desktop can then use its automatic update and recovery paths and
 select partial inference where its saved compute choice and capacity permit.
 
 Before publishing, require the legacy workflow's Linux and Windows unit and
-desktop acceptance jobs, both headless scenarios, and the signed-asset
+desktop acceptance jobs, the opt-in macOS desktop leg, both headless scenarios, and the signed-asset
 handoff with `desktop_tag=v0.8.27`. The `previous-bridge` headless scenario
 first runs the immutable v0.7.14 launcher and its real v0.8.13 node, then uses
 the unmodified daily updater to consume the candidate. It verifies retention
 of the private-key bytes, public identity, context and data paths, saved
-compute opt-out, genesis binding and persisted WAL prefix. These isolated CI
+compute opt-out, genesis binding and persisted WAL prefix. It then reopens the
+upgraded data with v0.8.13 and verifies that the real updater recovers again.
+Desktop acceptance also exercises that rollback after killing the child in
+the same way as the old app. The headless scenario additionally downloads the
+pinned model on an isolated remote runner and qualifies a saved compute opt-in
+against the unmodified updater's 30-second health deadline. Passing on the
+runner does not establish startup time on slower operator hardware. These isolated CI
 machines are not operators and cannot count toward deployed shard coverage.
+
+The candidate also prevents a second-generation bridge from being kept or
+restored as the original pre-bridge node. Rollback requires genuine earlier
+node version output; an already preserved original stays untouched.
 
 Publish v0.7.15 non-Latest first, verify its exact handoff digests, and qualify
 the canary before promoting that bridge to Latest. Never mark v0.8.27 Latest
