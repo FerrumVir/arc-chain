@@ -340,11 +340,15 @@ data-dir lock release; only cancellation with `shutdown_requested == true` and
 a cleanly drained listener (no remaining live connections/handlers or stop
 errors) exits cleanly and acknowledges a desktop shutdown receipt, while fatal
 early-startup aborts retain the original error with cleanup context. On fatal
-post-bind RPC errors without a clean shutdown request, the node broadcasts
-shutdown, drains any ETH RPC task, owned watcher/worker tasks, and consensus
-writers first, and then runs the final WAL durability sync while preserving the
-fatal error and never acknowledging a clean desktop shutdown receipt. On
-success, the full RPC router replaces the loading router atomically on the same
+post-bind RPC errors without a clean shutdown request (including pre-handoff
+`handoff_router` errors and unexpected server task returns or panics), the RPC
+server signals its owned lifecycle shutdown sender to drain all RPC-owned
+runtime tasks and waits for the inference compute barrier without aborting
+active compute (while all fallible RPC state validations and settlement replay
+run before spawning tasks), and the node then broadcasts shutdown, drains any
+ETH RPC task, owned watcher/worker tasks, and consensus writers first, and runs
+the final WAL durability sync while preserving the fatal error and never
+acknowledging a clean desktop shutdown receipt. On success, the full RPC router replaces the loading router atomically on the same
 bound TCP listener without a close/rebind gap, and outbound worker registration
 or job claims begin only after preparation completes. Validators, non-eligible
 roles, and `--rpc-unix` listeners keep the existing post-initialization

@@ -1849,6 +1849,8 @@ fn build_rpc_server_state_and_router(
             ),
         );
     }
+    let replayed_settlements = replay_verified_settlement_journal(&node)
+        .map_err(|error| anyhow::anyhow!("verified settlement journal replay failed: {error}"))?;
     if !shard_infos.is_empty() {
         let refresh_registry = node.shard_registry.clone();
         let refresh_infos: Vec<ShardInfo> = shard_infos
@@ -1879,8 +1881,6 @@ fn build_rpc_server_state_and_router(
             }
         });
     }
-    let replayed_settlements = replay_verified_settlement_journal(&node)
-        .map_err(|error| anyhow::anyhow!("verified settlement journal replay failed: {error}"))?;
     for job_id in &replayed_settlements {
         schedule_verified_settlement_retry(&node, *job_id);
     }
@@ -2170,6 +2170,95 @@ fn build_rpc_server_state_and_router(
     Ok((node, app))
 }
 
+struct RpcLifecycleShutdown {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    bridge_stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RpcLifecycleShutdown {
+    fn from_external(
+        external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<Self> {
+        let external_shutdown = external_shutdown?;
+        let initial = *external_shutdown.borrow();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(initial);
+        let (bridge_stop_tx, bridge_stop_rx) = tokio::sync::watch::channel(false);
+        let forward_tx = shutdown_tx.clone();
+        let bridge_task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown_request(external_shutdown) => {
+                    let _ = forward_tx.send(true);
+                }
+                _ = wait_for_shutdown_request(bridge_stop_rx) => {}
+            }
+        });
+        Some(Self {
+            shutdown_tx,
+            shutdown_rx,
+            bridge_stop_tx: Some(bridge_stop_tx),
+            bridge_task: Some(bridge_task),
+        })
+    }
+
+    fn receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    async fn finish_bridge(&mut self) {
+        if let Some(stop_tx) = self.bridge_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = self.bridge_task.take() {
+            let _ = task.await;
+        }
+    }
+
+    async fn signal_and_drain_node(&mut self, node: &NodeState) -> anyhow::Result<()> {
+        self.signal_shutdown();
+        let join_result = join_node_runtime_tasks(node).await;
+        let barrier_result = wait_for_inference_compute_barrier(node).await;
+        self.finish_bridge().await;
+        join_result?;
+        barrier_result?;
+        Ok(())
+    }
+}
+
+impl Drop for RpcLifecycleShutdown {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(stop_tx) = self.bridge_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn attach_node_drain_context(
+    fatal_error: anyhow::Error,
+    drain_result: anyhow::Result<()>,
+) -> anyhow::Error {
+    match drain_result {
+        Ok(()) => fatal_error,
+        Err(drain_error) => {
+            tracing::error!(%drain_error, "RPC runtime drain failed after server error");
+            let summary = fatal_error.to_string();
+            fatal_error.context(format!(
+                "{summary} (RPC runtime cleanup failed: {drain_error})"
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listen: RpcListen,
@@ -2204,7 +2293,9 @@ pub async fn serve(
     community_profiles: CommunityProfileServing,
     community_shard_coordinator: bool,
 ) -> anyhow::Result<()> {
-    let (node, app) = build_rpc_server_state_and_router(
+    let mut lifecycle = RpcLifecycleShutdown::from_external(shutdown);
+    let node_shutdown = lifecycle.as_ref().map(RpcLifecycleShutdown::receiver);
+    let (node, app) = match build_rpc_server_state_and_router(
         state,
         mempool,
         validator_address,
@@ -2229,52 +2320,80 @@ pub async fn serve(
         community_rewards_v1_enabled,
         native_serving,
         native_request_admission,
-        shutdown.clone(),
+        node_shutdown,
         transport_wire_policy,
         community_twin,
         community_release_on_verification,
         community_profiles,
         community_shard_coordinator,
-    )?;
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            if let Some(lifecycle) = lifecycle.as_mut() {
+                lifecycle.finish_bridge().await;
+            }
+            return Err(error);
+        }
+    };
 
-    let lifecycle_supervised = shutdown.is_some();
-    let server_result = match listen {
+    let server_shutdown = lifecycle.as_ref().map(RpcLifecycleShutdown::receiver);
+    let server_result: anyhow::Result<()> = match listen {
         RpcListen::Tcp(address) => {
-            let listener = crate::worker_startup::bind_rpc_tcp_listener(address.parse()?)?;
-            let server = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<RpcPeerAddr>(),
-            );
-            if let Some(shutdown) = shutdown {
-                server
-                    .with_graceful_shutdown(wait_for_shutdown_request(shutdown))
-                    .await
-            } else {
-                server.await
+            let listener_result = address
+                .parse()
+                .map_err(anyhow::Error::from)
+                .and_then(|addr| {
+                    crate::worker_startup::bind_rpc_tcp_listener(addr).map_err(anyhow::Error::from)
+                });
+            match listener_result {
+                Ok(listener) => {
+                    let server = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<RpcPeerAddr>(),
+                    );
+                    if let Some(shutdown) = server_shutdown {
+                        server
+                            .with_graceful_shutdown(wait_for_shutdown_request(shutdown))
+                            .await
+                            .map_err(anyhow::Error::from)
+                    } else {
+                        server.await.map_err(anyhow::Error::from)
+                    }
+                }
+                Err(error) => Err(error),
             }
         }
         #[cfg(unix)]
-        RpcListen::Unix(path) => {
-            let (listener, _socket_guard) = crate::unix_listener::bind(&path)?;
-            let server = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<RpcPeerAddr>(),
-            );
-            if let Some(shutdown) = shutdown {
-                server
-                    .with_graceful_shutdown(wait_for_shutdown_request(shutdown))
-                    .await
-            } else {
-                server.await
+        RpcListen::Unix(path) => match crate::unix_listener::bind(&path) {
+            Ok((listener, _socket_guard)) => {
+                let server = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<RpcPeerAddr>(),
+                );
+                if let Some(shutdown) = server_shutdown {
+                    server
+                        .with_graceful_shutdown(wait_for_shutdown_request(shutdown))
+                        .await
+                        .map_err(anyhow::Error::from)
+                } else {
+                    server.await.map_err(anyhow::Error::from)
+                }
             }
-        }
+            Err(error) => Err(error),
+        },
     };
-    if lifecycle_supervised {
-        join_node_runtime_tasks(&node).await?;
-        wait_for_inference_compute_barrier(&node).await?;
+    let drain_result = if let Some(lifecycle) = lifecycle.as_mut() {
+        lifecycle.signal_and_drain_node(&node).await
+    } else {
+        Ok(())
+    };
+    match server_result {
+        Ok(()) => {
+            drain_result?;
+            Ok(())
+        }
+        Err(server_error) => Err(attach_node_drain_context(server_error, drain_result)),
     }
-    server_result?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2311,7 +2430,83 @@ pub async fn serve_on_startup_server(
     community_profiles: CommunityProfileServing,
     community_shard_coordinator: bool,
 ) -> anyhow::Result<()> {
-    let lifecycle_supervised = shutdown.is_some();
+    serve_on_startup_server_with_post_build_hook(
+        startup_server,
+        state,
+        mempool,
+        validator_address,
+        validator_keypair,
+        stake,
+        boot_time,
+        peer_count,
+        inference_model,
+        candle_engine,
+        candle_model_id,
+        model_artifact_id,
+        dag_validators,
+        dag_round,
+        dag_committed,
+        consensus_engine,
+        shard_infos,
+        seed_rpc_addrs,
+        community_rpc_bases,
+        compute_threads,
+        compute_pool,
+        chain_identity,
+        community_rewards_v1_enabled,
+        native_serving,
+        native_request_admission,
+        shutdown,
+        transport_wire_policy,
+        community_twin,
+        community_release_on_verification,
+        community_profiles,
+        community_shard_coordinator,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_on_startup_server_with_post_build_hook<F>(
+    startup_server: crate::worker_startup::StartupRpcServer,
+    state: Arc<StateDB>,
+    mempool: Arc<Mempool>,
+    validator_address: Hash256,
+    validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
+    stake: u64,
+    boot_time: Instant,
+    peer_count: Arc<AtomicU32>,
+    inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    candle_model_id: Option<arc_crypto::Hash256>,
+    model_artifact_id: Option<arc_crypto::Hash256>,
+    dag_validators: Option<SharedValidators>,
+    dag_round: Option<Arc<AtomicU64>>,
+    dag_committed: Option<Arc<AtomicU64>>,
+    consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
+    shard_infos: Vec<ShardInfo>,
+    seed_rpc_addrs: Vec<String>,
+    community_rpc_bases: Vec<String>,
+    compute_threads: usize,
+    compute_pool: ComputePool,
+    chain_identity: Option<ChainIdentity>,
+    community_rewards_v1_enabled: bool,
+    native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
+    community_twin: crate::twin::TwinConfig,
+    community_release_on_verification: bool,
+    community_profiles: CommunityProfileServing,
+    community_shard_coordinator: bool,
+    on_built: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&NodeState),
+{
+    let mut lifecycle = RpcLifecycleShutdown::from_external(shutdown);
+    let node_shutdown = lifecycle.as_ref().map(RpcLifecycleShutdown::receiver);
     let (node, app) = match build_rpc_server_state_and_router(
         state,
         mempool,
@@ -2337,7 +2532,7 @@ pub async fn serve_on_startup_server(
         community_rewards_v1_enabled,
         native_serving,
         native_request_admission,
-        shutdown.clone(),
+        node_shutdown,
         transport_wire_policy,
         community_twin,
         community_release_on_verification,
@@ -2346,19 +2541,68 @@ pub async fn serve_on_startup_server(
     ) {
         Ok(built) => built,
         Err(error) => {
+            if let Some(lifecycle) = lifecycle.as_mut() {
+                lifecycle.finish_bridge().await;
+            }
             return Err(attach_startup_stop_context(error, startup_server).await);
         }
     };
+    on_built(&node);
     if let Err(error) = startup_server.handoff_router(app) {
-        return Err(attach_startup_stop_context(error, startup_server).await);
+        let fatal_error = attach_startup_stop_context(error, startup_server).await;
+        let drain_result = if let Some(lifecycle) = lifecycle.as_mut() {
+            lifecycle.signal_and_drain_node(&node).await
+        } else {
+            Ok(())
+        };
+        return Err(attach_node_drain_context(fatal_error, drain_result));
     }
-    let server_result = startup_server.wait_until_shutdown(shutdown).await;
-    if lifecycle_supervised {
-        join_node_runtime_tasks(&node).await?;
-        wait_for_inference_compute_barrier(&node).await?;
+    let server_shutdown = lifecycle.as_ref().map(RpcLifecycleShutdown::receiver);
+    let server_result = startup_server.wait_until_shutdown(server_shutdown).await;
+    let drain_result = if let Some(lifecycle) = lifecycle.as_mut() {
+        lifecycle.signal_and_drain_node(&node).await
+    } else {
+        Ok(())
+    };
+    match server_result {
+        Ok(()) => {
+            drain_result?;
+            Ok(())
+        }
+        Err(server_error) => Err(attach_node_drain_context(server_error, drain_result)),
     }
-    server_result?;
-    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_test_runtime_shutdown_observer(
+    node: &NodeState,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    exited_on_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    exited_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    let mut shutdown = node.runtime_shutdown.clone();
+    spawn_node_runtime_task(node, async move {
+        started.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(tx) = started_tx {
+            let _ = tx.send(());
+        }
+        wait_for_optional_runtime_shutdown(&mut shutdown).await;
+        exited_on_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(tx) = exited_tx {
+            let _ = tx.send(());
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn try_acquire_test_public_inference_permit(
+    node: &NodeState,
+) -> tokio::sync::OwnedSemaphorePermit {
+    node.public_inference_permits
+        .clone()
+        .try_acquire_owned()
+        .expect("public inference permit must be available during test setup")
 }
 
 async fn attach_startup_stop_context(

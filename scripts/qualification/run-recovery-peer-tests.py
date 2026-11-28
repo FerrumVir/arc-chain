@@ -165,6 +165,8 @@ EXPECTED_LIBRARY_TESTS = {
     'worker_startup::tests::cancellable_preparation_joins_before_cleanup_and_distinguishes_shutdown_from_errors',
     'worker_startup::tests::stop_bounded_reports_live_handlers_until_completion_and_refuses_new_connections',
     'worker_startup::tests::serve_eth_rejects_occupied_tcp_port',
+    'worker_startup::tests::serve_on_startup_server_pre_handoff_error_signals_and_drains_rpc_tasks',
+    'worker_startup::tests::serve_on_startup_server_unexpected_stop_and_panic_signal_and_drain_rpc_tasks',
 }
 
 

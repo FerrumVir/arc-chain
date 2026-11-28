@@ -544,14 +544,23 @@ impl StartupRpcServer {
             .server_task
             .take()
             .ok_or_else(|| anyhow::anyhow!("startup RPC server task already consumed"))?;
-        if let Some(runtime_shutdown) = runtime_shutdown {
+        if let Some(mut runtime_shutdown) = runtime_shutdown {
             tokio::select! {
                 result = &mut server_task => {
-                    return result
+                    let server_result = result
                         .context("RPC server task failed to join")?
                         .map_err(anyhow::Error::from);
+                    server_result?;
+                    let shutdown_signaled = *runtime_shutdown.borrow_and_update()
+                        || runtime_shutdown.has_changed().is_err();
+                    if !shutdown_signaled {
+                        anyhow::bail!(
+                            "RPC server task exited unexpectedly before shutdown was requested"
+                        );
+                    }
+                    return Ok(());
                 }
-                () = wait_for_shutdown_signal(runtime_shutdown) => {
+                () = wait_for_shutdown_signal(runtime_shutdown.clone()) => {
                     let _ = self.shutdown_tx.send(true);
                 }
             }
@@ -560,6 +569,58 @@ impl StartupRpcServer {
             .await
             .context("RPC server task failed to join")?
             .map_err(anyhow::Error::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn internal_shutdown_sender_for_test(&self) -> tokio::sync::watch::Sender<bool> {
+        self.shutdown_tx.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_server_task_for_test(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self
+            .server_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "startup server task must finish after internal shutdown signal"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_panicking_task_for_test(
+        address: &str,
+        loading_state: StartupLoadingState,
+        panic_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> anyhow::Result<Self> {
+        let socket_addr: SocketAddr = address.parse()?;
+        let listener = bind_rpc_tcp_listener(socket_addr)?;
+        let local_addr = listener.local_addr()?;
+        let tracker = Arc::new(ConnectionTracker::new());
+        let router_slot = Arc::new(parking_lot::RwLock::new(startup_loading_router(
+            loading_state,
+        )));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _listener = listener;
+            tokio::select! {
+                _ = panic_rx => panic!("simulated startup RPC server task panic"),
+                () = wait_for_shutdown_signal(shutdown_rx) => Ok(()),
+            }
+        });
+        Ok(Self {
+            local_addr,
+            router_slot,
+            tracker,
+            shutdown_tx,
+            server_task: Some(server_task),
+        })
     }
 
     pub async fn stop_bounded(
@@ -1159,7 +1220,8 @@ mod tests {
         )
         .unwrap();
         let addr = server.local_addr();
-        let accepted = server.tracker.accepted_notify.notified();
+        let tracker = Arc::clone(&server.tracker);
+        let accepted = tracker.accepted_notify.notified();
         tokio::pin!(accepted);
         accepted.as_mut().enable();
         let mut stalled_client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1349,5 +1411,425 @@ mod tests {
             rebound.is_ok(),
             "serve_eth must bind cleanly after port release and exit on shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_on_startup_server_pre_handoff_error_signals_and_drains_rpc_tasks() {
+        let state = Arc::new(StateDB::new());
+        let admission = Arc::new(NativeRequestAdmission::new(false));
+        let wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(false));
+        let boot_time = Instant::now();
+        let startup_server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time,
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+        )
+        .unwrap();
+        startup_server.finish_server_task_for_test().await;
+
+        let keypair = Arc::new(KeyPair::generate_ed25519());
+        let validator_address = keypair.address();
+        let (external_shutdown_tx, external_shutdown_rx) = tokio::sync::watch::channel(false);
+        let observer_started = Arc::new(AtomicBool::new(false));
+        let observer_exited = Arc::new(AtomicBool::new(false));
+        let hook_started = Arc::clone(&observer_started);
+        let hook_exited = Arc::clone(&observer_exited);
+
+        let handoff_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            rpc::serve_on_startup_server_with_post_build_hook(
+                startup_server,
+                Arc::clone(&state),
+                Arc::new(Mempool::new(1_000)),
+                validator_address,
+                Some(Arc::clone(&keypair)),
+                0,
+                boot_time,
+                Arc::new(AtomicU32::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                rpc::ComputePool::default(),
+                None,
+                false,
+                None,
+                Arc::clone(&admission),
+                Some(external_shutdown_rx),
+                Arc::clone(&wire_policy),
+                crate::twin::TwinConfig::default(),
+                false,
+                rpc::CommunityProfileServing::default(),
+                false,
+                move |node| {
+                    rpc::spawn_test_runtime_shutdown_observer(
+                        node,
+                        hook_started,
+                        hook_exited,
+                        None,
+                        None,
+                    );
+                },
+            ),
+        )
+        .await
+        .expect("pre-handoff error cleanup must signal and drain RPC tasks without deadlocking")
+        .expect_err("exited startup server must fail handoff_router");
+        let handoff_msg = handoff_err.to_string();
+        assert!(handoff_msg.contains("startup RPC server exited before router handoff"));
+        assert!(!*external_shutdown_tx.borrow());
+        assert!(observer_started.load(Ordering::Acquire));
+        assert!(observer_exited.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+
+        let build_fail_server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time,
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+        )
+        .unwrap();
+        let build_fail_addr = build_fail_server.local_addr();
+        let (build_shutdown_tx, build_shutdown_rx) = tokio::sync::watch::channel(false);
+        let build_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            rpc::serve_on_startup_server(
+                build_fail_server,
+                Arc::clone(&state),
+                Arc::new(Mempool::new(1_000)),
+                validator_address,
+                Some(Arc::clone(&keypair)),
+                0,
+                boot_time,
+                Arc::new(AtomicU32::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                rpc::ComputePool::default(),
+                None,
+                true,
+                None,
+                Arc::clone(&admission),
+                Some(build_shutdown_rx),
+                Arc::clone(&wire_policy),
+                crate::twin::TwinConfig::default(),
+                false,
+                rpc::CommunityProfileServing::default(),
+                false,
+            ),
+        )
+        .await
+        .expect("failed RPC factory must stop startup server promptly")
+        .expect_err("missing rewards activation height must fail factory build");
+        let build_msg = build_err.to_string();
+        assert!(build_msg.contains("community_rewards_v1_activation_height"));
+        assert!(!*build_shutdown_tx.borrow());
+        assert!(
+            tokio::net::TcpStream::connect(build_fail_addr)
+                .await
+                .is_err()
+        );
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+
+        let occupied_listener = bind_rpc_tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let occupied_addr = occupied_listener.local_addr().unwrap();
+        let (serve_shutdown_tx, serve_shutdown_rx) = tokio::sync::watch::channel(false);
+        let bind_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            rpc::serve(
+                rpc::RpcListen::Tcp(occupied_addr.to_string()),
+                Arc::clone(&state),
+                Arc::new(Mempool::new(1_000)),
+                validator_address,
+                Some(keypair),
+                0,
+                boot_time,
+                Arc::new(AtomicU32::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                rpc::ComputePool::default(),
+                None,
+                false,
+                None,
+                Arc::clone(&admission),
+                Some(serve_shutdown_rx),
+                wire_policy,
+                crate::twin::TwinConfig::default(),
+                false,
+                rpc::CommunityProfileServing::default(),
+                false,
+            ),
+        )
+        .await
+        .expect("rpc::serve bind failure must drain spawned RPC tasks without hanging")
+        .expect_err("rpc::serve must reject an occupied TCP port");
+        drop(occupied_listener);
+        assert!(!bind_err.to_string().is_empty());
+        assert!(!*serve_shutdown_tx.borrow());
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_on_startup_server_unexpected_stop_and_panic_signal_and_drain_rpc_tasks() {
+        let state = Arc::new(StateDB::new());
+        let admission = Arc::new(NativeRequestAdmission::new(false));
+        let wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(false));
+        let boot_time = Instant::now();
+        let startup_server = StartupRpcServer::start_tcp(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time,
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+        )
+        .unwrap();
+        let addr = startup_server.local_addr();
+        let internal_shutdown_tx = startup_server.internal_shutdown_sender_for_test();
+
+        let keypair = Arc::new(KeyPair::generate_ed25519());
+        let validator_address = keypair.address();
+        let (external_shutdown_tx, external_shutdown_rx) = tokio::sync::watch::channel(false);
+        let observer_started = Arc::new(AtomicBool::new(false));
+        let observer_exited = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let (permit_tx, permit_rx) = tokio::sync::oneshot::channel();
+        let hook_started = Arc::clone(&observer_started);
+        let hook_exited = Arc::clone(&observer_exited);
+
+        let mut serve_task = tokio::spawn(rpc::serve_on_startup_server_with_post_build_hook(
+            startup_server,
+            Arc::clone(&state),
+            Arc::new(Mempool::new(1_000)),
+            validator_address,
+            Some(Arc::clone(&keypair)),
+            0,
+            boot_time,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            rpc::ComputePool::default(),
+            None,
+            false,
+            None,
+            Arc::clone(&admission),
+            Some(external_shutdown_rx),
+            Arc::clone(&wire_policy),
+            crate::twin::TwinConfig::default(),
+            false,
+            rpc::CommunityProfileServing::default(),
+            false,
+            move |node| {
+                let permit = rpc::try_acquire_test_public_inference_permit(node);
+                let _ = permit_tx.send(permit);
+                rpc::spawn_test_runtime_shutdown_observer(
+                    node,
+                    hook_started,
+                    hook_exited,
+                    Some(started_tx),
+                    Some(exited_tx),
+                );
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("observer runtime task must start")
+            .unwrap();
+        let active_compute_permit = tokio::time::timeout(Duration::from_secs(2), permit_rx)
+            .await
+            .expect("compute permit must be acquired during post-build hook")
+            .unwrap();
+
+        let client = http_client();
+        let mut handed_off = false;
+        for _ in 0..100 {
+            let health: Value = client
+                .get(format!("http://{addr}/health"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if health["status"] != json!("loading") {
+                handed_off = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handed_off,
+            "router handoff must complete before unexpected stop"
+        );
+        drop(client);
+
+        let _ = internal_shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), exited_rx)
+            .await
+            .expect("unexpected server exit must signal RPC runtime tasks to complete")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut serve_task)
+                .await
+                .is_err(),
+            "compute barrier must wait for active compute instead of aborting it"
+        );
+        drop(active_compute_permit);
+
+        let unexpected_err = tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("unexpected server exit cleanup must complete once active compute finishes")
+            .unwrap()
+            .expect_err("unexpected server exit without external shutdown must return Err");
+        let unexpected_msg = unexpected_err.to_string();
+        assert!(unexpected_msg.contains("exited unexpectedly before shutdown was requested"));
+        assert!(!*external_shutdown_tx.borrow());
+        assert!(observer_started.load(Ordering::Acquire));
+        assert!(observer_exited.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        let panicking_server = StartupRpcServer::start_with_panicking_task_for_test(
+            "127.0.0.1:0",
+            StartupLoadingState {
+                role: EarlyWorkerStartupRole::FullIntegerWorker,
+                state: Arc::clone(&state),
+                boot_time,
+                transport_wire_policy: Arc::clone(&wire_policy),
+            },
+            panic_rx,
+        )
+        .unwrap();
+        let panic_tracker = Arc::clone(&panicking_server.tracker);
+        let (panic_shutdown_tx, panic_shutdown_rx) = tokio::sync::watch::channel(false);
+        let panic_observer_started = Arc::new(AtomicBool::new(false));
+        let panic_observer_exited = Arc::new(AtomicBool::new(false));
+        let (panic_started_tx, panic_started_rx) = tokio::sync::oneshot::channel();
+        let hook_panic_started = Arc::clone(&panic_observer_started);
+        let hook_panic_exited = Arc::clone(&panic_observer_exited);
+
+        let panic_serve_task = tokio::spawn(rpc::serve_on_startup_server_with_post_build_hook(
+            panicking_server,
+            Arc::clone(&state),
+            Arc::new(Mempool::new(1_000)),
+            validator_address,
+            Some(keypair),
+            0,
+            boot_time,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            rpc::ComputePool::default(),
+            None,
+            false,
+            None,
+            Arc::clone(&admission),
+            Some(panic_shutdown_rx),
+            wire_policy,
+            crate::twin::TwinConfig::default(),
+            false,
+            rpc::CommunityProfileServing::default(),
+            false,
+            move |node| {
+                rpc::spawn_test_runtime_shutdown_observer(
+                    node,
+                    hook_panic_started,
+                    hook_panic_exited,
+                    Some(panic_started_tx),
+                    None,
+                );
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), panic_started_rx)
+            .await
+            .expect("panic-path observer runtime task must start")
+            .unwrap();
+        let handoff_deadline = Instant::now() + Duration::from_secs(2);
+        while !panic_tracker.handed_off.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "panic-path router handoff must complete before injecting panic"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = panic_tx.send(());
+
+        let panic_err = tokio::time::timeout(Duration::from_secs(5), panic_serve_task)
+            .await
+            .expect("server panic cleanup must signal and drain RPC tasks without hanging")
+            .unwrap()
+            .expect_err("panicking startup RPC task must propagate join error");
+        assert!(
+            panic_err
+                .to_string()
+                .contains("RPC server task failed to join")
+        );
+        assert!(!*panic_shutdown_tx.borrow());
+        assert!(panic_observer_started.load(Ordering::Acquire));
+        assert!(panic_observer_exited.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
     }
 }

@@ -53,10 +53,14 @@ All notable changes to ARC Chain are tracked here. This project follows
   cancellation fails closed without acknowledging a desktop shutdown receipt if
   live connections or handlers remain or stop fails, while fatal startup aborts
   retain the original error with cleanup context. Post-bind fatal RPC errors
-  broadcast shutdown, drain any ETH RPC task, owned tasks, and consensus
-  writers first, and then run the final WAL durability barrier without falsely
-  acknowledging a clean desktop shutdown receipt. Validators, non-eligible
-  modes, and `--rpc-unix` listeners retain their startup ordering.
+  (including pre-handoff errors, unexpected server task exits, and panics)
+  signal an RPC-owned shutdown sender to drain all RPC-owned runtime tasks and
+  wait for the inference compute barrier without aborting active compute (with
+  fallible RPC factory validations and journal replay completed before spawning
+  tasks), then broadcast node shutdown, drain any ETH RPC task, owned tasks,
+  and consensus writers first, and run the final WAL durability barrier without
+  falsely acknowledging a clean desktop shutdown receipt. Validators,
+  non-eligible modes, and `--rpc-unix` listeners retain their startup ordering.
 - Early, ordinary, and ETH TCP RPC listeners reject occupied ports on Windows
   and preserve immediate rebinding after shutdown on Unix.
 
